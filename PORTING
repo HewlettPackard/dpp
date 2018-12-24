@@ -1,0 +1,62 @@
+This code is OS-independent. The OS-specific portion of this release 
+is <os>/sss.c. Porting DPP to a different OS requires definition of a
+new sss.c module for the new OS. Each <os>/sss.c must:
+
+  1. provision an 802.11 interface-- band, channel, etc.-- such that
+     802.11 action frames can be sent out of it.
+  2. provide an API to send 802.11 action frames out the radio.
+  3. subscribe to DPP action frames received from the kernel.
+  4. call DPP APIs to run PKEX and DPP Authentication.
+  5. provide APIs to DPP to provision an 802.11 interface per the
+     data received during DPP provisioning.
+
+A generic service model, service.[ch], is included to allow <os>/sss.c
+to manage socket interfaces and allow dpp and pkex to manage timers.
+Replacement of service.[ch] with a different service model should be
+trivial. 
+
+os_glue.h defines the external API each <os>/sss.c must have
+to allow DPP to use to send frames over the air. These are:
+
+  - transmit_<pkex/auth/config>_frame()
+
+	To transmit the appropriate frame, passed as data with a 
+	specified length, as an 802.11 action frame.
+
+  - void change_dpp_channel()
+
+    	Support for option of changing DPP channel after receiving
+	Auth request.
+
+  - void boostrap_peer()
+    	Parse the bootstrapping key file and begin DPP. Needed as
+	an os_glue API just for PKEX.
+
+  - provision_connector()
+	Parse credential and output netaccesskey and connector for
+	use by the DPP peer.
+	
+  - void fin()
+
+	To obtain notification of termination of DPP. 
+
+To port this code to another OS it is necessary to provide these APIs
+and perform the necessary function. dpp.h and pkex.h define the routines
+each <os>/sss.c must call to perform PKEX and DPP Authentication.
+
+It will also be necessary to provision a radio appopriately and
+initialize PKEX and DPP through:
+
+int pkex_initialize (int whatkind, char *password, char *id, char *info, 
+		     char *keyfile, char *bsfile, int verbosity);
+
+and
+
+int dpp_initialize (int initiator, int core, int mutual, char *keyfile, 
+		    char *bsfile, char *signkeyfile, char *enrolleerole, 
+		    int opclass, int channel, int verbosity)
+
+Before beginning the protocol.
+
+
+

@@ -1,0 +1,206 @@
+Device Provisioning Protocol
+-----------------------------
+
+  DPP provides a way to authenticate and provision a device taking
+part in the "enrollee" role by a device taking part in the "configurator"
+role.
+
+  Trust in the authentication is bootstrapped using either scanned QR
+codes or PKEX. Regardless of bootstrapping method, a flat file contains
+the regulatory information, in the form of operating class and channel,
+the MAC address of the device, and the device's public key is saved in
+a flat file for use by DPP Authentication. 
+
+  The OS-specific components reside in directories named for their
+respective OS, for example the freebsd OS-specific component is 
+in freebsd/sss.c. The OS-independent component is dpp.c and pkex.c. The 
+other .c files are helper modules. See PORTING for a description
+of the interfaces the modules have to each other.
+
+  Multiple DPP applications can communicate over a loopback interface to
+simulate a network. Each OS-specific component supports communication
+over the loopback interface.
+
+RESTRICTIONS
+
+  macos only supports DPP over wired (controller.c and device.c).
+
+  Freebsd sss currently only supports Atheros radios.
+
+REQUIREMENTS
+
+  libcrypto from OpenSSL, version 0.9.8 or later. Basically, all
+you need is EC support that has the pre-defined groups.
+
+BUILDING
+
+  The file freebsd_6.4_RC1_diffs contains patches for a few
+kernel files in freebsd 6.4_RC1 (other versions should be
+straightforward to patch as the diffs are minor) to allow for the
+sending of 802.11 authentication frames via a BPF. Rebuild the
+OS with these patchs.
+
+  Change directories to the top level. You may need to run some
+of the autohell stuff (aclocal, autoconf, automake) first but
+configure the package like this:
+
+% ./configure --with-ssl="<directory>" [--enable-brainpool] 
+
+where <directory> is the top level directory of openssl. Enable
+Brainpool if you have support for those curves. Then change
+directories into the one that matches your OS-- macos, linux,
+or freebsd-- and make.
+
+HOW TO USE
+
+  sss can be run to do PKEX only, DPP only, or PKEX followed by DPP.
+If a scanning Configurator is hooked up it must export the scanned
+public key in the form required by the bootstrapping keys flat file:
+
+  <index> <operating class> <channel> <macaddress> <b64 encoded key>
+
+  sss uses command line options to pick the interface, the role, the
+keys to use, the files in which to place trusted keys, and the various
+parameters to set when running PKEX and/or DPP:
+
+USAGE: ./sss [-hCIBapkceirdfgs]
+        -h  show usage, and exit
+        -c <signkey> run DPP as the configurator, sign connectors with <signkey>
+        -e <role> run DPP as the enrollee in the role of <role> (sta or ap)
+        -i  run DPP as the initiator
+        -r  run DPP as the responder
+        -a  do not perform mutual authentication in DPP
+        -C <filename> of radio configuration file
+        -I <interface> to add to DPP
+        -B <filename> of peer bootstrappign keys
+        -p <password> to use for PKEX
+        -f <channel> to use with DPP
+        -g <opclass> operating class to use with DPP
+        -z <info> to pass along with public key in PKEX
+        -n <identifier> for the code used in PKEX
+        -k <filename> my bootstrapping key
+        -b  bootstrapping (PKEX) only, don't run DPP
+        -x  <index> DPP only with key <index> in -B <filename>, don't do PKEX
+        -m <MAC address> to initiate to, otherwise uses broadcast
+        -s  change opclass/channel to what was set with -f and -g
+        -d <debug> set debugging mask
+
+
+* PKEX Only
+
+  Start up a PKEX responder:
+
+% ./sss -I lo0 -r -p fubar -n blah -k respp256.pem -B respbkeys.txt -b -d 63
+
+This says to use interface lo0 (loopback), run as the responder, use "fubar"
+as the password and "blah" as the identifier, use respp256.pem as the
+bootstrapping key, use respbkeys.txt as the flat file of peer's trusted
+bootstrapping keys, do PKEX only, and set the debugging mask to be verbose.
+The responder will wait until an intiator beings PKEX to it.
+
+  Start up a PKEX initiator:
+
+% ./sss -I lo0 -i -p fubar -n blah -k initp256.pem -B initbkeys.txt -b -d 63
+
+This says to use interface lo0 (loopback), run as the initiator, use "fubar"
+as the password and "blah" as the identifier, use initp256.pem as the
+bootstrapping key, use initbkeys.txt as the flat file of peer's trusted
+bootstrapping keys, do PKEX only, and set the debugging mask to be verbose.
+
+* PKEX then DPP
+
+  Start up a responder/enrollee:
+
+% ./sss -I ath0 -r -e ap -p thisissecret -k respbp384.pem -B respbkeys.txt -d 63
+
+This says to use the interface ath0 (802.11 radio), run as the responder, run as
+the enrollee with a role of "ap", use "thisissecret" as the PKEX password, use
+respbp384.pem as the bootstrapping key, use respbkeys.txt as the flat file of
+peer's trusted bootstrapping keys, and set verbose debugging.
+
+% ./sss -I lo0 -i -c signp521.pem -p thisissecret -k initbp384.pem -B initbkeys.txt -d 63
+
+This says to use the interface ath0 (802.11 radio)), run as the initiator, run as a
+configurator and sign with the key signp521.pem, use "thisissecret" as the PKEX
+password, use initbp384.pem as the bootstrapping key, use initbkeys.txt as the flat
+file of peer's trusted bootstrapping keys, and set verbose debugging.
+
+  Since this was a run of DPP as well, the enrollee will get a connector signed by
+the configurator. Since the enrollee had the role "ap" it will get a connector for
+the role of AP and be given an SSID to advertise. The ath0 interface on this device
+is now provisioned for DPP on that SSID and awaits connection from a STA. The
+connector received from this run is for the SSID "goaway" and looks like this:
+
+connector is signed with ES512, by key with key id:
+ SRHSlHn-YkFGdNq1XIBesoIy4YaSZGs7IRhvo8_py8s
+configurator's signing key is valid!!!
+connector:
+eyJ0eXAiOiJkcHBDb24iLCJraWQiOiJTUkhTbEhuLVlrRkdkTnExWElCZXNvSXk0WWFTWkdzN0lSaHZvOF
+9weThzIiwiYWxnIjoiRVM1MTIifQ.eyJncm91cHMiOlt7Imdyb3VwSWQiOiJpbnRlcm9wIiwibmV0Um9sZ
+SI6ImFwIn1dLCJuZXRBY2Nlc3NLZXkiOnsia3R5IjoiRUMiLCJjcnYiOiJCUC0zODQiLCJ4IjoiSkpxRGR
+mN2Z6X1dJcWN0VnI4Rnp0b0FLaGN4b3BFVlRIdk9ObTFzV3c0ZUlsaEtNUHdiYkJzNDJYbEFNRTE4cCIsI
+nkiOiJDR0lqRWRULXVQd0JCd0M0SklTeDhxaXROWVlicW50ODI5ZFZhbnF1bVJaSVZoVkU3NDkwYXphSEl
+oZVVERWZsIiwia2lkIjoid3NZNW1LalVXVGs0Y3A0QUdWaTVYRnBhR3pub1V1clBNblBIMTZQN19lQSJ9L
+CJleHBpcnkiOiIyMDIwLTAxLTAxVDAxOjAxOjAxIn0.ASt4K3BRyo3O9l1w9G6YWt2iJBmyrRUz5xM0-18
+QTTkFEs8TMqxLCZE7E093PyEdK9pGUK4wMg8BoissDyZNSpLQAciprohd8d2VB3R4acwuy9qoZr4EUVfM0
+BCO_X34aT1oSygyU39BaiGWYaoSPcKztOcmnpk_qw7Q05xCaazfZ2Dj
+with SSID goaway
+
+This is printed because debugging is set to verbose.
+
+  A STA can be provisioned on another device by running something similar, for example:
+
+% ./sss -I ath0 -r -e sta -p somethingunique -k stabp384.pem -B stabkeys.txt
+
+which, when it completes, will obtain a connector useful for a STA and told to 
+connect to "goaway". When it does it will exchange connectors and derive a PMK.
+
+* Wired DPP
+
+  A TCP/IP version of DPP is included with relay.c, controller.c, and device.c
+The controller is an aggregator of DPP conversations done over the wire through
+relays which encaps/decaps 802.11 action frames into/out of TCP/IP. The device
+speaks DPP solely through TCP/IP, no action frames used. 
+
+  To run it you need either a controller and a device or a controller, a relay,
+and a regualar instance of sss. For example,
+
+On freebsd, sss is running as a responder not doing mutual authentication
+(i.e. like a typical IoT device)
+
+ % sudo ./sss -I ath0 -r -e sta -k respp256.pem -a -d 63
+
+On linux a relay is running that would connect to a controller 10.10.10.99
+if anyone initiated to it and it will snoop for DPP frames with a responder's
+bootstrapping key indicated by the contents of controller.pem:
+
+ % sudo ./relay -I wlp58s0 -C 10.10.10.99 -k controller.pem -k 63
+
+And on macos the controller can be run to attack to a relay at 10.10.10.98
+and assuming the IoT device's (freebsd sss) public key has been bootstrapped
+into index 1 of initbkeys.txt:
+
+ % sudo ./controller -i -c signp256.pem -I 10.10.10.98 -k controller.pem \
+-B initbkeys.txt -x 1 -d 63
+
+The controller will initiate through the relay to the IoT device and provision
+a connector on it.
+
+CONTENTS OF DISTRIBUTION
+
+  There are various keys to use by the initiator (initXXX.pem) and the responder
+(respXXX.pem) and to use for signatures by the configurator (signXXX.pem). The
+curves are identified as:
+
+  p256 -- NIST 256-bit elliptic curve
+  p384 -- NIST 384-bit elliptic curve
+  p521 -- NIST 521-bit elliptic curve
+  bp256 -- Brainpool 256-bit elliptic curve
+  bp384 -- Brainpool 384-bit elliptic curve
+  bp512 -- Brainpool 512-bit elliptic curve
+
+More, or different ones, can be made with openssl.
+
+  There is a QR code for the controller-- controller.png contains the
+public key found in controller.pem. 
+
