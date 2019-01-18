@@ -1003,6 +1003,7 @@ add_interface (char *ptr)
     strncpy(ifr.ifr_name, inf->ifname, IFNAMSIZ);
     if (ioctl(inf->fd, SIOCGIFINDEX, &ifr) < 0) {
         fprintf(stderr, "unable to get if index on %s\n", inf->ifname);
+        free(inf);
         return;
     }
     ifidx = ifr.ifr_ifindex;
@@ -1027,6 +1028,7 @@ add_interface (char *ptr)
         if ((inf->nl_cb = nl_cb_alloc(NL_CB_DEFAULT)) == NULL) {
             fprintf(stderr, "unable to alloc an nl cb on %s\n", inf->ifname);
             free(inf);
+            return;
         }
 
         if ((inf->nl_sock = create_nl_socket(inf->nl_cb)) == NULL) {
