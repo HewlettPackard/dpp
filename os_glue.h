@@ -37,7 +37,7 @@ typedef unsigned int dpp_handle;
 int transmit_pkex_frame(unsigned char *, unsigned char *, unsigned char *, int);
 int transmit_auth_frame(dpp_handle, unsigned char *, int);
 int transmit_config_frame(dpp_handle, unsigned char, unsigned char *, int);
-int transmit_discovery_frame(dpp_handle, unsigned char *, int);
+int transmit_discovery_frame(unsigned char, unsigned char *, int);
 int provision_connector(char *, char *, int, char *, int, dpp_handle);
 int change_dpp_channel(dpp_handle, unsigned char, unsigned char);
 int bootstrap_peer(unsigned char *, int);

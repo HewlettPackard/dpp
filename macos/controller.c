@@ -72,7 +72,7 @@ message_from_relay (int fd, void *data)
 {
     struct conversation *conv = (struct conversation *)data;
     dpp_action_frame *dpp;
-    unsigned char buf[3000];
+    unsigned char buf[3000], pmk[PMK_LEN], pmkid[PMKID_LEN];
     int framesize, rlen;
     uint32_t netlen;
 
@@ -133,9 +133,19 @@ message_from_relay (int fd, void *data)
                      * DPP Discovery
                      */
                 case DPP_SUB_PEER_DISCOVER_REQ:
+                    printf("DPP discovery request...\n");
+                    if (process_dpp_discovery_frame(&buf[1], framesize - 1,
+                                                    (unsigned char)conv->handle, pmk, pmkid) < 0) {
+                        fprintf(stderr, "error processing DPP Discovery frame\n");
+                    }
+                    break;
                 case DPP_SUB_PEER_DISCOVER_RESP:
-                    printf("DPP discovery message...\n");
-                    if (process_dpp_discovery_frame(&buf[1], framesize - 1, conv->handle) < 0) {
+                    /*
+                     * shouldn't happen since we don't send DPP discovery requests....
+                     */
+                    printf("DPP discovery response...\n");
+                    if (process_dpp_discovery_frame(&buf[1], framesize - 1,
+                                                    (unsigned char)conv->handle, pmk, pmkid) < 0) {
                         fprintf(stderr, "error processing DPP Discovery frame\n");
                     }
                     break;
@@ -232,9 +242,9 @@ transmit_auth_frame (dpp_handle handle, char *data, int len)
 }
 
 int
-transmit_discovery_frame (dpp_handle handle, char *data, int len)
+transmit_discovery_frame (unsigned char tid, char *data, int len)
 {
-    return cons_action_frame(PUB_ACTION_VENDOR, handle, data, len);
+    return cons_action_frame(PUB_ACTION_VENDOR, (dpp_handle)tid, data, len);
 }
 
 int

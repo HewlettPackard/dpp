@@ -75,6 +75,7 @@ TAILQ_HEAD(bar, interface) interfaces;
 struct dpp_instance {
     TAILQ_ENTRY(dpp_instance) entry;
     dpp_handle handle;
+    unsigned int tid;
     unsigned char mymac[ETH_ALEN];
     unsigned char peermac[ETH_ALEN];
 };
@@ -161,6 +162,22 @@ find_instance_by_handle (dpp_handle handle)
 }
 
 struct dpp_instance *
+find_instance_by_tid (unsigned char tid)
+{
+    struct dpp_instance *found;
+    
+    TAILQ_FOREACH(found, &dpp_instances, entry) {
+        if (found->tid == tid) {
+            break;
+        }
+    }
+    if (found == NULL) {
+        fprintf(stderr, "unable to find dpp peer, tid = %d\n", tid);
+    }
+    return found;
+}
+
+struct dpp_instance *
 create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char *bskey)
 {
     struct dpp_instance *instance;
@@ -179,13 +196,29 @@ create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char
     return instance;
 }
 
+struct dpp_instance *
+create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
+{
+    struct dpp_instance *instance;
+    
+    if ((instance = (struct dpp_instance *)malloc(sizeof(struct dpp_instance))) == NULL) {
+        return NULL;
+    }
+    memcpy(instance->mymac, mymac, ETH_ALEN);
+    memcpy(instance->peermac, peermac, ETH_ALEN);
+    instance->tid = get_dpp_discovery_tid();
+    TAILQ_INSERT_HEAD(&dpp_instances, instance, entry);
+    
+    return instance;
+}
+
 static void
 process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *frame, int framesize)
 {
     dpp_action_frame *dpp;
     struct dpp_instance *instance;
     char el_id, el_len, ssid[33];
-    unsigned char *els;
+    unsigned char *els, pmk[PMK_LEN], pmkid[PMKID_LEN];
     unsigned short frame_control;
     int type, stype, left;
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -250,13 +283,23 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                                  * DPP Discovery
                                  */
                             case DPP_SUB_PEER_DISCOVER_REQ:
+                                if ((instance = create_discovery_instance(inf->bssid, frame->sa)) == NULL) {
+                                    break;
+                                }
+                                if (process_dpp_discovery_frame(frame->action.variable, left, instance->tid,
+                                                                pmk, pmkid) < 0) {
+                                    fprintf(stderr, "error processing DPP Discovery frame from " MACSTR "\n",
+                                            MAC2STR(frame->sa));
+                                }
+                                break;
                             case DPP_SUB_PEER_DISCOVER_RESP:
                                 if ((instance = find_instance_by_mac(inf->bssid, frame->sa)) == NULL) {
                                     fprintf(stderr, "no dpp instance at " MACSTR " from " MACSTR "\n",
                                             MAC2STR(inf->bssid), MAC2STR(frame->sa));
                                     return;
                                 }
-                                if (process_dpp_discovery_frame(frame->action.variable, left, instance->handle) < 0) {
+                                if (process_dpp_discovery_frame(frame->action.variable, left, instance->tid,
+                                                                pmk, pmkid) < 0) {
                                     fprintf(stderr, "error processing DPP Discovery frame from " MACSTR "\n",
                                             MAC2STR(frame->sa));
                                 }
@@ -341,12 +384,10 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                         if ((el_len == 0) || memcmp(ssid, our_ssid, strlen(ssid))) {
                             break;
                         }
-                        if ((instance = find_instance_by_mac(inf->bssid, frame->sa)) == NULL) {
-                            if ((instance = create_dpp_instance(inf->bssid, frame->sa, NULL)) == NULL) {
-                                break;
-                            }
+                        if ((instance = create_discovery_instance(inf->bssid, frame->sa)) == NULL) {
+                            break;
                         }
-                        if (dpp_begin_discovery(instance->handle) > 0) {
+                        if (dpp_begin_discovery(instance->tid) > 0) {
                             discovered = 1;
                         }
                         break;
@@ -761,11 +802,11 @@ transmit_auth_frame (dpp_handle handle, char *data, int len)
 }
 
 int
-transmit_discovery_frame (dpp_handle handle, char *data, int len)
+transmit_discovery_frame (unsigned char tid, char *data, int len)
 {
     struct dpp_instance *instance;
 
-    if ((instance = find_instance_by_handle(handle)) == NULL) {
+    if ((instance = find_instance_by_tid(tid)) == NULL) {
         return -1;
     }
     return cons_action_frame(PUB_ACTION_VENDOR, instance->mymac, instance->peermac, data, len);

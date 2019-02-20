@@ -43,7 +43,9 @@ dpp_handle dpp_allocate_handle(void);
 int dpp_create_peer(unsigned char *);
 int process_dpp_auth_frame(unsigned char *, int, dpp_handle);
 int process_dpp_config_frame(unsigned char, unsigned char *, int, dpp_handle);
-int process_dpp_discovery_frame(unsigned char *, int, dpp_handle);
-int dpp_begin_discovery(dpp_handle);
+int process_dpp_discovery_frame(unsigned char *, int, unsigned char, 
+                                unsigned char *, unsigned char *);
+unsigned char get_dpp_discovery_tid(void);
+int dpp_begin_discovery(unsigned char);
 
 #endif  /* _DPP_H_ */

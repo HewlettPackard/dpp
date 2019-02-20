@@ -9,6 +9,14 @@ new sss.c module for the new OS. Each <os>/sss.c must:
   4. call DPP APIs to run PKEX and DPP Authentication.
   5. provide APIs to DPP to provision an 802.11 interface per the
      data received during DPP provisioning.
+  6. implement provisioned role
+     6a) AP needs to beacon out the provisioned SSID with the
+         DPP AKM.
+     6b) STA needs to scan for the provisioned SSID, initiate
+         DPP discovery when found.
+  7. take the PMK that results from DPP discovery and use it--
+     associate, do the 4way handshake with the PMK, plumb the
+     resulting secrets to the radio and start networking!
 
 A generic service model, service.[ch], is included to allow <os>/sss.c
 to manage socket interfaces and allow dpp and pkex to manage timers.
@@ -57,6 +65,14 @@ int dpp_initialize (int initiator, int core, int mutual, char *keyfile,
 		    int opclass, int channel, int verbosity)
 
 Before beginning the protocol.
+
+DPP discovery does not use a DPP instance created with dpp_initialize().
+One must call
+
+unsigned char get_dpp_discovery(void)
+
+to obtain a transaction ID, bind appropriate MAC addresses to that state,
+and pass the transaction ID to the appropriate discovery API.
 
 
 

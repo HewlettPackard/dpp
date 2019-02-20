@@ -78,6 +78,9 @@ ieee_order (unsigned short x)                   /* if BE, byte-swap */
 
 #define ETH_ALEN                                6
 
+#define PMK_LEN                                 64  /* could be product of SHA512 */
+#define PMKID_LEN                               16
+
 /*
  * some prefix matches for the NL80211 interface under linux
  */

@@ -85,6 +85,7 @@
 #define STATUS_DECRYPT_FAILURE          3
 #define STATUS_CONFIGURE_FAILURE        5
 #define STATUS_RESPONSE_PENDING         6
+#define STATUS_INVALID_CONNECTOR        7
 
 /*
  * DPP roles
@@ -139,14 +140,19 @@ struct candidate {
     int nextfragment;
     char enrollee_name[80];
     char enrollee_role[10];
-    char *connector;
-    int connector_len;
-    char discovery_transaction;
-    EC_KEY *configurator_signkey;
-    unsigned char csign_kid[KID_LENGTH];
     unsigned char field;
     unsigned char enonce[SHA512_DIGEST_LENGTH/2];
 };
+
+/*
+ * stuff that gets provisioned when we are an enrollee
+ */
+static EC_KEY *netaccesskey;
+static char *connector;
+static int connector_len;
+static unsigned char discovery_transaction = 0;
+static EC_KEY *configurator_signkey;   /* we're an enrollee, this isn't ours */
+static unsigned char csign_kid[KID_LENGTH];
 
 /*
  * our instance of DPP
@@ -154,7 +160,7 @@ struct candidate {
 struct _dpp_instance {
     TAILQ_HEAD(blah, candidate) peers;
     EC_KEY *bootstrap;
-    EC_KEY *signkey;
+    EC_KEY *signkey;            /* we're the configurator, this is ours */
     const EC_GROUP *group;
     const EVP_MD *hashfcn;
     char core;                  /* capabile of being configurator or enrollee */
@@ -179,7 +185,6 @@ static int dpp_initialized = 0;
 static BN_CTX *bnctx = NULL;
 static int debug = 0;
 static int is_initiator;
-static unsigned char trans_id = 0;
 
 static unsigned char wfa_dpp[4] = { 0x50, 0x6f, 0x9a, 0x1a };
 static unsigned char dpp_proto_elem_req[3] = { 0x6c, 0x08, 0x00 };
@@ -606,63 +611,59 @@ ieee_ize_attributes (unsigned char *attributes, int len)
 //----------------------------------------------------------------------
 
 static int
-send_dpp_discovery_frame (struct candidate *peer, unsigned char frametype, unsigned char tid)
+send_dpp_discovery_frame (unsigned char frametype, unsigned char status, 
+                          unsigned char tid, unsigned char transaction_id)
 {
     TLV *tlv;
     dpp_action_frame *frame;
+    unsigned char framebuf[WIRELESS_MTU + 40];
+    unsigned char buffer[4096];
+    int bufferlen;
 
-    memset(peer->buffer, 0, sizeof(peer->buffer));
+    memset(buffer, 0, sizeof(buffer));
 
-    tlv = (TLV *)peer->buffer;
+    tlv = (TLV *)buffer;
     tlv = TLV_set_tlv(tlv, TRANSACTION_IDENTIFIER, 1, &tid);
-    tlv = TLV_set_tlv(tlv, CONNECTOR, peer->connector_len, (unsigned char *)peer->connector);
-    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+    if (frametype == DPP_SUB_PEER_DISCOVER_RESP) {
+        tlv = TLV_set_tlv(tlv, DPP_STATUS, 1, &status);
+    }
+    if (status == STATUS_OK) {
+        tlv = TLV_set_tlv(tlv, CONNECTOR, connector_len, (unsigned char *)connector);
+    }
+    bufferlen = (int)((unsigned char *)tlv - buffer);
 
-    ieee_ize_attributes(peer->buffer, peer->bufferlen);
+    ieee_ize_attributes(buffer, bufferlen);
 
-    frame = (dpp_action_frame *)peer->frame;
+    frame = (dpp_action_frame *)framebuf;
     memcpy(frame->oui_type, wfa_dpp, sizeof(wfa_dpp));
     frame->cipher_suite = 1;
     frame->frame_type = frametype;
-    memcpy(frame->attributes, peer->buffer, peer->bufferlen);
+    memcpy(frame->attributes, buffer, bufferlen);
     /*
      * TODO: retransmission....
      */
-    return transmit_discovery_frame(peer->handle, peer->frame, peer->bufferlen + sizeof(dpp_action_frame));
+    return transmit_discovery_frame(transaction_id, framebuf, bufferlen + sizeof(dpp_action_frame));
 }
 
 int
-dpp_begin_discovery (dpp_handle handle)
+dpp_begin_discovery (unsigned char transaction_id)
 {
-    struct candidate *peer = NULL;
-
     dpp_debug(DPP_DEBUG_TRACE, "initiate DPP discovery...\n");
 
-    TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
-        if (peer->handle == handle) {
-            break;
-        }
-    }
-    if (peer == NULL) {
-        dpp_debug(DPP_DEBUG_ERR, "don't have state to initiate DPP!\n");
-        return -1;
-    }
-    if ((peer->connector == NULL) || (peer->connector_len < 1)) {
-        dpp_debug(DPP_DEBUG_ERR, "don't have a connector for peer with handle %d\n", handle);
+    if ((connector == NULL) || (connector_len < 1)) {
+        dpp_debug(DPP_DEBUG_ERR, "don't have a connector for peer with tid %d\n", transaction_id);
         return -1;
     }
 
-    trans_id++;
-    peer->discovery_transaction = trans_id;
-    send_dpp_discovery_frame (peer, DPP_SUB_PEER_DISCOVER_REQ, trans_id);
+    send_dpp_discovery_frame (DPP_SUB_PEER_DISCOVER_REQ, STATUS_OK, transaction_id, transaction_id);
     
     return 1;
 }
 
 static int
-process_dpp_discovery_connector (struct candidate *peer, unsigned char *connector, int connector_len)
+process_dpp_discovery_connector (unsigned char *conn, int conn_len, unsigned char *pmk, unsigned char *pmkid)
 {
-    unsigned char unburl[1024], *dot, pmk[SHA512_DIGEST_LENGTH], pmkid[SHA512_DIGEST_LENGTH], *nx = NULL;
+    unsigned char unburl[1024], *dot, *nx = NULL;
     char *sstr, *estr;
     unsigned int mdlen = SHA512_DIGEST_LENGTH;
     int unburllen, ntok, ret = -1;
@@ -676,8 +677,8 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
     /*
      * base64url decode the JWS Protected Header then extract and decode the 'kid'
      */
-    dot = (unsigned char *)strstr((char *)connector, ".");
-    if ((unburllen = base64urldecode(unburl, connector, dot - connector)) < 1) {
+    dot = (unsigned char *)strstr((char *)conn, ".");
+    if ((unburllen = base64urldecode(unburl, conn, dot - conn)) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "Unable to base64url decode protected header of connector!\n");
         return -1;
     }
@@ -688,10 +689,10 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
     /*
      * if the 'kid' of the signer of the connector matches our configurator's 'kid'...
      */
-    if (((int)(estr - sstr) != KID_LENGTH) || memcmp(peer->csign_kid, sstr, KID_LENGTH)) {
+    if (((int)(estr - sstr) != KID_LENGTH) || memcmp(csign_kid, sstr, KID_LENGTH)) {
         dpp_debug(DPP_DEBUG_ERR, "'kid' in peer's connector unknown!\n");
         debug_buffer(DPP_DEBUG_ERR, "configurator's 'kid'",
-                     (unsigned char *)peer->csign_kid, KID_LENGTH);
+                     (unsigned char *)csign_kid, KID_LENGTH);
         debug_buffer(DPP_DEBUG_ERR, "'kid' in peer's connector",
                      (unsigned char *)sstr, (int)(estr - sstr));
         return -1;
@@ -701,8 +702,8 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
     /*
      * ...then validate the connector
      */
-    if (validate_connector(connector, connector_len,
-                           peer->configurator_signkey, bnctx) < 0) {
+    if (validate_connector(conn, conn_len,
+                           configurator_signkey, bnctx) < 0) {
         dpp_debug(DPP_DEBUG_ERR, "connector in DPP discovery frame is not valid!\n");
         return -1;
     }
@@ -711,12 +712,12 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
     /*
      * extract the point from the valid connector, making sure it's same group as ours
      */
-    if ((PK = get_point_from_connector(connector, connector_len, dpp_instance.group, bnctx)) == NULL) {
+    if ((PK = get_point_from_connector(conn, conn_len, dpp_instance.group, bnctx)) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "can't extract point from connector!\n");
         goto fail;;
     }
-    if (((nk = EC_KEY_get0_private_key(peer->my_proto)) == NULL) ||
-        ((NK = EC_KEY_get0_public_key(peer->my_proto)) == NULL)) {
+    if (((nk = EC_KEY_get0_private_key(netaccesskey)) == NULL) ||
+        ((NK = EC_KEY_get0_public_key(netaccesskey)) == NULL)) {
         dpp_debug(DPP_DEBUG_ERR, "can't get my own network key! FAIL!\n");
         goto fail;
     }
@@ -738,13 +739,13 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
      */
     memset(nx, 0, dpp_instance.primelen);
     BN_bn2bin(x, nx + (dpp_instance.primelen - BN_num_bytes(x)));
-    memset(pmk, 0, SHA512_DIGEST_LENGTH);
+    memset((char *)pmk, 0, SHA512_DIGEST_LENGTH);
     /*
      * ...derive PMK
      */
     hkdf(dpp_instance.hashfcn, 0, nx, dpp_instance.primelen, NULL, 0,
-         (unsigned char *)"DPP PMK", strlen("DPP PMK"), pmk, dpp_instance.digestlen);
-    print_buffer("pmk", pmk, dpp_instance.digestlen);
+         (unsigned char *)"DPP PMK", strlen("DPP PMK"), (char *)pmk, dpp_instance.digestlen);
+    print_buffer("pmk", (char *)pmk, dpp_instance.digestlen);
     /*
      * PMKID is based on x-coordinates of both public keys
      */
@@ -777,8 +778,8 @@ process_dpp_discovery_connector (struct candidate *peer, unsigned char *connecto
         BN_bn2bin(pkx, nx + (dpp_instance.primelen - BN_num_bytes(pkx)));
         EVP_DigestUpdate(mdctx, nx, dpp_instance.primelen);
     }
-    EVP_DigestFinal(mdctx, pmkid, &mdlen);
-    print_buffer("pmkid", pmkid, 16);   /* PMKID is fixed at 128 bits */
+    EVP_DigestFinal(mdctx, (char *)pmkid, &mdlen);
+    print_buffer("pmkid", (char *)pmkid, PMKID_LEN);   /* PMKID is fixed at 128 bits */
 
     ret = 1;
 fail:
@@ -806,25 +807,30 @@ fail:
     return ret;
 }
 
+unsigned char
+get_dpp_discovery_tid (void)
+{
+    return ++discovery_transaction;
+}
+
 int
-process_dpp_discovery_frame (unsigned char *data, int len, dpp_handle handle)
+process_dpp_discovery_frame (unsigned char *data, int len, unsigned char transaction_id,
+                             unsigned char *pmk, unsigned char *pmkid)
 {
     TLV *tlv;
-    unsigned char tid;
-    struct candidate *peer = NULL;
+    unsigned char tid, *val;
     dpp_action_frame *frame = (dpp_action_frame *)data;
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP discovery frame!\n");
-    TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
-        if (peer->handle == handle) {
-            break;
-        }
-    }
-    if (peer == NULL) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to find peer to respond to discovery frame!\n");
+    if ((connector == NULL) || (connector_len < 1)) {
+        dpp_debug(DPP_DEBUG_ERR, "don't have a connector to do discovery with!\n");
         return -1;
     }
-    srv_rem_timeout(srvctx, peer->t0);
+    if (configurator_signkey == NULL) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "No configurator signing key, discarding DPP Discovery Request!\n");
+        return 1;
+    }
+
     ieee_ize_attributes(frame->attributes, len - sizeof(dpp_action_frame));
 
     tlv = (TLV *)frame->attributes;
@@ -834,33 +840,48 @@ process_dpp_discovery_frame (unsigned char *data, int len, dpp_handle handle)
     }
     memcpy(&tid, TLV_value(tlv), 1);
     tlv = TLV_next(tlv);
-    if (TLV_type(tlv) != CONNECTOR) {
-        dpp_debug(DPP_DEBUG_ERR, "2nd TLV in dpp discovery request was not a connector!\n");
-        return -1;
-    }
     switch (frame->frame_type) {
         case DPP_SUB_PEER_DISCOVER_REQ:
-            if (peer->connector == NULL || peer->connector_len < 1) {
-                dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "No connector to send back, discarding DPP Discovery Request!\n");
-                return 1;
-            }
-            if (peer->configurator_signkey == NULL) {
-                dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "No configurator signing key, discarding DPP Discovery Request!\n");
-                return 1;
-            }
-            if (process_dpp_discovery_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "failed to process dpp discovery request!\n");
+            if (TLV_type(tlv) != CONNECTOR) {
+                dpp_debug(DPP_DEBUG_ERR, "2nd TLV in dpp discovery request was not a connector!\n");
                 return -1;
             }
-            send_dpp_discovery_frame(peer, DPP_SUB_PEER_DISCOVER_RESP, tid);
+            if (process_dpp_discovery_connector(TLV_value(tlv), TLV_length(tlv), pmk, pmkid) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "failed to process dpp discovery request!\n");
+                send_dpp_discovery_frame(DPP_SUB_PEER_DISCOVER_RESP, STATUS_INVALID_CONNECTOR, tid, transaction_id);
+                return -1;
+            }
+            /*
+             * the tid is the peer's for it to identify our response
+             * transaction_id is ours to identify the state of the exchange 
+             */
+            send_dpp_discovery_frame(DPP_SUB_PEER_DISCOVER_RESP, STATUS_OK, tid, transaction_id);
             break;
         case DPP_SUB_PEER_DISCOVER_RESP:
-            if (tid != peer->discovery_transaction) {
+            /*
+             * non-AP STAs should not have more than one active transaction at a time
+             */
+            if (tid != transaction_id) {
                 dpp_debug(DPP_DEBUG_ERR, "got a spurious DPP Discovery Response (%d, expected %d)\n",
-                          tid, peer->discovery_transaction);
+                          tid, discovery_transaction);
                 return -1;
             }
-            if (process_dpp_discovery_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 1) {
+            if (TLV_type(tlv) != DPP_STATUS) {
+                dpp_debug(DPP_DEBUG_ERR, "2nd TLV in dpp discovery response was not status!\n");
+                return -1;
+            }
+            val = TLV_value(tlv);
+            if (*val != STATUS_OK) {
+                dpp_debug(DPP_DEBUG_ERR, "Peer indicated error %d in discovery response status!\n", 
+                          TLV_value(tlv));
+                return -1;
+            }
+            tlv = TLV_next(tlv);
+            if (TLV_type(tlv) != CONNECTOR) {
+                dpp_debug(DPP_DEBUG_ERR, "3rd TLV in dpp discovery response was not a connector!\n");
+                return -1;
+            }
+            if (process_dpp_discovery_connector(TLV_value(tlv), TLV_length(tlv), pmk, pmkid) < 1) {
                 dpp_debug(DPP_DEBUG_ERR, "failed to process dpp discovery request!\n");
                 return -1;
             }
@@ -885,7 +906,8 @@ dump_key_con (struct candidate *peer)
 {
     FILE *fp;
     char *buf;
-    int buflen, i;
+    int buflen;
+    BIO *bio;
 
     /*
      * write out the connector...
@@ -894,32 +916,29 @@ dump_key_con (struct candidate *peer)
         dpp_debug(DPP_DEBUG_ERR, "unable to store the connector!\n");
         return;
     }
-    if ((buf = malloc(peer->connector_len + 1)) == NULL) {
+    if ((buf = malloc(connector_len + 1)) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to copy the connector!\n");
         return;
     }
-    memcpy(buf, peer->connector, peer->connector_len);
-    buf[peer->connector_len] = '\0';
+    memcpy(buf, connector, connector_len);
+    buf[connector_len] = '\0';
     fprintf(fp, "%s\n", buf);
     free(buf);
     fclose(fp);
 
-    buf = NULL;
-    /*
-     * ...and the private key
-     */
-    buflen = i2d_ECPrivateKey(peer->my_proto, (unsigned char **)&buf);
+    if ((bio = BIO_new(BIO_s_file())) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to save network access key!\n");
+        return;
+    }
     if ((fp = fopen("netaccesskey", "w")) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to store the network access key!\n");
         return;
     }
-    for (i = 0; i < buflen; i++) {
-        fprintf(fp, "%02x", buf[i] & 0xff);
-    }
+    BIO_set_fp(bio, fp, BIO_CLOSE);
+    buflen = PEM_write_bio_ECPrivateKey(bio, netaccesskey, NULL, NULL, 0, NULL, NULL);
 
     fflush(fp);
-    fclose(fp);
-    OPENSSL_free(buf);
+    BIO_free(bio);
 }
 
 static int
@@ -928,7 +947,7 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     siv_ctx ctx;
     TLV *tlv, *wraptlv;
     unsigned char burlx[256], burly[256], kid[SHA512_DIGEST_LENGTH];
-    unsigned char connector[1024], *bn = NULL;
+    unsigned char conn[1024], *bn = NULL;
     char confobj[1536];
     int sofar = 0, offset, burllen, nid;
     BIGNUM *x = NULL, *y = NULL, *signprime = NULL;
@@ -947,7 +966,7 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     /*
      * if we can't generate a connector then indicate configuration failure
      */
-    if (generate_connector(connector, sizeof(connector), (EC_GROUP *)dpp_instance.group,
+    if (generate_connector(conn, sizeof(conn), (EC_GROUP *)dpp_instance.group,
                            peer->peer_proto, peer->enrollee_role,
                            dpp_instance.signkey, bnctx) < 0) {
         dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
@@ -1005,7 +1024,7 @@ problemo:
                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                          "\"expiry\":\"2020-01-01T01:01:01\"}}",
-                         connector,
+                         conn,
 #ifdef HAS_BRAINPOOL
                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                          nid == NID_secp384r1 ? "P-384" : \
@@ -1320,19 +1339,19 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
         /*
          * create an EC_KEY out of "crv", "x", and "y"
          */
-        peer->configurator_signkey = EC_KEY_new_by_curve_name(signnid);
-        EC_KEY_set_public_key_affine_coordinates(peer->configurator_signkey, x, y);
-        EC_KEY_set_conv_form(peer->configurator_signkey, POINT_CONVERSION_COMPRESSED);
-        EC_KEY_set_asn1_flag(peer->configurator_signkey, OPENSSL_EC_NAMED_CURVE);
-        if (((signgroup = EC_KEY_get0_group(peer->configurator_signkey)) == NULL) ||
-            ((P = EC_KEY_get0_public_key(peer->configurator_signkey)) == NULL) ||
+        configurator_signkey = EC_KEY_new_by_curve_name(signnid);
+        EC_KEY_set_public_key_affine_coordinates(configurator_signkey, x, y);
+        EC_KEY_set_conv_form(configurator_signkey, POINT_CONVERSION_COMPRESSED);
+        EC_KEY_set_asn1_flag(configurator_signkey, OPENSSL_EC_NAMED_CURVE);
+        if (((signgroup = EC_KEY_get0_group(configurator_signkey)) == NULL) ||
+            ((P = EC_KEY_get0_public_key(configurator_signkey)) == NULL) ||
             !EC_POINT_is_on_curve(signgroup, P, bnctx)) {
             dpp_debug(DPP_DEBUG_ERR, "configurator's signing key is not valid!\n");
             goto fin;
         }
         dpp_debug(DPP_DEBUG_TRACE, "configurator's signing key is valid!!!\n");
 
-        if (get_kid_from_point(peer->csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
+        if (get_kid_from_point(csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
             dpp_debug(DPP_DEBUG_ERR, "can't get key id for configurator's sign key!\n");
             goto fin;
         }
@@ -1345,27 +1364,31 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
             goto fin;
         }
-        if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), peer->configurator_signkey, bnctx) < 0) {
+        if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), configurator_signkey, bnctx) < 0) {
             dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
             goto fin;
         }
-        peer->connector_len = (int)(estr - sstr);
-        if ((peer->connector = malloc(peer->connector_len)) == NULL) {
-            peer->connector_len = 0;
+        connector_len = (int)(estr - sstr);
+        if ((connector = malloc(connector_len)) == NULL) {
+            connector_len = 0;
             dpp_debug(DPP_DEBUG_ERR, "Unable to allocate a connector!!\n");
             goto fin;
         }
-        memcpy(peer->connector, sstr, peer->connector_len);
+        memcpy(connector, sstr, connector_len);
+        if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
+            goto fin;
+        }
 
         dump_key_con(peer);
 
         if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                   &sstr, &estr, 2, "discovery", "ssid")) == 0) {
             provision_connector(dpp_instance.enrollee_role, "*", 1,
-                                peer->connector, peer->connector_len, peer->handle);
+                                connector, connector_len, peer->handle);
         } else {
             provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                peer->connector, peer->connector_len, peer->handle);
+                                connector, connector_len, peer->handle);
         }
     } else if (strncmp(sstr, "psk", 3) == 0) {
         /*
@@ -1394,8 +1417,8 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
     ret = 1;
 fin:
     if (ret < 1) {
-        if (peer->configurator_signkey != NULL) {
-            EC_KEY_free(peer->configurator_signkey);
+        if (configurator_signkey != NULL) {
+            EC_KEY_free(configurator_signkey);
         }
     }
     if (x != NULL) {
@@ -3408,9 +3431,9 @@ dpp_create_peer (char *keyb64)
         return -1;
     }
     
-    peer->configurator_signkey = NULL;  // even if this is a configurator, used by discovery
-    peer->connector = NULL;
-    peer->connector_len = 0;
+    configurator_signkey = NULL;  // even if this is a configurator, used by discovery
+    connector = NULL;
+    connector_len = 0;
     peer->state = DPP_BOOTSTRAPPED;
     TAILQ_INSERT_HEAD(&dpp_instance.peers, peer, entry);
 

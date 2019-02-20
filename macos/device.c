@@ -108,7 +108,7 @@ transmit_auth_frame (dpp_handle unused, char *data, int len)
 }
 
 int
-transmit_discovery_frame (dpp_handle unused, char *data, int len)
+transmit_discovery_frame (unsigned char tid, char *data, int len)
 {
     return cons_action_frame(PUB_ACTION_VENDOR, data, len);
 }
@@ -149,11 +149,9 @@ process_incoming_mgmt_frame(unsigned char type, unsigned char *msg, int len)
                     break;
                 case DPP_SUB_PEER_DISCOVER_REQ:
                 case DPP_SUB_PEER_DISCOVER_RESP:
-                    printf("DPP Peer Discovery frame...\n");
-                    if (process_dpp_discovery_frame(msg, len, handle) < 0) {
-                        fprintf(stderr, "error processing DPP Auth frame!\n");
-                        return -1;
-                    }
+                    /*
+                     * device doesn't send or receive DPP discovery frames
+                     */
                     break;
                 case PKEX_SUB_EXCH_REQ:
                 case PKEX_SUB_COM_REV_REQ:
