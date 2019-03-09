@@ -40,9 +40,13 @@ straightforward to patch as the diffs are minor) to allow for the
 sending of 802.11 authentication frames via a BPF. Rebuild the
 OS with these patchs.
 
-  Change directories to the top level. You may need to run some
-of the autohell stuff (aclocal, autoconf, automake) first but
-configure the package like this:
+  Change directories to the top level and run the autotools commands:
+
+% aclocal
+% autoconf
+% automake
+
+   Then configure the package like this:
 
 % ./configure --with-ssl="<directory>" [--enable-brainpool] 
 
@@ -174,9 +178,9 @@ On linux a relay is running that would connect to a controller 10.10.10.99
 if anyone initiated to it and it will snoop for DPP frames with a responder's
 bootstrapping key indicated by the contents of controller.pem:
 
- % sudo ./relay -I wlp58s0 -C 10.10.10.99 -k controller.pem -k 63
+ % sudo ./relay -I wlp58s0 -C 10.10.10.99 -k controller.pem -d 63
 
-And on macos the controller can be run to attack to a relay at 10.10.10.98
+And on macos the controller can be run to attach to a relay at 10.10.10.98
 and assuming the IoT device's (freebsd sss) public key has been bootstrapped
 into index 1 of initbkeys.txt:
 
