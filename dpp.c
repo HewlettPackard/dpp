@@ -592,8 +592,12 @@ retransmit_auth (timerid id, void *data)
     return;
 }
 
+/*
+ * IEEE order is little endian, ensure things go out (hton) correctly 
+ * and can be coverted (ntoh) after receipt
+ */
 static void
-ieee_ize_attributes (unsigned char *attributes, int len)
+ieeeize_hton_attributes (unsigned char *attributes, int len)
 {
     unsigned char *ptr = attributes;
     TLV *tlv;
@@ -603,6 +607,19 @@ ieee_ize_attributes (unsigned char *attributes, int len)
         ptr = (unsigned char *)TLV_next(tlv);
         tlv->type = ieee_order(tlv->type);
         tlv->length = ieee_order(tlv->length);
+    }
+}
+
+static void ieeeize_ntoh_attributes (unsigned char *attributes, int len)
+{
+    unsigned char *ptr = attributes;
+    TLV *tlv;
+
+    while (ptr < (attributes + len)) {
+        tlv = (TLV *)ptr;
+        tlv->type = ieee_order(tlv->type);
+        tlv->length = ieee_order(tlv->length);
+        ptr = (unsigned char *)TLV_next(tlv);
     }
 }
 
@@ -632,7 +649,7 @@ send_dpp_discovery_frame (unsigned char frametype, unsigned char status,
     }
     bufferlen = (int)((unsigned char *)tlv - buffer);
 
-    ieee_ize_attributes(buffer, bufferlen);
+    ieeeize_hton_attributes(buffer, bufferlen);
 
     frame = (dpp_action_frame *)framebuf;
     memcpy(frame->oui_type, wfa_dpp, sizeof(wfa_dpp));
@@ -744,8 +761,8 @@ process_dpp_discovery_connector (unsigned char *conn, int conn_len, unsigned cha
      * ...derive PMK
      */
     hkdf(dpp_instance.hashfcn, 0, nx, dpp_instance.primelen, NULL, 0,
-         (unsigned char *)"DPP PMK", strlen("DPP PMK"), (char *)pmk, dpp_instance.digestlen);
-    print_buffer("pmk", (char *)pmk, dpp_instance.digestlen);
+         (unsigned char *)"DPP PMK", strlen("DPP PMK"), pmk, dpp_instance.digestlen);
+    print_buffer("pmk", pmk, dpp_instance.digestlen);
     /*
      * PMKID is based on x-coordinates of both public keys
      */
@@ -778,8 +795,8 @@ process_dpp_discovery_connector (unsigned char *conn, int conn_len, unsigned cha
         BN_bn2bin(pkx, nx + (dpp_instance.primelen - BN_num_bytes(pkx)));
         EVP_DigestUpdate(mdctx, nx, dpp_instance.primelen);
     }
-    EVP_DigestFinal(mdctx, (char *)pmkid, &mdlen);
-    print_buffer("pmkid", (char *)pmkid, PMKID_LEN);   /* PMKID is fixed at 128 bits */
+    EVP_DigestFinal(mdctx, pmkid, &mdlen);
+    print_buffer("pmkid", pmkid, PMKID_LEN);   /* PMKID is fixed at 128 bits */
 
     ret = 1;
 fail:
@@ -831,7 +848,7 @@ process_dpp_discovery_frame (unsigned char *data, int len, unsigned char transac
         return 1;
     }
 
-    ieee_ize_attributes(frame->attributes, len - sizeof(dpp_action_frame));
+    ieeeize_ntoh_attributes(frame->attributes, len - sizeof(dpp_action_frame));
 
     tlv = (TLV *)frame->attributes;
     if (TLV_type(tlv) != TRANSACTION_IDENTIFIER) {
@@ -925,6 +942,7 @@ dump_key_con (struct candidate *peer)
     fprintf(fp, "%s\n", buf);
     free(buf);
     fclose(fp);
+    dpp_debug(DPP_DEBUG_TRACE, "wrote %d byte connector\n", connector_len);
 
     if ((bio = BIO_new(BIO_s_file())) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to save network access key!\n");
@@ -936,6 +954,7 @@ dump_key_con (struct candidate *peer)
     }
     BIO_set_fp(bio, fp, BIO_CLOSE);
     buflen = PEM_write_bio_ECPrivateKey(bio, netaccesskey, NULL, NULL, 0, NULL, NULL);
+    dpp_debug(DPP_DEBUG_TRACE, "%s netaccesskey\n", buflen > 0 ? "wrote" : "didn't write");
 
     fflush(fp);
     BIO_free(bio);
@@ -953,6 +972,8 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     BIGNUM *x = NULL, *y = NULL, *signprime = NULL;
     const EC_POINT *signpub;
     const EC_GROUP *signgroup;
+    unsigned char *encrypt_ptr = NULL;
+    unsigned short wrapped_len = 0;
 
     memset(peer->buffer, 0, sizeof(peer->buffer));
     peer->bufferlen = 0;
@@ -961,6 +982,7 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     wraptlv = TLV_set_tlv(tlv, DPP_STATUS, 1, &status);
     wraptlv->type = WRAPPED_DATA;
     tlv = (TLV *)(wraptlv->value + AES_BLOCK_SIZE);
+    encrypt_ptr = (unsigned char *)tlv;
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
 
     /*
@@ -1042,10 +1064,16 @@ problemo:
     }
 
     wraptlv->length = (int)((unsigned char *)tlv - (unsigned char *)wraptlv->value);
+    wrapped_len = wraptlv->length - AES_BLOCK_SIZE;
     /*
-     * datalen ends up being the amount of stuff we need to wrap (exclude the SIV)
+     * ieee-ize the attributes that get encrypted
      */
-    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+    ieeeize_hton_attributes(encrypt_ptr, ((unsigned char *)tlv - encrypt_ptr));
+    /*
+     * ...and the stuff that doesn't
+     */
+    ieeeize_hton_attributes(peer->buffer, ((unsigned char *)tlv - peer->buffer));
+
     switch(dpp_instance.digestlen) {
         case SHA256_DIGEST_LENGTH:
             siv_init(&ctx, peer->ke, SIV_256);
@@ -1059,9 +1087,11 @@ problemo:
         default:
             dpp_debug(DPP_DEBUG_ERR, "unknown digest length %d!\n", dpp_instance.digestlen);
     }
-    siv_encrypt(&ctx, wraptlv->value + AES_BLOCK_SIZE, wraptlv->value + AES_BLOCK_SIZE,
-                wraptlv->length - AES_BLOCK_SIZE, wraptlv->value, 1, &peer->buffer,
+    siv_encrypt(&ctx, wraptlv->value + AES_BLOCK_SIZE, encrypt_ptr, wrapped_len,
+                wraptlv->value, 1, &peer->buffer,
                 (int)((unsigned char *)wraptlv - (unsigned char *)peer->buffer));
+
+    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
 
     (void)send_dpp_config_frame(peer, GAS_INITIAL_RESPONSE);
     
@@ -1103,7 +1133,7 @@ send_dpp_config_req_frame (struct candidate *peer)
     }
 
     tlv = (TLV *)peer->buffer;
-    tlv->type = WRAPPED_DATA;
+    tlv->type = ieee_order(WRAPPED_DATA);
     tlv = (TLV *)(tlv->value + AES_BLOCK_SIZE);
 
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
@@ -1112,6 +1142,12 @@ send_dpp_config_req_frame (struct candidate *peer)
                       whoami, dpp_instance.enrollee_role);
     tlv = TLV_set_tlv(tlv, CONFIG_ATTRIBUTES_OBJECT, caolen, (unsigned char *)confattsobj);
 
+    /*
+     * put the attributes into ieee-order
+     */
+    ieeeize_hton_attributes((((TLV *)peer->buffer)->value + AES_BLOCK_SIZE),
+                            (unsigned char *)tlv - (((TLV *)peer->buffer)->value + AES_BLOCK_SIZE));
+    
     switch(dpp_instance.digestlen) {
         case SHA256_DIGEST_LENGTH:
             siv_init(&ctx, peer->ke, SIV_256);
@@ -1130,9 +1166,13 @@ send_dpp_config_req_frame (struct candidate *peer)
      */
     peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
     tlv = (TLV *)peer->buffer;
-    tlv->length = peer->bufferlen - sizeof(TLV);
+    /*
+     * only 1 attribute to put into ieee-order...
+     */
+    tlv->length = ieee_order(peer->bufferlen - sizeof(TLV));
 
-    siv_encrypt(&ctx, tlv->value + AES_BLOCK_SIZE, tlv->value + AES_BLOCK_SIZE, tlv->length - AES_BLOCK_SIZE,
+    siv_encrypt(&ctx, tlv->value + AES_BLOCK_SIZE, tlv->value + AES_BLOCK_SIZE,
+                (peer->bufferlen - sizeof(TLV)) - AES_BLOCK_SIZE,
                 tlv->value, 0);
 
     if (send_dpp_config_frame(peer, GAS_INITIAL_REQUEST)) {
@@ -1158,7 +1198,7 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config response!\n");
 
-    ieee_ize_attributes(attrs, len);
+    ieeeize_ntoh_attributes(attrs, len);
     tlv = (TLV *)attrs;
     if ((TLV_type(tlv) != DPP_STATUS) || (TLV_length(tlv) != 1)) {
         dpp_debug(DPP_DEBUG_ERR, "missing status in DPP Config Response!\n");
@@ -1440,7 +1480,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config request!\n");
 
-    ieee_ize_attributes(attrs, len);
+    ieeeize_ntoh_attributes(attrs, len);
     tlv = (TLV *)attrs;
     if (TLV_type(tlv) != WRAPPED_DATA) {
         dpp_debug(DPP_DEBUG_ERR, "Wrapped data not in DPP Config Request!\n");
@@ -1468,7 +1508,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     /*
      * ieee-ize the attribute lengths and point to the first TLV in the wrapped data
      */
-    ieee_ize_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
+    ieeeize_ntoh_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
     tlv = (TLV *)(TLV_value(tlv) + AES_BLOCK_SIZE);
 
     if (TLV_type(tlv) != ENROLLEE_NONCE) {
@@ -1931,7 +1971,7 @@ compute_ke (struct candidate *peer, BIGNUM *n, BIGNUM *l)
 static int
 send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
 {
-    unsigned char bootkeyhash[SHA256_DIGEST_LENGTH], *ptr, *attrs;
+    unsigned char bootkeyhash[SHA256_DIGEST_LENGTH], *ptr, *attrs, *end;
     siv_ctx ctx;
     TLV *tlv;
     int success = 0, aadlen = 0;
@@ -1970,7 +2010,12 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
      * and finally wrapped data
      */
     tlv->type = WRAPPED_DATA;
-    tlv->length = ieee_order(sizeof(TLV) + AES_BLOCK_SIZE + dpp_instance.digestlen);
+    if (status == STATUS_OK) {
+        tlv->length = (sizeof(TLV) + AES_BLOCK_SIZE + dpp_instance.digestlen);
+    } else {
+        tlv->length = (sizeof(TLV) + AES_BLOCK_SIZE + dpp_instance.noncelen);
+    }
+
     ptr = tlv->value;
     /*
      * ...which is itself a TLV, the initiator auth tag
@@ -1982,15 +2027,26 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
      */
     setup_dpp_auth_frame(peer, DPP_SUB_AUTH_CONFIRM);
     if (status == STATUS_OK) {
-        tlv->type = INITIATOR_AUTH_TAG;
+        /*
+         * only 1 attribute to ieee-ize...
+         */
+        tlv->type = ieee_order(INITIATOR_AUTH_TAG);
         tlv->length = ieee_order(dpp_instance.digestlen);
+        end = (unsigned char *)(tlv->value + dpp_instance.digestlen);
+
         dpp_debug(DPP_DEBUG_TRACE, "I-auth...\n");  // delete this
         if (generate_auth(peer, 1, tlv->value) != dpp_instance.digestlen) {
             goto fin;
         }
         debug_buffer(DPP_DEBUG_TRACE, "AUTHi", tlv->value, dpp_instance.digestlen);
         fflush(stdout);
-        tlv = TLV_next(tlv);
+
+        peer->bufferlen = (int)(end - attrs);
+        /*
+         * since we're binding the inner encryption to the cleartext attributes
+         * make sure we're authenticating what's sent
+         */
+        ieeeize_hton_attributes(attrs, peer->bufferlen);
 
         switch(dpp_instance.digestlen) {
             case SHA256_DIGEST_LENGTH:
@@ -2012,11 +2068,21 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
     } else {
         /*
          * status is NOT OK!
+         *
+         * only 1 attribute to ieee-ize...
          */
-        tlv->type = RESPONDER_NONCE;
+        tlv->type = ieee_order(RESPONDER_NONCE);
         tlv->length = ieee_order(dpp_instance.noncelen);
         memcpy(tlv->value, peer->peernonce, dpp_instance.noncelen);
-        tlv = TLV_next(tlv);
+        end = (unsigned char *)(tlv->value + dpp_instance.noncelen);
+
+        peer->bufferlen = (int)(end - attrs);
+        /*
+         * since we're binding the inner encryption to the cleartext attributes
+         * make sure we're authenticating what's sent
+         */
+        ieeeize_hton_attributes(attrs, peer->bufferlen);
+
         switch(dpp_instance.digestlen) {
             case SHA256_DIGEST_LENGTH:
                 siv_init(&ctx, peer->k2, SIV_256);
@@ -2035,7 +2101,6 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
                     dpp_instance.digestlen + sizeof(TLV), ptr, 
                     2, peer->frame, sizeof(dpp_action_frame), attrs, aadlen);
     }
-    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
     if (send_dpp_auth_frame(peer)) {
         success = 1;
         peer->retrans = 0;
@@ -2222,7 +2287,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
          * the responder auth data
          */
         secondarywrap = (TLV *)(secondary + AES_BLOCK_SIZE);
-        secondarywrap->type = RESPONDER_AUTH_TAG;
+        secondarywrap->type = ieee_order(RESPONDER_AUTH_TAG);
         secondarywrap->length = ieee_order(dpp_instance.digestlen);
         dpp_debug(DPP_DEBUG_TRACE, "R-auth...\n");   // delete this
         if (generate_auth(peer, 0, secondarywrap->value) != dpp_instance.digestlen) {
@@ -2264,7 +2329,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         /*
          * now ieee-ize the TLVs in the primary wrapping
          */
-        ieee_ize_attributes(primary + AES_BLOCK_SIZE, ptr - (primary + AES_BLOCK_SIZE));
+        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, ptr - (primary + AES_BLOCK_SIZE));
         /*
          * and encrypt the whole thing with k2
          */
@@ -2289,10 +2354,16 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         /*
          * STATUS is not OK!
          *
-         * fix up the lengths we skipped over and send back an notification
+         * fix up the lengths we skipped over and send back a notification
          */
         ptr = (unsigned char *)primarywrap;
         tlv->length = primarywraplen = ptr - primary;
+
+        /*
+         * now ieee-ize the TLVs in the primary wrapping
+         */
+        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, ptr - (primary + AES_BLOCK_SIZE));
+        
         switch(dpp_instance.digestlen) {
             case SHA256_DIGEST_LENGTH:
                 siv_init(&ctx, peer->k1, SIV_256);
@@ -2312,10 +2383,6 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
                     2, peer->frame, sizeof(dpp_action_frame), attrs, ((unsigned char *)tlv - attrs));
     }
     
-    /*
-     * and now ieee-ize our message
-     */
-    ieee_ize_attributes(attrs, ptr - attrs);
     peer->bufferlen = (int)(ptr - peer->buffer);
     if (send_dpp_auth_frame(peer)) {
         success = 1;
@@ -2453,7 +2520,10 @@ send_dpp_auth_request (struct candidate *peer)
     tlv = TLV_set_tlv(tlv, INITIATOR_NONCE, dpp_instance.noncelen, peer->mynonce);
     ptr = (unsigned char *)TLV_set_tlv(tlv, INITIATOR_CAPABILITIES, 1, &capabilities);
     wrapped_len = ptr - wrap;
-    ieee_ize_attributes(wrap, wrapped_len);
+    /*
+     * put the attributes to-be-wrapped into ieee_order()
+     */
+    ieeeize_hton_attributes(wrap, wrapped_len);
 
     /*
      * Now cons up a DPP Authentication Initiate. First H(Br)...
@@ -2485,7 +2555,6 @@ send_dpp_auth_request (struct candidate *peer)
     offset = dpp_instance.primelen - BN_num_bytes(y);
     BN_bn2bin(y, ptr + offset);
     tlv = TLV_next(tlv);
-    ieee_ize_attributes(attrs, (int)((unsigned char *)tlv - attrs));
 
     /*
      * if we want to change channels and get the response on a different
@@ -2497,7 +2566,7 @@ send_dpp_auth_request (struct candidate *peer)
         ptr = tlv->value;
         *ptr++ = dpp_instance.newoc;
         *ptr++ = dpp_instance.newchan;
-        tlv = TLV_next(tlv);
+        tlv = (TLV *)ptr;
     }
 
     /*
@@ -2507,6 +2576,12 @@ send_dpp_auth_request (struct candidate *peer)
     tlv->length = AES_BLOCK_SIZE + wrapped_len;      /* IV || C */
 
     /*
+     * put the cleartext attributes into ieee_order()
+     */
+    ptr = (unsigned char *)TLV_next(tlv);
+    ieeeize_hton_attributes(attrs, (int)((unsigned char *)ptr - attrs));
+
+    /*
      * setup DPP Action frame header to include as a component of AAD
      */
     setup_dpp_auth_frame(peer, DPP_SUB_AUTH_REQUEST);
@@ -2514,12 +2589,6 @@ send_dpp_auth_request (struct candidate *peer)
                 wrapped_len, TLV_value(tlv),
                 2, peer->frame, sizeof(dpp_action_frame), attrs, ((unsigned char *)tlv - attrs));
 
-    /*
-     * ptr points to the end of all the attributes now
-     */
-    ptr = (unsigned char *)TLV_next(tlv);
-        
-    ieee_ize_attributes(attrs, ptr - attrs);
     peer->bufferlen = (int)(ptr - peer->buffer);
     if (send_dpp_auth_frame(peer)) {
         success = 1;
@@ -2637,7 +2706,7 @@ process_dpp_auth_confirm (struct candidate *peer, dpp_action_frame *frame, int f
          */
         goto fin;
     }
-    ieee_ize_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
+    ieeeize_ntoh_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
     tlv = (TLV *)(TLV_value(tlv) + AES_BLOCK_SIZE);
 
     dpp_debug(DPP_DEBUG_TRACE, "I-auth...\n");   // delete this
@@ -2771,7 +2840,11 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
              */
             goto fin;
         }
-        ieee_ize_attributes(ptr, primarywraplen);
+        /*
+         * ieee-ize the unwrapped attributes
+         */
+        ieeeize_ntoh_attributes(ptr, primarywraplen);
+
         if ((tlv = find_tlv(RESPONDER_CAPABILITIES, ptr, primarywraplen)) == NULL) {
             dpp_debug(DPP_DEBUG_ERR, "can't find responder capabilities in primary wrapped data\n");
             goto fin;
@@ -2860,8 +2933,9 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
     ptr = TLV_value(tlv) + AES_BLOCK_SIZE;
     primarywraplen = TLV_length(tlv) - AES_BLOCK_SIZE;
     /*
-     * and unwrap it
+     * ...put the AAD back into ieee-order and unwrap it
      */
+    ieeeize_hton_attributes(attrs, ((unsigned char *)tlv - attrs));
     if (siv_decrypt(&ctx, ptr, ptr, primarywraplen, TLV_value(tlv),
                     2, frame, sizeof(dpp_action_frame), attrs, ((unsigned char *)tlv - attrs)) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't decrypt primary blob in DPP Auth Resp!\n");
@@ -2870,7 +2944,7 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
          */
         goto fin;
     }
-    ieee_ize_attributes(ptr, primarywraplen);
+    ieeeize_ntoh_attributes(ptr, primarywraplen);
 
     if ((tlv = find_tlv(RESPONDER_NONCE, ptr, primarywraplen)) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "can't find responder nonce in primary wrapped data\n");
@@ -2978,7 +3052,8 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
         (void)send_dpp_auth_confirm(peer, STATUS_AUTH_FAILURE);
         goto fin;
     }
-    ieee_ize_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
+    ieeeize_ntoh_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
+
     if ((tlv = find_tlv(RESPONDER_AUTH_TAG, TLV_value(tlv) + AES_BLOCK_SIZE,
                         TLV_length(tlv) - AES_BLOCK_SIZE)) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "can't find responder auth tag in DPP Auth Resp!\n");
@@ -3148,6 +3223,8 @@ process_dpp_auth_request (struct candidate *peer, dpp_action_frame *frame, int f
          */
         goto fin;
     }
+    ieeeize_ntoh_attributes(TLV_value(tlv) + AES_BLOCK_SIZE, TLV_length(tlv) - AES_BLOCK_SIZE);
+    
     /*
      * there are TLVs inside the wrapped blob, right past the IV!
      */
@@ -3267,7 +3344,7 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
     /*
      * fix up the lengths of all the TLVs...
      */
-    ieee_ize_attributes(frame->attributes, len - sizeof(dpp_action_frame));
+    ieeeize_ntoh_attributes(frame->attributes, len - sizeof(dpp_action_frame));
     /*
      * implement the state machine for DPP
      */
