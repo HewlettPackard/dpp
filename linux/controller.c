@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -331,7 +331,7 @@ new_connection (int fd, void *data)
     }
     memset(conv, 0, sizeof(struct conversation));
     conv->fd = sd;
-    if ((conv->handle = dpp_create_peer(NULL)) < 1) {
+    if ((conv->handle = dpp_create_peer(NULL, 0, 0)) < 1) {
         free(conv);
         return;
     }
@@ -382,6 +382,8 @@ new_connection (int fd, void *data)
                 goto fail;
             }
             break;
+        case DPP_CHIRP:
+            break;
         default:
             fprintf(stderr, "first message from relay not a DPP/PKEX request!\n");
             goto fail;
@@ -412,7 +414,7 @@ int change_dpp_channel (dpp_handle handle, unsigned char foo, unsigned char bar)
  * Initiates DPP, through the relay, to peer whose DPP URI is at "keyidx".
  */
 int
-bootstrap_peer (char *relay, int keyidx)
+bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     struct conversation *conv;
@@ -504,7 +506,7 @@ bootstrap_peer (char *relay, int keyidx)
         free(conv);
         return -1;
     }
-    if ((conv->handle = dpp_create_peer(keyb64)) < 1) {
+    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
         close(conv->fd);
         free(conv);
         return -1;
@@ -520,7 +522,7 @@ main (int argc, char **argv)
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1;
     int opt, infd;
     struct sockaddr_in serv;
-    char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10];
+    char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
@@ -531,6 +533,7 @@ main (int argc, char **argv)
     TAILQ_INIT(&conversations);
     memset(bootstrapfile, 0, 80);
     memset(signkeyfile, 0, 80);
+    memset(mudurl, 0, 80);
     memset(identifier, 0, 80);
     memset(pkexinfo, 0, 80);
 //    strcpy(bootstrapfile, "none");
@@ -601,6 +604,9 @@ main (int argc, char **argv)
             case 'z':
                 strcpy(pkexinfo, optarg);
                 break;
+            case 'u':
+                strcpy(mudurl, optarg);
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -621,6 +627,7 @@ main (int argc, char **argv)
                         "\t-b  bootstrapping (PKEX) only, don't run DPP\n"
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
+                        "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -675,9 +682,9 @@ main (int argc, char **argv)
         }
     }
     if (do_dpp) {
-        if (dpp_initialize(is_initiator, config_or_enroll, mutual, keyfile,
+        if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           0, 0, debug) < 0) {
+                           mudurl[0] == 0 ? NULL : mudurl,0, 0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }
@@ -689,7 +696,7 @@ main (int argc, char **argv)
      * address, then begin the conversation using that handle.
      */
     if (is_initiator) {
-        bootstrap_peer(relay, keyidx);
+        bootstrap_peer(relay, keyidx, is_initiator, mutual);
     }
 
     srv_main_loop(srvctx);

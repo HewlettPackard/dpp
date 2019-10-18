@@ -163,8 +163,9 @@ find_instance_by_tid (unsigned char tid)
     return found;
 }
 
-struct dpp_instance *
-create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char *bskey)
+static struct dpp_instance *
+create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char *bskey,
+                     int is_initiator, int mauth)
 {
     struct dpp_instance *instance;
     
@@ -173,7 +174,7 @@ create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char
     }
     memcpy(instance->mymac, mymac, ETH_ALEN);
     memcpy(instance->peermac, peermac, ETH_ALEN);
-    if ((instance->handle = dpp_create_peer(bskey)) < 1) {
+    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth)) < 1) {
         free(instance);
         return NULL;
     }
@@ -334,6 +335,18 @@ bpf_in (int fd, void *data)
                                 case PKEX_SUB_COM_REV_RESP:
                                     if (process_pkex_frame(frame->action.variable, left, inf->bssid, frame->sa) < 0) {
                                         fprintf(stderr, "error processing PKEX frame from " MACSTR "\n",
+                                                MAC2STR(frame->sa));
+                                    }
+                                    break;
+                                case DPP_CONFIG_RESULT:
+                                    if ((instance = find_instance_by_mac(inf->bssid, frame->sa)) == NULL) {
+                                        fprintf(stderr, "no dpp instance at " MACSTR " from " MACSTR "\n",
+                                                MAC2STR(inf->bssid), MAC2STR(frame->sa));
+                                        return;
+                                    }
+                                    if (process_dpp_config_frame(BAD_DPP_SPEC_MESSAGE, frame->action.variable,
+                                                                 left, instance->handle) < 0) {
+                                        fprintf(stderr, "error processing DPP Config frame from " MACSTR "\n",
                                                 MAC2STR(frame->sa));
                                     }
                                     break;
@@ -639,6 +652,66 @@ provision_connector (char *role, unsigned char *ssid, int ssidlen,
         if (inf->is_loopback) {
             srv_add_timeout(srvctx, SRV_MSEC(1), send_beacon, inf);
         } else {
+            /*
+             * enable RSN
+             */
+            memset(&ireq, 0, sizeof(struct ieee80211req));
+            strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
+            ireq.i_type = IEEE80211_IOC_WPA;
+            ireq.i_val = 5;                     /* DPP! */
+            if (ioctl(s, SIOCS80211, &ireq) < 0) {
+                fprintf(stderr, "unable to set RSN!\n");
+                perror("ioctl setting RSN");
+                exit(1);
+            }
+            /*
+             * enable privacy
+             */
+            memset(&ireq, 0, sizeof(struct ieee80211req));
+            strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
+            ireq.i_type = IEEE80211_IOC_PRIVACY;
+            ireq.i_val = 1;
+            if (ioctl(s, SIOCS80211, &ireq) < 0) {
+                fprintf(stderr, "unable to set PRIVACY!\n");
+                perror("ioctl setting PRIVACY");
+                exit(1);
+            }
+            /*
+             * enable DPP RSN for beacons
+             */
+            memset(&ireq, 0, sizeof(struct ieee80211req));
+            strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
+            ireq.i_type = IEEE80211_IOC_KEYMGTALGS;
+            ireq.i_val = 0x80;  /* not the real one but it's what we use */
+            if (ioctl(s, SIOCS80211, &ireq) < 0) {
+                fprintf(stderr, "unable to set DPP!\n");
+                perror("ioctl setting DPP");
+                exit(1);
+            }
+            /*
+             * use CCMP for ucast
+             */
+            memset(&ireq, 0, sizeof(struct ieee80211req));
+            strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
+            ireq.i_type = IEEE80211_IOC_UCASTCIPHERS;
+            ireq.i_val = 0x08;
+            if (ioctl(s, SIOCS80211, &ireq) < 0) {
+                fprintf(stderr, "unable to set mcast to CCMP!\n");
+                perror("ioctl setting mcast to CCMP");
+                exit(1);
+            }
+            /*
+             * use CCMP for mcast
+             */
+            memset(&ireq, 0, sizeof(struct ieee80211req));
+            strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
+            ireq.i_type = IEEE80211_IOC_MCASTCIPHER;
+            ireq.i_val = 3;
+            if (ioctl(s, SIOCS80211, &ireq) < 0) {
+                fprintf(stderr, "unable to set mcast to CCMP!\n");
+                perror("ioctl setting mcast to CCMP");
+                exit(1);
+            }
             /*
              * set the ssid
              */
@@ -1030,13 +1103,14 @@ change_dpp_channel (dpp_handle handle, unsigned char class, unsigned char channe
  * Initiates DPP to peer whose DPP URI is at "keyidx".
  */
 int
-bootstrap_peer (unsigned char *mymac, int keyidx)
+bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     int n, opclass, channel;
     unsigned char peermac[ETH_ALEN]; 
     unsigned char keyb64[1024];
     char mac[20], *ptr;
+    unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
     printf("looking for bootstrap key index %d\n", keyidx);
     if ((fp = fopen(bootstrapfile, "r")) == NULL) {
@@ -1074,7 +1148,12 @@ bootstrap_peer (unsigned char *mymac, int keyidx)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if (create_dpp_instance(mymac, peermac, keyb64) == NULL) {
+    if (peermac[0] == 0 && peermac[1] == 0 && peermac[2] == 0 &&
+        peermac[3] == 0 && peermac[4] == 0 && peermac[5] == 0) {
+        memcpy(peermac, broadcast, ETH_ALEN);
+    }
+
+    if (create_dpp_instance(mymac, peermac, keyb64, is_initiator, mauth) == NULL) {
         fprintf(stderr, "unable to create peer!\n");
     } else {
         printf("new peer is at " MACSTR "\n", MAC2STR(peermac));
@@ -1088,12 +1167,12 @@ main (int argc, char **argv)
 {
     int s, c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
     unsigned char opclass = 81, channel = 6;
-    int mediaopt, chchan = 0;
+    int mediaopt, chchan = 0, chirp = 0;
     struct interface *inf;
     struct ifreq ifr;
     struct ieee80211req ireq;
     struct ifmediareq ifmreq;
-    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10];
+    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *cruft, identifier[80], pkexinfo[80];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     char *ptr, *endptr;
@@ -1119,8 +1198,9 @@ main (int argc, char **argv)
     opclass = 81;
     mediaopt = RADIO_ADHOC;
 
+    memset(mudurl, 0, 80);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:bae:c:d:p:n:z:f:g:s");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:t");
         if (c < 0) {
             break;
         }
@@ -1194,10 +1274,15 @@ main (int argc, char **argv)
             case 's':
                 chchan = 1;
                 break;
+            case 't':
+                chirp = 1;
+                break;
+            case 'u':
+                strcpy(mudurl, optarg);
             default:
             case 'h':
                 fprintf(stderr, 
-                        "USAGE: %s [-hCIBapkceirdfgs]\n"
+                        "USAGE: %s [-hCIBapkceirdfgstu]\n"
                         "\t-h  show usage, and exit\n"
                         "\t-c <signkey> run DPP as the configurator, sign connectors with <signkey>\n"
                         "\t-e <role> run DPP as the enrollee in the role of <role> (sta or ap)\n"
@@ -1217,6 +1302,8 @@ main (int argc, char **argv)
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
                         "\t-s  change opclass/channel to what was set with -f and -g\n"
+                        "\t-u <url> to find a MUD file (enrollee only)\n"
+                        "\t-t  send DPP chirps (responder only)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -1410,8 +1497,8 @@ main (int argc, char **argv)
             channel = 0;
             opclass = 0;
         }
-        if (dpp_initialize(is_initiator, config_or_enroll, mutual, keyfile, 
-                           signkeyfile, enrollee_role, opclass, channel, debug) < 0) {
+        if (dpp_initialize(config_or_enroll, keyfile, 
+                           signkeyfile, enrollee_role, mudurl, chirp, opclass, channel, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }
@@ -1429,13 +1516,13 @@ main (int argc, char **argv)
          */
         if (is_initiator) {
             if (!do_pkex) {
-                bootstrap_peer(inf->bssid, keyidx);
+                bootstrap_peer(inf->bssid, keyidx, is_initiator, mutual);
             } else {
                 pkex_initiate(inf->bssid, targetmac);
             }
         } else {
             if (!do_pkex) {
-                create_dpp_instance(inf->bssid, targetmac, NULL);
+                create_dpp_instance(inf->bssid, targetmac, NULL, is_initiator, mutual);
             }
         }
     }

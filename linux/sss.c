@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -177,8 +177,9 @@ find_instance_by_tid (unsigned char tid)
     return found;
 }
 
-struct dpp_instance *
-create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char *bskey)
+static struct dpp_instance *
+create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char *bskey,
+                     int is_initiator, int mauth)
 {
     struct dpp_instance *instance;
     
@@ -187,7 +188,7 @@ create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char
     }
     memcpy(instance->mymac, mymac, ETH_ALEN);
     memcpy(instance->peermac, peermac, ETH_ALEN);
-    if ((instance->handle = dpp_create_peer(bskey)) < 1) {
+    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth)) < 1) {
         free(instance);
         return NULL;
     }
@@ -315,6 +316,24 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                                     fprintf(stderr, "error processing PKEX frame from " MACSTR "\n",
                                             MAC2STR(frame->sa));
                                 }
+                                break;
+                            case DPP_CONFIG_RESULT:
+                                if ((instance = find_instance_by_mac(inf->bssid, frame->sa)) == NULL) {
+                                    fprintf(stderr, "no dpp instance at " MACSTR " from " MACSTR "\n",
+                                            MAC2STR(inf->bssid), MAC2STR(frame->sa));
+                                    return;
+                                }
+                                if (process_dpp_config_frame(BAD_DPP_SPEC_MESSAGE, frame->action.variable, left,
+                                                             instance->handle) < 0) {
+                                    fprintf(stderr, "error processing DPP Config frame from " MACSTR "\n",
+                                            MAC2STR(frame->sa));
+                                }
+                                break;
+                            case DPP_CHIRP:
+                                /*
+                                 * this is a controller feature, let's just ignore it here.
+                                 */
+                                fprintf(stderr, "got a DPP chirp from " MACSTR "\n", MAC2STR(frame->sa));
                                 break;
                             default:
                                 fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -1288,7 +1307,7 @@ change_dpp_channel (dpp_handle handle, unsigned char class, unsigned char channe
  * Initiates DPP to peer whose DPP URI is at "keyidx".
  */
 int
-bootstrap_peer (unsigned char *mymac, int keyidx)
+bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     int n, opclass, channel;
@@ -1335,7 +1354,7 @@ bootstrap_peer (unsigned char *mymac, int keyidx)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if (create_dpp_instance(mymac, peermac, keyb64) == NULL) {
+    if (create_dpp_instance(mymac, peermac, keyb64, is_initiator, mauth) == NULL) {
         fprintf(stderr, "unable to create peer!\n");
     } else {
         printf("new peer is at " MACSTR "\n", MAC2STR(peermac));
@@ -1348,9 +1367,9 @@ int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
-    int chchandpp = 0;
+    int chchandpp = 0, chirp = 0;
     struct interface *inf;
-    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10];
+    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
@@ -1363,10 +1382,11 @@ main (int argc, char **argv)
     
     memset(bootstrapfile, 0, 80);
     memset(signkeyfile, 0, 80);
+    memset(mudurl, 0, 80);
     memset(identifier, 0, 80);
     memset(pkexinfo, 0, 80);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:t");
         if (c < 0) {
             break;
         }
@@ -1440,10 +1460,16 @@ main (int argc, char **argv)
             case 's':
                 chchandpp = 1;
                 break;
+            case 't':
+                chirp = 1;
+                break;
+            case 'u':
+                strcpy(mudurl, optarg);
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
-                        "USAGE: %s [-hCIBapkceirdfgs]\n"
+                        "USAGE: %s [-hCIBapkceirdfgst]\n"
                         "\t-h  show usage, and exit\n"
                         "\t-c <signkey> run DPP as the configurator, sign connectors with <signkey>\n"
                         "\t-e <role> run DPP as the enrollee in the role of <role> (sta or ap)\n"
@@ -1463,6 +1489,8 @@ main (int argc, char **argv)
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
                         "\t-s  change opclass/channel to what was set with -f and -g during DPP\n"
+                        "\t-u <url> to find a MUD file (enrollee only)\n"
+                        "\t-t  send DPP chirps (responder only)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -1518,8 +1546,9 @@ main (int argc, char **argv)
         }
     }
     if (do_dpp) {
-        if (dpp_initialize(is_initiator, config_or_enroll, mutual, keyfile,
+        if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
+                           mudurl[0] == 0 ? NULL : mudurl, chirp,
                            chchandpp ? opclass : 0, chchandpp ? channel : 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
@@ -1538,13 +1567,13 @@ main (int argc, char **argv)
          */
         if (is_initiator) {
             if (!do_pkex) {
-                bootstrap_peer(inf->bssid, keyidx);
+                bootstrap_peer(inf->bssid, keyidx, is_initiator, mutual);
             } else {
                 pkex_initiate(inf->bssid, targetmac);
             }
         } else {
             if (!do_pkex) {
-                create_dpp_instance(inf->bssid, targetmac, NULL);
+                create_dpp_instance(inf->bssid, targetmac, NULL, is_initiator, mutual);
             }
         }
     }

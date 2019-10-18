@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -57,6 +57,8 @@ typedef struct _tlv {
 #define CODE_IDENTIFIER                 0x1015
 #define TRANSACTION_IDENTIFIER          0x1016
 #define CHANGE_CHANNEL                  0x1018
+#define PROTOCOL_VERSION                0x1019
+#define DPP_ENVELOPED_DATA              0x101A
     unsigned short type;
     unsigned short length;
     unsigned char value[0];

@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -701,10 +701,10 @@ save_bootstrap_key (struct pkex_peer *peer)
         if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, existing) < 0) {
             continue;
         }
-        if (strcmp(existing, newone) == 0) {
-            fprintf(stderr, "PKEX: bootstrapping key is trusted already\n");
-            goto fin;
-        }
+//        if (strcmp(existing, newone) == 0) {
+//            fprintf(stderr, "PKEX: bootstrapping key is trusted already\n");
+//            goto fin;
+//        }
     }
     ret++;
     /*
@@ -1898,7 +1898,7 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
                 /*
                  * kick off DPP!
                  */
-                bootstrap_peer(peer->mymac, keyidx);
+                bootstrap_peer(peer->mymac, keyidx, peer->initiator, 1);
                 peer->state = PKEX_FINISHED;
             }
             break;
@@ -1919,12 +1919,16 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
             /*
              * kick off DPP!
              */
-            bootstrap_peer(peer->mymac, keyidx);
+            bootstrap_peer(peer->mymac, keyidx, peer->initiator, 1);
             peer->state = PKEX_FINISHED;
             break;
         case PKEX_FINISHED:
         default:
-            dpp_debug(DPP_DEBUG_ERR, "PKEX: already done!\n");
+            /*
+             * try and sync back up
+             */
+            pkex_reveal_to_peer(peer);
+            dpp_debug(DPP_DEBUG_ERR, "PKEX: already done! Sending reveal again\n");
             break;
     }
     return 1;

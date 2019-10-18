@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -38,9 +38,9 @@ typedef unsigned int dpp_handle;
 /*
  * exported APIs to interact with the DPP module
  */
-int dpp_initialize(int, int, int, char *, char *, char *, int, int, int);
-dpp_handle dpp_allocate_handle(void);
-int dpp_create_peer(unsigned char *);
+int dpp_initialize(int, char *, char *, char *, char *, int, int, int, int);
+dpp_handle dpp_create_peer(unsigned char *, int, int);
+void dpp_free_peer(dpp_handle);
 int process_dpp_auth_frame(unsigned char *, int, dpp_handle);
 int process_dpp_config_frame(unsigned char, unsigned char *, int, dpp_handle);
 int process_dpp_discovery_frame(unsigned char *, int, unsigned char, 

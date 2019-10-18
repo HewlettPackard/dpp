@@ -11,11 +11,6 @@
  *        notice, this list of conditions, and the following disclaimer
  *        in the documentation and/or other materials provided with the
  *        distribution.
- *     3. All advertising materials and documentation mentioning features
- *	  or use of this software must display the following acknowledgement:
- *
- *        "This product includes software written by
- *         Dan Harkins (dharkins at lounge dot org)"
  *
  *  "DISCLAIMER OF LIABILITY
  *  

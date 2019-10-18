@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -44,6 +44,10 @@
 #define RADIO_11a       1
 #define RADIO_11b       2
 #define RADIO_11g       3
+
+/*
+ * regulatory designations 
+ */
 
 struct _regulatory {
     unsigned char class;

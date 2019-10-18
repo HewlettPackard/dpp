@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -311,7 +311,7 @@ save_bootstrap_key (unsigned char *b64key, unsigned char *peermac)
 #endif
 
 int
-bootstrap_peer (int keyidx)
+bootstrap_peer (int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     int n, opclass, channel;
@@ -356,7 +356,7 @@ bootstrap_peer (int keyidx)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if ((handle = dpp_create_peer(keyb64)) < 1) {
+    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
         fprintf(stderr, "unable to create peer!\n");
         return -1;
     }
@@ -368,7 +368,7 @@ int
 main (int argc, char **argv)
 {
     int debug = 0, c, got_controller = 0, do_pkex = 0, mutual = 1, keyidx = 0, config_or_enroll = 0;
-    char password[30], pkexinfo[80], enrollee_role[10], signkeyfile[30];
+    char password[30], pkexinfo[80], enrollee_role[10], signkeyfile[30], mudurl[80];
     char identifier[80], keyfile[80];
     struct sockaddr_in clnt;
 
@@ -378,12 +378,13 @@ main (int argc, char **argv)
     }
     memset(bootstrapfile, 0, 80);
     memset(signkeyfile, 0, 30);
+    memset(mudurl, 0, 80);
     memset(keyfile, 0, 80);
     memset(identifier, 0, 80);
     memset(pkexinfo, 0, 80);
     strcpy(enrollee_role, "sta");
     for (;;) {
-        c = getopt(argc, argv, "hd:f:g:C:k:p:ax:B:n:e:c:");
+        c = getopt(argc, argv, "hd:f:g:C:k:p:ax:B:n:e:c:u:");
         if (c < 0) {
             break;
         }
@@ -425,6 +426,9 @@ main (int argc, char **argv)
                 strcpy(enrollee_role, optarg);
                 config_or_enroll |= 0x01;
                 break;
+            case 'u':
+                strcpy(mudurl, optarg);
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -440,6 +444,7 @@ main (int argc, char **argv)
                         "\t-z <info> to pass along with public key in PKEX\n"
                         "\t-a to indicate doing non-mutual authentication\n"
                         "\t-x <keyidx> index into bootstrapping key file to use\n"
+                        "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -492,16 +497,16 @@ main (int argc, char **argv)
             exit(1);
         }
     }
-    if (dpp_initialize(1, config_or_enroll, mutual, keyfile,
+    if (dpp_initialize(config_or_enroll, keyfile,
                        signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                       0, 0, debug) < 0) {
+                       mudurl[0] == 0 ? NULL : mudurl, 0, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);
     }
 
     if (!do_pkex) {
         printf("not doing pkex, just DPP...\n");
-        bootstrap_peer(keyidx);
+        bootstrap_peer(keyidx, 1, mutual);
     } else {
         printf("PKEX, then DPP...\n");
         pkex_initiate(myfakemac, peerfakemac);

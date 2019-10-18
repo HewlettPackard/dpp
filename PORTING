@@ -60,7 +60,7 @@ int pkex_initialize (int whatkind, char *password, char *id, char *info,
 
 and
 
-int dpp_initialize (int initiator, int core, int mutual, char *keyfile, 
+int dpp_initialize (int core, char *keyfile, 
 		    char *bsfile, char *signkeyfile, char *enrolleerole, 
 		    int opclass, int channel, int verbosity)
 

@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -537,6 +537,7 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                             break;
                         }
                         /* fall through intentional */
+                    case DPP_CHIRP:
                     case PKEX_SUB_EXCH_REQ:
                         /*
                          * a gratuitous request, create new client state...

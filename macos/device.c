@@ -312,7 +312,7 @@ save_bootstrap_key (unsigned char *b64key, unsigned char *peermac)
 #endif
 
 int
-bootstrap_peer (int keyidx)
+bootstrap_peer (int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     int n, opclass, channel;
@@ -353,7 +353,7 @@ bootstrap_peer (int keyidx)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if ((handle = dpp_create_peer(keyb64)) < 1) {
+    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
         fprintf(stderr, "unable to create peer!\n");
         return -1;
     }
@@ -489,16 +489,16 @@ main (int argc, char **argv)
             exit(1);
         }
     }
-    if (dpp_initialize(1, config_or_enroll, mutual, keyfile,
+    if (dpp_initialize(config_or_enroll, keyfile,
                        signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                       0, 0, debug) < 0) {
+                       NULL, 0, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);
     }
 
     if (!do_pkex) {
         printf("not doing pkex, just DPP...\n");
-        bootstrap_peer(keyidx);
+        bootstrap_peer(keyidx, 1, mutual);
     } else {
         printf("PKEX, then DPP...\n");
         pkex_initiate(myfakemac, peerfakemac);

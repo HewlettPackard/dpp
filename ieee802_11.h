@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Dan Harkins, 2008, 2009, 2010, 2016
+ * Copyright (c) Dan Harkins, 2008, 2009, 2010, 2016, 2019
  *
  *  Copyright holder grants permission for redistribution and use in source 
  *  and binary forms, with or without modification, provided that the 
@@ -11,11 +11,6 @@
  *        notice, this list of conditions, and the following disclaimer
  *        in the documentation and/or other materials provided with the
  *        distribution.
- *     3. All advertising materials and documentation mentioning features
- *	  or use of this software must display the following acknowledgement:
- *
- *        "This product includes software written by
- *         Dan Harkins (dharkins at lounge dot org)"
  *
  *  "DISCLAIMER OF LIABILITY
  *  
@@ -140,6 +135,7 @@ struct ieee80211_mgmt_frame {
 #define GAS_INITIAL_RESPONSE            11
 #define GAS_COMEBACK_REQUEST            12
 #define GAS_COMEBACK_RESPONSE           13
+#define BAD_DPP_SPEC_MESSAGE            255     /* config result */
             unsigned char variable[0];
         } __attribute__ ((packed)) action;
     };
@@ -161,6 +157,8 @@ typedef struct _dpp_action_frame {
 #define PKEX_SUB_EXCH_RESP          8
 #define PKEX_SUB_COM_REV_REQ        9
 #define PKEX_SUB_COM_REV_RESP       10
+#define DPP_CONFIG_RESULT           11
+#define DPP_CHIRP                   12
     unsigned char attributes[0];
 } __attribute__ ((packed)) dpp_action_frame;
 

@@ -49,7 +49,10 @@
 #include <net/if_media.h>
 #include <net/bpf.h>
 #include <net/route.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 #include "ieee802_11.h"
+#include "tlv.h"
 #include "service.h"
 #include "common.h"
 #include "pkex.h"
@@ -58,6 +61,7 @@
 struct conversation {
     TAILQ_ENTRY(conversation) entry;
     dpp_handle handle;
+    timerid t0;
     int fd;
 };
 TAILQ_HEAD(bar, conversation) conversations;
@@ -65,7 +69,67 @@ TAILQ_HEAD(bar, conversation) conversations;
 service_context srvctx;
 char bootstrapfile[80];
 unsigned char fakemac[ETH_ALEN] = { 0xde, 0xad, 0xbe, 0xef, 0x0f, 0x00 };
-int keyidx = 0;
+
+static void
+dump_buffer (unsigned char *buf, int len)
+{
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (i && (i%4 == 0)) {
+            printf(" ");
+        }
+        if (i && (i%32 == 0)) {
+            printf("\n");
+        }
+        printf("%02x", buf[i]);
+    }
+    printf("\n");
+}
+
+static void
+print_buffer (char *str, unsigned char *buf, int len)
+{
+    printf("%s:\n", str);
+    dump_buffer(buf, len);
+    printf("\n");
+}
+
+static void
+srvfail (int fd, void *data)
+{
+    struct conversation *conv = NULL;
+
+    TAILQ_FOREACH(conv, &conversations, entry) {
+        if (fd == conv->fd) {
+            TAILQ_REMOVE(&conversations, conv, entry);
+            break;
+        }
+    }
+    srv_rem_input(srvctx, fd);
+    close(fd);
+    if (conv != NULL) {
+        free(conv);
+    }
+    return;
+}
+
+void
+delete_conv (timerid t, void *data)
+{
+    struct conversation *conv = (struct conversation *)data;
+    
+    printf("deleting conversation...\n");
+    srv_rem_input(srvctx, conv->fd);
+    TAILQ_REMOVE(&conversations, conv, entry);
+    if (conv->handle) {
+        dpp_free_peer(conv->handle);
+    }
+    close(conv->fd);
+    free(conv);
+
+    return;
+}
 
 static void
 message_from_relay (int fd, void *data)
@@ -76,22 +140,25 @@ message_from_relay (int fd, void *data)
     int framesize, rlen;
     uint32_t netlen;
 
+    memset(buf, 0, sizeof(buf));
     if (read(fd, (char *)&netlen, sizeof(uint32_t)) < 0) {
         fprintf(stderr, "can't read message from relay!\n");
-        srv_rem_input(srvctx, fd);
-        close(fd);
-        TAILQ_REMOVE(&conversations, conv, entry);
-        free(conv);
+        srv_rem_timeout(srvctx, conv->t0);
+        srv_add_timeout(srvctx, SRV_USEC(1), delete_conv, conv);
         return;
     }
     netlen = ntohl(netlen);
+    if (netlen == 0) {
+        fprintf(stderr, "failed to read from peer!\n");
+        srv_rem_timeout(srvctx, conv->t0);
+        srv_add_timeout(srvctx, SRV_USEC(1), delete_conv, conv);
+        return;
+    }
     if (netlen > sizeof(buf)) {
         fprintf(stderr, "overflow attack by relay/client! Not gonna read in %d bytes\n",
                 netlen);
-        srv_rem_input(srvctx, fd);
-        close(fd);
-        TAILQ_REMOVE(&conversations, conv, entry);
-        free(conv);
+        srv_rem_timeout(srvctx, conv->t0);
+        srv_add_timeout(srvctx, SRV_USEC(1), delete_conv, conv);
         return;
     }
     
@@ -99,10 +166,8 @@ message_from_relay (int fd, void *data)
     while (netlen) {
         if ((rlen = read(fd, (buf + framesize), netlen)) < 1) {
             fprintf(stderr, "can't read message from relay!\n");
-            srv_rem_input(srvctx, fd);
-            close(fd);
-            TAILQ_REMOVE(&conversations, conv, entry);
-            free(conv);
+            srv_rem_timeout(srvctx, conv->t0);
+            srv_add_timeout(srvctx, SRV_USEC(1), delete_conv, conv);
             return;
         }
         framesize += rlen;
@@ -163,6 +228,15 @@ message_from_relay (int fd, void *data)
                                 MAC2STR(conv->fakepeer));
                     }
 */
+                    break;
+                case DPP_CONFIG_RESULT:
+                    if (process_dpp_config_frame(BAD_DPP_SPEC_MESSAGE, &buf[1], framesize - 1,
+                                                 (unsigned char)conv->handle) < 0) {
+                        fprintf(stderr, "error processing DPP Config frame\n");
+                    }
+                    break;
+                case DPP_CHIRP:
+                    fprintf(stderr, "got a chirp! Need to handle this....\n");
                     break;
                 default:
                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -313,11 +387,15 @@ new_connection (int fd, void *data)
 {
     struct sockaddr_in *serv = (struct sockaddr_in *)data;
     struct conversation *conv;
-    int sd, rlen, framesize;
+    int sd, rlen, framesize, ret, opclass, channel, asn1len, found = 0;
     uint32_t netlen;
-    unsigned int clen;
-    unsigned char buf[3000];
-    dpp_action_frame *frame;
+    char pkey[200];
+    unsigned int clen, mdlen = SHA256_DIGEST_LENGTH;
+    unsigned char buf[3000], mac[20], keyasn1[1024], keyhash[SHA256_DIGEST_LENGTH];
+    dpp_action_frame *dpp;
+    EVP_MD_CTX *mdctx = NULL;
+    TLV *rhash;
+    FILE *fp;
     
     printf("new connection!!!\n");
     clen = sizeof(struct sockaddr_in);
@@ -332,13 +410,10 @@ new_connection (int fd, void *data)
     }
     memset(conv, 0, sizeof(struct conversation));
     conv->fd = sd;
-    if ((conv->handle = dpp_create_peer(NULL)) < 1) {
-        free(conv);
-        return;
-    }
 
     TAILQ_INSERT_TAIL(&conversations, conv, entry);
     srv_add_input(srvctx, conv->fd, conv, message_from_relay);
+    srv_add_exceptor(srvctx, srvfail);
     
     if (read(conv->fd, (char *)&netlen, sizeof(uint32_t)) < 0) {
         fprintf(stderr, "unable to read message from relay!\n");
@@ -360,13 +435,14 @@ new_connection (int fd, void *data)
         framesize += rlen;
         netlen -= rlen;
     }
-    
     if (buf[0] != PUB_ACTION_VENDOR) {
-        fprintf(stderr, "first message from relay not DPP/PKEX!\n");
+        fprintf(stderr, "first message is not a vendor-specific action frame...dropping!\n");
         goto fail;
     }
-    frame = (dpp_action_frame *)&buf[1];
-    switch (frame->frame_type) {
+    
+    printf("read %d bytes frame from relay\n", framesize);
+    dpp = (dpp_action_frame *)&buf[1];
+    switch (dpp->frame_type) {
         case PKEX_SUB_EXCH_REQ:
             printf("PKEX request...\n");
 /* we don't do PKEX in the controller yet...
@@ -378,8 +454,64 @@ new_connection (int fd, void *data)
             break;
         case DPP_SUB_AUTH_REQUEST:
             printf("DPP auth request...\n");
-            if (process_dpp_auth_frame(&buf[1], framesize - 1, conv->handle) < 0) {
+            /*
+             * responder and non-mutual...
+             */
+            if ((conv->handle = dpp_create_peer(NULL, 0, 0)) < 1) {
+                goto fail;
+            }
+            if (process_dpp_auth_frame((unsigned char *)dpp, framesize-1, conv->handle) < 0) {
                 fprintf(stderr, "error processing DPP auth frame from relay!\n");
+                goto fail;
+            }
+            break;
+        case DPP_CHIRP:
+            /*
+             * see if we know about this guy...
+             */
+            printf("DPP chirp!\n");
+            if ((rhash = find_tlv(RESPONDER_BOOT_HASH, dpp->attributes, framesize - 1)) == NULL) {
+                goto fail;
+            }
+            if ((fp = fopen(bootstrapfile, "r")) == NULL) {
+                goto fail;
+            }
+            if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+                goto fail;
+            }
+            while (!feof(fp)) {
+                memset(pkey, 0, sizeof(pkey));
+                if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, pkey) < 0) {
+                    continue;
+                }
+                if ((asn1len = EVP_DecodeBlock(keyasn1, (unsigned char *)pkey, strlen(pkey))) < 0) {
+                    continue;
+                }
+                printf("checking %d...", ret);
+                EVP_DigestInit(mdctx, EVP_sha256());
+                EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
+                EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
+                EVP_DigestFinal(mdctx, keyhash, &mdlen);
+                print_buffer("decoded", keyasn1, asn1len);
+                print_buffer("from chirp", TLV_value(rhash), SHA256_DIGEST_LENGTH);
+                print_buffer("computed", keyhash, SHA256_DIGEST_LENGTH);
+                if (memcmp(keyhash, TLV_value(rhash), SHA256_DIGEST_LENGTH) == 0) {
+                    printf("YES!!!\n");
+                    /* 
+                     * if so, initiator and try mutual (responder decides anyway)
+                     */
+                    if ((conv->handle = dpp_create_peer((unsigned char *)&pkey[0], 1, 1)) < 1) {
+                        fclose(fp);
+                        goto fail;
+                    }
+                    found = 1;
+                    break;
+                } else {
+                    printf("no\n");
+                }
+            }
+            fclose(fp);
+            if (!found) {
                 goto fail;
             }
             break;
@@ -387,13 +519,22 @@ new_connection (int fd, void *data)
             fprintf(stderr, "first message from relay not a DPP/PKEX request!\n");
             goto fail;
     }
+    conv->t0 = srv_add_timeout(srvctx, SRV_SEC(10), delete_conv, conv);
     if (0) {
 fail:
         close(sd);
+        if (conv->handle > 0) {
+            dpp_free_peer(conv->handle);
+
+        }
         srv_rem_input(srvctx, sd);
         TAILQ_REMOVE(&conversations, conv, entry);
         free(conv);
     }
+    if (mdctx != NULL) {
+        EVP_MD_CTX_free(mdctx);
+    }
+    
     return;
 }
 
@@ -413,7 +554,7 @@ int change_dpp_channel (dpp_handle handle, unsigned char foo, unsigned char bar)
  * Initiates DPP, through the relay, to peer whose DPP URI is at "keyidx".
  */
 int
-bootstrap_peer (char *relay, int keyidx)
+bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     struct conversation *conv;
@@ -504,16 +645,25 @@ bootstrap_peer (char *relay, int keyidx)
     memcpy(ptr, (char *)&ctrl, sizeof(struct wired_control));
     if (write(conv->fd, buf, sizeof(struct wired_control) + sizeof(uint32_t) + 1) < 1) {
         fprintf(stderr, "unable to write message to relay at %s\n", relay);
-        close(conv->fd);
-        free(conv);
-        return -1;
+        goto fail;
     }
-    if ((conv->handle = dpp_create_peer(keyb64)) < 1) {
-        close(conv->fd);
-        free(conv);
-        return -1;
+    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
+        goto fail;
     }
 
+    if (0) {
+fail:
+        if (conv->handle > 0) {
+            dpp_free_peer(conv->handle);
+        }
+        srv_rem_timeout(srvctx, conv->fd);
+        close(conv->fd);
+        TAILQ_REMOVE(&conversations, conv, entry);
+        free(conv);
+        return -1;
+    }
+    conv->t0 = srv_add_timeout(srvctx, SRV_SEC(10), delete_conv, conv);
+       
     return 1;
 }
 
@@ -521,7 +671,7 @@ int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1;
-    int opt, infd;
+    int keyidx = 0, opt, infd;
     struct sockaddr_in serv;
     char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10];
     char *ptr, *endptr, identifier[80], pkexinfo[80];
@@ -630,6 +780,7 @@ main (int argc, char **argv)
                 
         }
     }
+#if 0
     /*
      * if we're doing DPP w/mutual authentication and/or doing PKEX then
      * a bootstrapping key has to be included
@@ -643,7 +794,7 @@ main (int argc, char **argv)
                 argv[0]);
         exit(1);
     }
-
+#endif
     if ((infd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         fprintf(stderr, "%s: unable to create inbound TCP socket!\n", argv[0]);
         exit(1);
@@ -678,9 +829,9 @@ main (int argc, char **argv)
         }
     }
     if (do_dpp) {
-        if (dpp_initialize(is_initiator, config_or_enroll, mutual, keyfile,
+        if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           0, 0, debug) < 0) {
+                           NULL, 0, 0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }
@@ -691,8 +842,8 @@ main (int argc, char **argv)
      * controller-to-relay message to create state for the relay to bind to that MAC
      * address, then begin the conversation using that handle.
      */
-    if (is_initiator) {
-        bootstrap_peer(relay, keyidx);
+    if (keyidx) {
+        bootstrap_peer(relay, keyidx, is_initiator, mutual);
     }
 
     srv_main_loop(srvctx);

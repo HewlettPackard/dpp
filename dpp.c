@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -86,6 +86,9 @@
 #define STATUS_CONFIGURE_FAILURE        5
 #define STATUS_RESPONSE_PENDING         6
 #define STATUS_INVALID_CONNECTOR        7
+#define STATUS_NO_MATCH                 8
+#define STATUS_CONFIG_REJECTED          9
+#define STATUS_CONFIGURE_PENDING        10
 
 /*
  * DPP roles
@@ -104,6 +107,7 @@
 struct candidate {
     TAILQ_ENTRY(candidate) entry;
     dpp_handle handle;
+    unsigned char version;
 
     EC_KEY *peer_bootstrap;
     /*
@@ -122,6 +126,7 @@ struct candidate {
     unsigned short state;
     BIGNUM *m;
     unsigned char core;                 /* configurator or enrollee for this time */
+    int is_initiator;
     int mauth;                          /* mutual authentication (1) or not (0) */
     unsigned char k1[SHA512_DIGEST_LENGTH];
     unsigned char k2[SHA512_DIGEST_LENGTH];
@@ -167,7 +172,7 @@ struct _dpp_instance {
     char newoc;                 /* switch to this new operating class after sending DDP Auth Req */
     char newchan;               /* swithc to this new channel after sending DPP Auth Req */
     char enrollee_role[10];     /* role for an enrollee */
-    int mauth;                  /* mutual authentication (1) or not (0) */
+    char mudurl[80];            /* MUD URL for an enrollee */
     int group_num;              /* these are handy to keep around */
     int primelen;               /* and not have to continually */
     int digestlen;              /* compute them from "bootstrap" */
@@ -184,7 +189,7 @@ static dpp_handle next_handle = 0;
 static int dpp_initialized = 0;
 static BN_CTX *bnctx = NULL;
 static int debug = 0;
-static int is_initiator;
+static int do_chirp;
 
 static unsigned char wfa_dpp[4] = { 0x50, 0x6f, 0x9a, 0x1a };
 static unsigned char dpp_proto_elem_req[3] = { 0x6c, 0x08, 0x00 };
@@ -362,6 +367,145 @@ dpp_debug (int level, const char *fmt, ...)
 //----------------------------------------------------------------------
 
 static void
+setup_dpp_action_frame (struct candidate *peer, unsigned char frametype)
+{
+    dpp_action_frame *frame;
+
+    frame = (dpp_action_frame *)peer->frame;
+    memcpy(frame->oui_type, wfa_dpp, sizeof(wfa_dpp));
+    frame->cipher_suite = 1;
+    frame->frame_type = frametype;
+
+    return;
+}
+
+static int
+send_dpp_action_frame (struct candidate *peer)
+{
+    dpp_action_frame *frame;
+
+    frame = (dpp_action_frame *)peer->frame;
+    memcpy(frame->attributes, peer->buffer, peer->bufferlen);
+    return transmit_auth_frame(peer->handle, peer->frame, peer->bufferlen + sizeof(dpp_action_frame));
+}
+
+/*
+ * IEEE order is little endian, ensure things go out (hton) correctly 
+ * and can be coverted (ntoh) after receipt
+ */
+static void
+ieeeize_hton_attributes (unsigned char *attributes, int len)
+{
+    unsigned char *ptr = attributes;
+    TLV *tlv;
+
+    while (ptr < (attributes + len)) {
+        tlv = (TLV *)ptr;
+        ptr = (unsigned char *)TLV_next(tlv);
+        tlv->type = ieee_order(tlv->type);
+        tlv->length = ieee_order(tlv->length);
+    }
+}
+
+static void ieeeize_ntoh_attributes (unsigned char *attributes, int len)
+{
+    unsigned char *ptr = attributes;
+    TLV *tlv;
+
+    while (ptr < (attributes + len)) {
+        tlv = (TLV *)ptr;
+        tlv->type = ieee_order(tlv->type);
+        tlv->length = ieee_order(tlv->length);
+        ptr = (unsigned char *)TLV_next(tlv);
+    }
+}
+
+static int
+compute_bootstrap_key_hash (EC_KEY *key, unsigned char *digest)
+{
+    int asn1len;
+    BIO *bio;
+    EVP_MD_CTX *mdctx;
+    unsigned int mdlen = SHA256_DIGEST_LENGTH;
+    unsigned char *asn1;
+
+    memset(digest, 0, SHA256_DIGEST_LENGTH);
+
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        return -1;
+    }
+    if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+        BIO_free(bio);
+        return -1;
+    }
+    (void)i2d_EC_PUBKEY_bio(bio, key);
+    (void)BIO_flush(bio);
+    asn1len = BIO_get_mem_data(bio, &asn1);
+
+    EVP_DigestInit(mdctx, EVP_sha256());
+    EVP_DigestUpdate(mdctx, asn1, asn1len);
+    EVP_DigestFinal(mdctx, digest, &mdlen);
+
+    BIO_free(bio);
+    EVP_MD_CTX_free(mdctx);
+    return mdlen;
+}
+
+static void
+send_dpp_chirp (timerid id, void *data)
+{
+    struct candidate *peer = (struct candidate *)data;
+    unsigned char bootkeyhash[SHA256_DIGEST_LENGTH], *asn1;
+    TLV *tlv;
+    int asn1len;
+    BIO *bio;
+    EVP_MD_CTX *mdctx;
+    unsigned int mdlen = SHA256_DIGEST_LENGTH;
+    
+    memset(peer->buffer, 0, sizeof(peer->buffer));
+    memset(bootkeyhash, 0, SHA256_DIGEST_LENGTH);
+    peer->bufferlen = 0;
+    tlv = (TLV *)peer->buffer;
+
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        goto fin;
+    }
+    if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+        BIO_free(bio);
+        goto fin;
+    }
+    (void)i2d_EC_PUBKEY_bio(bio, dpp_instance.bootstrap);
+    (void)BIO_flush(bio);
+    asn1len = BIO_get_mem_data(bio, &asn1);
+
+    /*
+     * the entirety of the chirp is a hash of "chirp" and our bootstrapping key
+     */
+    EVP_DigestInit(mdctx, EVP_sha256());
+    EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
+    EVP_DigestUpdate(mdctx, asn1, asn1len);
+    EVP_DigestFinal(mdctx, bootkeyhash, &mdlen);
+
+    BIO_free(bio);
+    EVP_MD_CTX_free(mdctx);
+
+    tlv = TLV_set_tlv(tlv, RESPONDER_BOOT_HASH, SHA256_DIGEST_LENGTH, bootkeyhash);
+    ieeeize_hton_attributes(peer->buffer, (int)((unsigned char *)tlv - peer->buffer));
+
+    setup_dpp_action_frame(peer, DPP_CHIRP);
+    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+    if (send_dpp_action_frame(peer)) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "chirp...\n");
+    }
+fin:
+    /*
+     * keep chirping, when we get a response we'll stop
+     */
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(30), send_dpp_chirp, peer);
+    return;
+}
+
+static void
 destroy_peer (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
@@ -402,7 +546,16 @@ fail_dpp_peer (struct candidate *peer)
         return;
     }
     peer->state = DPP_FAILED;
-    (void)srv_add_timeout(srvctx, SRV_MSEC(1), destroy_peer, peer);
+    /*
+     * if we're chirping then restart everything, set the timer for 5s to allow
+     * this failure to completely process (for any 2nd timers potentially coming
+     * in here, we want to stay with state = DPP_FAILED) then start all over again
+     */
+    if (do_chirp) {
+        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), send_dpp_chirp, peer);
+    } else {
+        (void)srv_add_timeout(srvctx, SRV_MSEC(1), destroy_peer, peer);
+    }
 }
 
 static void
@@ -539,29 +692,6 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
 }
 
 static void
-setup_dpp_auth_frame (struct candidate *peer, unsigned char frametype)
-{
-    dpp_action_frame *frame;
-
-    frame = (dpp_action_frame *)peer->frame;
-    memcpy(frame->oui_type, wfa_dpp, sizeof(wfa_dpp));
-    frame->cipher_suite = 1;
-    frame->frame_type = frametype;
-
-    return;
-}
-
-static int
-send_dpp_auth_frame (struct candidate *peer)
-{
-    dpp_action_frame *frame;
-
-    frame = (dpp_action_frame *)peer->frame;
-    memcpy(frame->attributes, peer->buffer, peer->bufferlen);
-    return transmit_auth_frame(peer->handle, peer->frame, peer->bufferlen + sizeof(dpp_action_frame));
-}
-
-static void
 retransmit_auth (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
@@ -590,37 +720,6 @@ retransmit_auth (timerid id, void *data)
         peer->retrans++;
     }
     return;
-}
-
-/*
- * IEEE order is little endian, ensure things go out (hton) correctly 
- * and can be coverted (ntoh) after receipt
- */
-static void
-ieeeize_hton_attributes (unsigned char *attributes, int len)
-{
-    unsigned char *ptr = attributes;
-    TLV *tlv;
-
-    while (ptr < (attributes + len)) {
-        tlv = (TLV *)ptr;
-        ptr = (unsigned char *)TLV_next(tlv);
-        tlv->type = ieee_order(tlv->type);
-        tlv->length = ieee_order(tlv->length);
-    }
-}
-
-static void ieeeize_ntoh_attributes (unsigned char *attributes, int len)
-{
-    unsigned char *ptr = attributes;
-    TLV *tlv;
-
-    while (ptr < (attributes + len)) {
-        tlv = (TLV *)ptr;
-        tlv->type = ieee_order(tlv->type);
-        tlv->length = ieee_order(tlv->length);
-        ptr = (unsigned char *)TLV_next(tlv);
-    }
 }
 
 //----------------------------------------------------------------------
@@ -961,6 +1060,52 @@ dump_key_con (struct candidate *peer)
 }
 
 static int
+send_dpp_config_result (struct candidate *peer, unsigned char status)
+{
+    siv_ctx ctx;
+    TLV *wraptlv, *tlv;
+
+    dpp_debug(DPP_DEBUG_TRACE, "sending dpp config result\n");
+    memset(peer->buffer, 0, sizeof(peer->buffer));
+    peer->bufferlen = 0;
+
+    wraptlv = (TLV *)peer->buffer;
+    wraptlv->type = ieee_order(WRAPPED_DATA);
+    tlv = (TLV *)(wraptlv->value + AES_BLOCK_SIZE);
+    tlv = TLV_set_tlv(tlv, DPP_STATUS, 1, &status);
+    tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
+    
+    ieeeize_hton_attributes(wraptlv->value + AES_BLOCK_SIZE,
+                            (unsigned char *)tlv - (unsigned char *)(wraptlv->value + AES_BLOCK_SIZE));
+
+    setup_dpp_action_frame(peer, DPP_CONFIG_RESULT);
+    switch(dpp_instance.digestlen) {
+        case SHA256_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_256);
+            break;
+        case SHA384_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_384);
+            break;
+        case SHA512_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_512);
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "unknown digest length %d!\n", dpp_instance.digestlen);
+    }
+    peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+    wraptlv->length = ieee_order(peer->bufferlen - sizeof(TLV));
+
+    siv_encrypt(&ctx, wraptlv->value + AES_BLOCK_SIZE, wraptlv->value + AES_BLOCK_SIZE,
+                (unsigned char *)tlv - ((unsigned char *)wraptlv->value + AES_BLOCK_SIZE),
+                wraptlv->value,
+                1, &peer->frame, sizeof(dpp_action_frame));
+    
+    send_dpp_action_frame(peer);
+
+    return 1;
+}
+        
+static int
 send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
 {
     siv_ctx ctx;
@@ -1116,7 +1261,7 @@ send_dpp_config_req_frame (struct candidate *peer)
     siv_ctx ctx;
     TLV *tlv;
     int ret = -1, caolen = 0;
-    char confattsobj[80], whoami[20];
+    char confattsobj[300], whoami[20];
     
     memset(peer->buffer, 0, sizeof(peer->buffer));
     peer->nextfragment = 0;     // so enrollee can reuse the buffer when he's done sending
@@ -1137,9 +1282,18 @@ send_dpp_config_req_frame (struct candidate *peer)
     tlv = (TLV *)(tlv->value + AES_BLOCK_SIZE);
 
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
-    caolen = snprintf(confattsobj, sizeof(confattsobj),
-                      "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\"}",
-                      whoami, dpp_instance.enrollee_role);
+    /*
+     * if we have a MUD URL then send it
+     */
+    if (dpp_instance.mudurl[0] == 0) {
+        caolen = snprintf(confattsobj, sizeof(confattsobj),
+                          "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\"}",
+                          whoami, dpp_instance.enrollee_role);
+    } else {
+        caolen = snprintf(confattsobj, sizeof(confattsobj),
+                          "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\", \"mudurl\":\"%s\"}",
+                          whoami, dpp_instance.enrollee_role, dpp_instance.mudurl);
+    }
     tlv = TLV_set_tlv(tlv, CONFIG_ATTRIBUTES_OBJECT, caolen, (unsigned char *)confattsobj);
 
     /*
@@ -1182,6 +1336,67 @@ send_dpp_config_req_frame (struct candidate *peer)
     ret = 1;
 fin:
     return ret;
+}
+
+static int
+process_dpp_config_result (struct candidate *peer, unsigned char *data, int len)
+{
+    dpp_action_frame *frame = (dpp_action_frame *)data;
+    TLV *tlv;
+    siv_ctx ctx;
+    unsigned char *status;
+    int res = -1;
+
+    dpp_debug(DPP_DEBUG_TRACE, "processing dpp config result\n");
+    ieeeize_ntoh_attributes(frame->attributes, len - sizeof(dpp_action_frame));
+    tlv = (TLV *)frame->attributes;
+    if (TLV_type(tlv) != WRAPPED_DATA) {
+        dpp_debug(DPP_DEBUG_ERR, "missing wrapped data in DPP Config result!\n");
+        goto fin;
+    }
+    /*
+     * decrypt the wrapped data
+     */
+    switch(dpp_instance.digestlen) {
+        case SHA256_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_256);
+            break;
+        case SHA384_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_384);
+            break;
+        case SHA512_DIGEST_LENGTH:
+            siv_init(&ctx, peer->ke, SIV_512);
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "unknown digest length %d!\n", dpp_instance.digestlen);
+            goto fin;
+    }
+    
+    if (siv_decrypt(&ctx, TLV_value(tlv) + AES_BLOCK_SIZE, TLV_value(tlv) + AES_BLOCK_SIZE,
+                    TLV_length(tlv) - AES_BLOCK_SIZE, TLV_value(tlv),
+                    1, data, sizeof(dpp_action_frame)) < 1) {
+        dpp_debug(DPP_DEBUG_ERR, "can't decrypt DPP Config result!\n");
+        goto fin;
+    }
+    tlv = (TLV *)(TLV_value(tlv) + AES_BLOCK_SIZE);
+    if ((TLV_type(tlv) != DPP_STATUS) || (TLV_length(tlv) != 1)) {
+        dpp_debug(DPP_DEBUG_ERR, "missing status in DPP config result!\n");
+        goto fin;
+    }
+    status = TLV_value(tlv);
+    if (*status != STATUS_OK) {
+        dpp_debug(DPP_DEBUG_ANY, "bad status %d from peer\n", *status);
+        goto fin;
+    }
+    tlv = TLV_next(tlv);
+    if (memcmp(TLV_value(tlv), peer->enonce, dpp_instance.noncelen)) {
+        dpp_debug(DPP_DEBUG_ANY, "incorrect enonce in DPP config result!\n");
+        goto fin;
+    }
+    dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "peer has successfully been provisioned!\n");
+    res = 1;
+fin:
+    return res;
 }
 
 static int
@@ -1522,6 +1737,8 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         dpp_debug(DPP_DEBUG_ERR, "malformed wrapped data in DPP Config Request-- no C-attrs!\n");
         return -1;
     }
+    dpp_debug(DPP_DEBUG_ANY, "the json looks like %.*s\n",
+              TLV_length(tlv), TLV_value(tlv));
     /*
      * parse the config attributes object for some interesting info
      */
@@ -1549,6 +1766,13 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         strncpy(peer->enrollee_role, sstr, estr - sstr);
     }
 
+    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                              &sstr, &estr, 1, "mudurl")) > 0) {
+        dpp_debug(DPP_DEBUG_ANY, "got a MUD URL of %.*s\n",
+                  estr - sstr, sstr);
+// when we handle pending responses do this
+//        return 0;
+    }
     return 1;
 }
 
@@ -1559,7 +1783,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
     gas_action_resp_frame *garp;
     gas_action_comeback_resp_frame *gacrp;
     struct candidate *peer = NULL;
-    int ret = -1;
+    int ret = -1, ready_to_send;
     
     TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
         if (peer->handle == handle) {
@@ -1577,6 +1801,14 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
     srv_rem_timeout(srvctx, peer->t0);
 
     switch (field) {
+        case BAD_DPP_SPEC_MESSAGE:
+            /*
+             * this is not a GAS frame. Unfortunately the spec uses GAS for the
+             * request and response but a regular DPP action frame for the confirm.
+             * So overload the "field" (it's just a uchar) and special case it here
+             */
+            process_dpp_config_result(peer, data, len);
+            break;
         case GAS_INITIAL_REQUEST:
             dpp_debug(DPP_DEBUG_TRACE, "got a GAS_INITIAL_REQUEST...\n");
             if (peer->core != DPP_CONFIGURATOR) {
@@ -1589,11 +1821,17 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                 return ret;
             }
             peer->dialog_token = garq->dialog_token;
-            if (process_dpp_config_request(peer, garq->query_req, len - sizeof(gas_action_req_frame)) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config request!\n");
-                send_dpp_config_resp_frame(peer, STATUS_CONFIGURE_FAILURE);
-            } else {
-                send_dpp_config_resp_frame(peer, STATUS_OK);
+            ready_to_send = process_dpp_config_request(peer, garq->query_req, len - sizeof(gas_action_req_frame));
+            switch (ready_to_send) {
+                case 1:
+                    send_dpp_config_resp_frame(peer, STATUS_OK);
+                    break;
+                case 0:
+                    send_dpp_config_resp_frame(peer, STATUS_CONFIGURE_PENDING);
+                    break;
+                default:
+                    dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config request!\n");
+                    send_dpp_config_resp_frame(peer, STATUS_CONFIGURE_FAILURE);
             }
             break;
         case GAS_INITIAL_RESPONSE:
@@ -1616,6 +1854,9 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                 if (process_dpp_config_response(peer, garp->query_resp, len - sizeof(gas_action_resp_frame)) < 1) {
                     dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
                     return -1;
+                }
+                if (peer->version > 1) {
+                    send_dpp_config_result(peer, STATUS_OK);
                 }
             } else if (garp->comeback_delay == 1) {
                 /*
@@ -1672,6 +1913,9 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                     dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
                     return -1;
                 }
+                if (peer->version > 1) {
+                    send_dpp_config_result(peer, STATUS_OK);
+                }
             }
             break;
         default:
@@ -1704,37 +1948,6 @@ start_config_protocol (timerid id, void *data)
 //----------------------------------------------------------------------
 
 static int
-compute_bootstrap_key_hash (EC_KEY *key, unsigned char *digest)
-{
-    int asn1len;
-    BIO *bio;
-    EVP_MD_CTX *mdctx;
-    unsigned int mdlen = SHA256_DIGEST_LENGTH;
-    unsigned char *asn1;
-
-    memset(digest, 0, SHA256_DIGEST_LENGTH);
-
-    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
-        return -1;
-    }
-    if ((mdctx = EVP_MD_CTX_new()) == NULL) {
-        BIO_free(bio);
-        return -1;
-    }
-    (void)i2d_EC_PUBKEY_bio(bio, key);
-    (void)BIO_flush(bio);
-    asn1len = BIO_get_mem_data(bio, &asn1);
-
-    EVP_DigestInit(mdctx, EVP_sha256());
-    EVP_DigestUpdate(mdctx, asn1, asn1len);
-    EVP_DigestFinal(mdctx, digest, &mdlen);
-
-    BIO_free(bio);
-    EVP_MD_CTX_free(mdctx);
-    return mdlen;
-}
-
-static int
 generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
 {
     int offset;
@@ -1751,7 +1964,7 @@ generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
 
     EVP_DigestInit(mdctx, dpp_instance.hashfcn);
     finaloctet = initiators;
-    if (initiators != is_initiator) {
+    if (initiators != peer->is_initiator) {
         EVP_DigestUpdate(mdctx, peer->mynonce, dpp_instance.noncelen);
         debug_buffer(DPP_DEBUG_TRACE, "my nonce", peer->mynonce, dpp_instance.noncelen);
         EVP_DigestUpdate(mdctx, peer->peernonce, dpp_instance.noncelen);
@@ -1798,7 +2011,7 @@ generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
          * however, if we're not doing mutual authentication then when I'm the responder
          * this is my bootstrapping key and when I'm not this is the peer's bootstrapping key
          */
-        if (!peer->mauth && !is_initiator) {
+        if (!peer->mauth && !peer->is_initiator) {
             if (((boot = EC_KEY_get0_public_key(dpp_instance.bootstrap)) == NULL) ||
                 !EC_POINT_get_affine_coordinates_GFp(dpp_instance.group, boot,
                                                      x, NULL, bnctx)) {
@@ -1816,7 +2029,7 @@ generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
         offset = dpp_instance.primelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
         EVP_DigestUpdate(mdctx, xoctets, dpp_instance.primelen);
-        debug_buffer(DPP_DEBUG_TRACE, !peer->mauth && !is_initiator ? "my bootstrap pubkey" : "peer's bootstrap pubkey",
+        debug_buffer(DPP_DEBUG_TRACE, !peer->mauth && !peer->is_initiator ? "my bootstrap pubkey" : "peer's bootstrap pubkey",
                      xoctets, dpp_instance.primelen);
     } else {
         EVP_DigestUpdate(mdctx, peer->peernonce, dpp_instance.noncelen);
@@ -1866,7 +2079,7 @@ generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
          * however, if we're not doing mutual authenticaiton then when I'm the initiator
          * this is the peer's bootstrapping key and when I'm not this is my bootstrapping key
          */
-        if (!peer->mauth && is_initiator) {
+        if (!peer->mauth && peer->is_initiator) {
             if (((boot = EC_KEY_get0_public_key(peer->peer_bootstrap)) == NULL) ||
                 !EC_POINT_get_affine_coordinates_GFp(dpp_instance.group, boot,
                                                      x, NULL, bnctx)) {
@@ -1883,7 +2096,7 @@ generate_auth (struct candidate *peer, int initiators, unsigned char *auth)
         offset = dpp_instance.primelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
         EVP_DigestUpdate(mdctx, xoctets, dpp_instance.primelen);
-        debug_buffer(DPP_DEBUG_TRACE, !peer->mauth && is_initiator ? "peer's bootstrap pubkey" : "my bootstrap pubkey",
+        debug_buffer(DPP_DEBUG_TRACE, !peer->mauth && peer->is_initiator ? "peer's bootstrap pubkey" : "my bootstrap pubkey",
                      xoctets, dpp_instance.primelen);
     }
     EVP_DigestUpdate(mdctx, &finaloctet, 1);
@@ -1935,7 +2148,7 @@ compute_ke (struct candidate *peer, BIGNUM *n, BIGNUM *l)
      * salt is the length of the largest hash digest supported, since nonces
      * are half the length of the hash digest it's the right size
      */
-    if (is_initiator) {
+    if (peer->is_initiator) {
         memcpy(salt, peer->mynonce, dpp_instance.noncelen);
         memcpy(salt+dpp_instance.noncelen, peer->peernonce, dpp_instance.noncelen);
     } else {
@@ -2025,7 +2238,7 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
     /*
      * set up the DPP action frame header for inclusion as part of AAD
      */
-    setup_dpp_auth_frame(peer, DPP_SUB_AUTH_CONFIRM);
+    setup_dpp_action_frame(peer, DPP_SUB_AUTH_CONFIRM);
     if (status == STATUS_OK) {
         /*
          * only 1 attribute to ieee-ize...
@@ -2101,7 +2314,7 @@ send_dpp_auth_confirm (struct candidate *peer, unsigned char status)
                     dpp_instance.digestlen + sizeof(TLV), ptr, 
                     2, peer->frame, sizeof(dpp_action_frame), attrs, aadlen);
     }
-    if (send_dpp_auth_frame(peer)) {
+    if (send_dpp_action_frame(peer)) {
         success = 1;
         peer->retrans = 0;
     }
@@ -2254,6 +2467,12 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         tlv = TLV_next(tlv);
     }
     /*
+     * if the peer sent us a verion > 1 then respond 
+     */
+    if (peer->version > 1) {
+        tlv = TLV_set_tlv(tlv, PROTOCOL_VERSION, 1, &peer->version);
+    }
+    /*
      * the primary wrapping of data which is...
      */
     tlv->type = WRAPPED_DATA;
@@ -2276,7 +2495,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
     /*
      * fill in the DPP Auth frame header for inclusion as a component of AAD
      */
-    setup_dpp_auth_frame(peer, DPP_SUB_AUTH_RESPONSE);
+    setup_dpp_action_frame(peer, DPP_SUB_AUTH_RESPONSE);
     if (status == STATUS_OK) {
         /*
          * and secondary wrapped data which is
@@ -2384,7 +2603,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
     }
     
     peer->bufferlen = (int)(ptr - peer->buffer);
-    if (send_dpp_auth_frame(peer)) {
+    if (send_dpp_action_frame(peer)) {
         success = 1;
         peer->retrans = 0;
         peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_auth, peer);
@@ -2556,6 +2775,12 @@ send_dpp_auth_request (struct candidate *peer)
     BN_bn2bin(y, ptr + offset);
     tlv = TLV_next(tlv);
 
+    dpp_debug(DPP_DEBUG_TRACE, "version is %d in send_dpp_auth_request\n", peer->version);
+    if (peer->version > 1) {
+        dpp_debug(DPP_DEBUG_TRACE, "adding a version...\n");
+        tlv = TLV_set_tlv(tlv, PROTOCOL_VERSION, 1, &peer->version);
+    }
+    
     /*
      * if we want to change channels and get the response on a different
      * one, indicate that now...
@@ -2584,13 +2809,13 @@ send_dpp_auth_request (struct candidate *peer)
     /*
      * setup DPP Action frame header to include as a component of AAD
      */
-    setup_dpp_auth_frame(peer, DPP_SUB_AUTH_REQUEST);
+    setup_dpp_action_frame(peer, DPP_SUB_AUTH_REQUEST);
     siv_encrypt(&ctx, wrap, (TLV_value(tlv) + AES_BLOCK_SIZE),
                 wrapped_len, TLV_value(tlv),
                 2, peer->frame, sizeof(dpp_action_frame), attrs, ((unsigned char *)tlv - attrs));
 
     peer->bufferlen = (int)(ptr - peer->buffer);
-    if (send_dpp_auth_frame(peer)) {
+    if (send_dpp_action_frame(peer)) {
         success = 1;
         peer->retrans = 0;
         peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_auth, peer);
@@ -3153,7 +3378,21 @@ process_dpp_auth_request (struct candidate *peer, dpp_action_frame *frame, int f
             goto fin;
         }
     }
-    
+
+    /*
+     * if the peer includes the version TLV then use that, otherwise assume v1
+     */
+    if ((tlv = find_tlv(PROTOCOL_VERSION, attrs, len)) != NULL) {
+        peer->version = *((unsigned char *)TLV_value(tlv));
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "peer send a version of %d\n", peer->version);
+        if ((peer->version > 2) || (peer->version == 0)) {
+            peer->version = 1;
+        }
+    } else {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "peer did not send a version, assuming 1\n");
+        peer->version = 1;
+    }
+
     if ((tlv = find_tlv(INITIATOR_PROTOCOL_KEY, attrs, len)) == NULL) {
         dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "can't find initiator's protocol key in Auth Req!\n");
         goto fin;
@@ -3348,7 +3587,7 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
     /*
      * implement the state machine for DPP
      */
-    if (is_initiator) {
+    if (peer->is_initiator) {
         /*
          * initiator state machine
          */
@@ -3444,6 +3683,7 @@ init_dpp_auth (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
 
+    dpp_debug(DPP_DEBUG_TRACE, "initiate DPP version %d\n", peer->version);
     if (send_dpp_auth_request(peer) > 0) {
         peer->state = DPP_AUTHENTICATING;
     }
@@ -3451,7 +3691,7 @@ init_dpp_auth (timerid id, void *data)
 }
 
 dpp_handle
-dpp_create_peer (char *keyb64)
+dpp_create_peer (char *keyb64, int initiator, int mutualauth)
 {
     struct candidate *peer;
     const BIGNUM *priv;
@@ -3477,7 +3717,16 @@ dpp_create_peer (char *keyb64)
     }
     peer->t0 = 0;
     peer->my_proto = NULL;
-    peer->mauth = dpp_instance.mauth;   /* initiator changes, responder set */
+    peer->mauth = initiator ? 1 : mutualauth;   /* initiator changes, responder set */
+
+    peer->is_initiator = initiator;
+    if (peer->is_initiator) {
+        peer->version = 2;              /* we can do v2 so we state it up front */
+    } else {
+        peer->version = 1;              /* leave it up to the initiator, assume the worst */
+    }
+    dpp_debug(DPP_DEBUG_TRACE, "we %s the initiator, version is %d\n",
+              peer->is_initiator ? "are" : "are not", peer->version);
     
     priv = EC_KEY_get0_private_key(dpp_instance.bootstrap);
     debug_a_bignum(DPP_DEBUG_TRACE, "my private bootstrap key", (BIGNUM *)priv);
@@ -3501,12 +3750,12 @@ dpp_create_peer (char *keyb64)
         EC_KEY_set_asn1_flag(peer->peer_bootstrap, OPENSSL_EC_NAMED_CURVE);
         debug_ec_key(DPP_DEBUG_TRACE, "peer's bootstrap key", peer->peer_bootstrap);
         debug_asn1_ec(DPP_DEBUG_TRACE, "DER encoded ASN.1", peer->peer_bootstrap, 0);
-    } else if (is_initiator) {
+    } else if (peer->is_initiator) {
         dpp_debug(DPP_DEBUG_ERR, "Initiator needs responder's bootstrapping key!\n");
         EC_POINT_free(peer->peer_proto);
         free(peer);
         return -1;
-    }
+    } 
     
     configurator_signkey = NULL;  // even if this is a configurator, used by discovery
     connector = NULL;
@@ -3517,15 +3766,37 @@ dpp_create_peer (char *keyb64)
     peer->handle = ++next_handle; // safe to assume we won't have 2^32 active sessions
 
     dpp_debug(DPP_DEBUG_TRACE, "\n------- Start of DPP Authentication Protocol ---------\n");
-    if (is_initiator) {
+    if (peer->is_initiator) {
         peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(200), init_dpp_auth, peer);
+    } else if (do_chirp) {
+        peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(10), send_dpp_chirp, peer);
     }
+    
     return peer->handle;
 }
 
+void
+dpp_free_peer (dpp_handle handle)
+{
+    struct candidate *peer = NULL;
+
+    TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
+        if (peer->handle == handle) {
+            break;
+        }
+    }
+    if (peer == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "no peer found with handle %d\n", handle);
+        return;
+    }
+    (void)srv_add_timeout(srvctx, SRV_USEC(1), destroy_peer, peer);
+    return;
+}
+
 int
-dpp_initialize (int initiator, int core, int mutual, char *keyfile, 
-                char *signkeyfile, char *enrolleerole, int opclass, int channel, int verbosity)
+dpp_initialize (int core, char *keyfile, char *signkeyfile,
+                char *enrolleerole, char *mudurl, int chirp,
+                int opclass, int channel, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;
@@ -3544,32 +3815,22 @@ dpp_initialize (int initiator, int core, int mutual, char *keyfile,
      * set defaults and read in config
      */
     debug = verbosity;
-    is_initiator = initiator;
-    if (!is_initiator) {
-        /*
-         * the responder decides, the initiator always offers
-         */
-        dpp_instance.mauth = mutual;
-    } else {
-        dpp_instance.mauth = 1;
-    }
+    do_chirp = chirp;
 
     if (!core) {                /* have to chose one! */
         return -1;
     }
+    memset(dpp_instance.mudurl, 0, sizeof(dpp_instance.mudurl));
     dpp_instance.core = core;
     switch (core) {
         case DPP_ENROLLEE:
-            dpp_debug(DPP_DEBUG_TRACE, "role: enrollee, %s\n",
-                      is_initiator ? "initiator" : mutual ? "responder (mutual auth)" : "responder (not mutual auth)");
+            dpp_debug(DPP_DEBUG_TRACE, "role: enrollee\n");
             break;
         case DPP_CONFIGURATOR:
-            dpp_debug(DPP_DEBUG_TRACE, "role: configurator, %s\n",
-                      is_initiator ? "initiator" : mutual ? "responder (mutual auth)" : "responder (not mutual auth)");
+            dpp_debug(DPP_DEBUG_TRACE, "role: configurator\n");
             break;
         case (DPP_ENROLLEE | DPP_CONFIGURATOR):
-            dpp_debug(DPP_DEBUG_TRACE, "role: both enrollee and configurator, %s\n",
-                      is_initiator ? "initiator" : mutual ? "responder (mutual auth)" : "responder (not mutual auth)");
+            dpp_debug(DPP_DEBUG_TRACE, "role: both enrollee and configurator\n");
             break;
         default:
             dpp_debug(DPP_DEBUG_TRACE, "role: unknown... %x\n", core);
@@ -3594,6 +3855,9 @@ dpp_initialize (int initiator, int core, int mutual, char *keyfile,
         BIO_free(bio);
     } else {
         strcpy(dpp_instance.enrollee_role, enrolleerole);
+        if (mudurl) {
+            strcpy(dpp_instance.mudurl, mudurl);
+        }
     }
 
     dpp_instance.newoc = opclass;

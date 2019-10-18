@@ -25,7 +25,7 @@ RESTRICTIONS
 
   macos only supports DPP over wired (controller.c and device.c).
 
-  Freebsd sss currently only supports Atheros radios.
+  Freebsd currently only supports Atheros radios.
 
 REQUIREMENTS
 
@@ -78,15 +78,17 @@ USAGE: ./sss [-hCIBapkceirdfgs]
         -I <interface> to add to DPP
         -B <filename> of peer bootstrappign keys
         -p <password> to use for PKEX
+        -n <identifier> for the code used in PKEX
         -f <channel> to use with DPP
         -g <opclass> operating class to use with DPP
         -z <info> to pass along with public key in PKEX
-        -n <identifier> for the code used in PKEX
         -k <filename> my bootstrapping key
         -b  bootstrapping (PKEX) only, don't run DPP
-        -x  <index> DPP only with key <index> in -B <filename>, don't do PKEX
+        -x <index> DPP only with key <index> in -B <filename>, don't do PKEX
         -m <MAC address> to initiate to, otherwise uses broadcast
         -s  change opclass/channel to what was set with -f and -g
+	-u <url> to find a MUD file (enrollee only)
+	-t  send DPP chirps (responder only)
         -d <debug> set debugging mask
 
 
