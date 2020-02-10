@@ -225,9 +225,6 @@ cons_action_frame (unsigned char field, dpp_handle handle,
     return len;
 }
 
-/*
- * wrappers to send action frames
- */
 int
 transmit_config_frame (dpp_handle handle, unsigned char field, char *data, int len)
 {
@@ -399,7 +396,7 @@ fail:
 }
 
 int
-change_channel (unsigned char *blah, unsigned char foo, unsigned char bar)
+change_dpp_freq (dpp_handle handle, unsigned long blah)
 {
     return 1;
 }

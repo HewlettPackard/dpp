@@ -86,6 +86,11 @@ struct family_data {
     int id;
 };
 
+struct trigger_results {
+    int done;
+    int aborted;
+};
+
 service_context srvctx;
 static int discovered = -1;
 char our_ssid[33];
@@ -517,7 +522,8 @@ no_seq_check (struct nl_msg *msg, void *arg)
     return NL_OK;
 }
 
-static int cookie_handler(struct nl_msg *msg, void *arg)
+static int
+cookie_handler(struct nl_msg *msg, void *arg)
 {
     struct nlattr *tb[NL80211_ATTR_MAX + 1];
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -795,9 +801,105 @@ cons_action_frame (unsigned char field, unsigned char *mymac, unsigned char *pee
     return len;
 }
 
-/*
- * wrappers to send action frames
- */
+static unsigned long
+chan2freq (unsigned int chan)
+{
+    if (chan == 14) {
+        return 2484;
+    }
+    if (chan < 14) {
+        return 2407 + chan * 5;
+    }
+    if (chan < 27) {
+        return 2512 + ((chan - 15)*20);
+    }
+    return 5000 + (chan * 5);
+}
+
+static int
+change_freq (unsigned char *mac, unsigned long freak)
+{
+#if 0
+    struct nl_msg *msg;
+    unsigned long long cookie;
+#endif
+    struct interface *inf;
+    
+    TAILQ_FOREACH(inf, &interfaces, entry) {
+        if (memcmp(mac, inf->bssid, ETH_ALEN) == 0) {
+            break;
+        }
+    }
+    if (inf == NULL) {
+        fprintf(stderr, "can't find " MACSTR " to change channel!\n",
+                MAC2STR(mac));
+        return -1;
+    }
+    if (inf->is_loopback) {
+        return 1;
+    }
+
+#if 0
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
+        fprintf(stderr, "can't allocate an nl_msg!\n");
+        return -1;
+    }
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
+    /*
+     * for the time being ignore HT, VHT...
+     */
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
+    cookie = 0;
+    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
+        fprintf(stderr, "unable to change channel!\n");
+        return -1;
+    }
+#endif
+    inf->freq = freak;
+    return 1;
+}
+
+int
+change_dpp_freq (dpp_handle handle, unsigned long freq) 
+{
+    struct dpp_instance *instance;
+
+    if ((instance = find_instance_by_handle(handle)) == NULL) {
+        return -1;
+    }
+    return change_freq(instance->mymac, freq);
+}
+
+int
+change_dpp_channel (dpp_handle handle, unsigned char class, unsigned char channel)
+{
+    struct dpp_instance *instance;
+    int i, maxregs;
+    unsigned long freak;
+
+    /*
+     * make sure it's a valid class/channel
+     */
+    maxregs = (sizeof(regulatory)/sizeof(struct _regulatory));
+    for (i = 0; i < maxregs; i++) {
+        if ((regulatory[i].class == class) && (regulatory[i].channel == channel)) {
+            break;
+        }
+    }
+    if (i == maxregs) {
+        fprintf(stderr, "opclass %d and channel %d is not supported!\n",
+                class, channel);
+        return -1;
+    }
+
+    if ((instance = find_instance_by_handle(handle)) == NULL) {
+        return -1;
+    }
+    freak = chan2freq(channel);
+    printf("trying to change to channel %d (%ld)\n", channel, freak);
+    return change_freq(instance->mymac, freak);
+}
+
 int
 transmit_config_frame (dpp_handle handle, unsigned char field, char *data, int len)
 {
@@ -984,7 +1086,6 @@ static int family_handler(struct nl_msg *msg, void *arg)
     struct nlattr *mcgrp;
     int i;
 
-    printf("inside family handler....\n");
     nla_parse(tb, CTRL_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
               genlmsg_attrlen(gnlh, 0), NULL);
     if (!tb[CTRL_ATTR_MCAST_GROUPS])
@@ -1016,7 +1117,6 @@ nl_get_multicast_id (struct interface *inf, const char *family, const char *grou
     if ((msg = nlmsg_alloc()) == NULL) {
         return -1;
     }
-    printf("getting multicast id for %s/%s\n", family, group);
     if (!genlmsg_put(msg, 0, 0, genl_ctrl_resolve(inf->nl_sock, "nlctrl"), 0, 0,
                      CTRL_CMD_GETFAMILY, 0) ||
         nla_put_string(msg, CTRL_ATTR_FAMILY_NAME, family)) {
@@ -1028,7 +1128,173 @@ nl_get_multicast_id (struct interface *inf, const char *family, const char *grou
     }
     return res.id;
 }
+
+static int
+scan_callback_trigger (struct nl_msg *msg, void *arg) 
+{
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct trigger_results *results = arg;
+
+    switch (gnlh->cmd) {
+        case NL80211_CMD_SCAN_ABORTED:
+            results->done = 1;
+            results->aborted = 1;
+            break;
+        case NL80211_CMD_NEW_SCAN_RESULTS:
+            results->done = 1;
+            results->aborted = 0;
+            break;
+        default:
+//            printf("weird multicast message\n");
+            break;
+    }
+
+    return NL_SKIP;
+}
+
+int
+find_dpp_conie (unsigned char *ie, int ielen) {
+    uint8_t len;
+    uint8_t *data;
+    char blah[33];
+    const uint8_t dpp_config_conn[6] = {
+        0xdd, 0x04, 0x50, 0x6f, 0x9a, 0x1e
+    };
+
+    memset(blah, 0, 33);
+    while (ielen >= 2 && ielen >= ie[1]) {
+        if (ie[0] == 0 && ie[1] >= 0 && ie[1] <= 32) {
+            len = ie[1];
+            data = ie + 2;
+            memcpy(blah, data, len);
+        }
+        if (memcmp(ie, dpp_config_conn, sizeof(dpp_config_conn)) == 0) {
+            printf("FOUND THE DPP CONFIGURATOR CONNECTIVITY IE on %s!!!\n", blah);
+            return 1;
+        }
+        ielen -= ie[1] + 2;
+        ie += ie[1] + 2;
+    }
+    return 0;
+}
+
+static int
+callback_dump(struct nl_msg *msg, void *arg)
+{
+    // Called by the kernel with a dump of the successful scan's data. Called for each SSID.
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct nlattr *bss[NL80211_BSS_MAX + 1];
+    static struct nla_policy bss_policy[NL80211_BSS_MAX + 1] = {
+        [NL80211_BSS_TSF] = { .type = NLA_U64 },
+        [NL80211_BSS_FREQUENCY] = { .type = NLA_U32 },
+        [NL80211_BSS_BSSID] = { },
+        [NL80211_BSS_BEACON_INTERVAL] = { .type = NLA_U16 },
+        [NL80211_BSS_CAPABILITY] = { .type = NLA_U16 },
+        [NL80211_BSS_INFORMATION_ELEMENTS] = { },
+        [NL80211_BSS_SIGNAL_MBM] = { .type = NLA_U32 },
+        [NL80211_BSS_SIGNAL_UNSPEC] = { .type = NLA_U8 },
+        [NL80211_BSS_STATUS] = { .type = NLA_U32 },
+        [NL80211_BSS_SEEN_MS_AGO] = { .type = NLA_U32 },
+        [NL80211_BSS_BEACON_IES] = { },
+    };
+    struct interface *inf = (struct interface *)arg;
+    uint32_t freq;
+
+    // Parse and error check.
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+    if (!tb[NL80211_ATTR_BSS]) {
+        printf("bss info missing!\n");
+        return NL_SKIP;
+    }
+    if (nla_parse_nested(bss, NL80211_BSS_MAX, tb[NL80211_ATTR_BSS], bss_policy)) {
+        printf("failed to parse nested attributes!\n");
+        return NL_SKIP;
+    }
+    if (!bss[NL80211_BSS_BSSID]) return NL_SKIP;
+    if (!bss[NL80211_BSS_INFORMATION_ELEMENTS]) return NL_SKIP;
+    /*
+     * if an AP is beaconing out the DPP Configurator Connectivity IE
+     * then add its frequency to the chirp list
+     */
+    if (find_dpp_conie(nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]),
+                       nla_len(bss[NL80211_BSS_INFORMATION_ELEMENTS])) > 0) {
+        freq = nla_get_u32(bss[NL80211_BSS_FREQUENCY]);
+        dpp_add_chirp_freq(inf->bssid, freq);
+    }
     
+    return NL_SKIP;
+}
+
+int
+do_scan_trigger(struct interface *inf)
+{
+    // Starts the scan and waits for it to finish. Does not return until the scan is done or has been aborted.
+    struct trigger_results results = { .done = 0, .aborted = 0 };
+    struct nl_msg *msg;
+    struct nl_cb *cb;
+    struct nl_msg *ssids_to_scan;
+    int err;
+    int ret;
+    int mcid = nl_get_multicast_id(inf, "nl80211", "scan");
+    nl_socket_add_membership(inf->nl_sock, mcid);  // Without this, callback_trigger() won't be called.
+
+    // Allocate the messages and callback handler.
+    msg = nlmsg_alloc();
+    if (!msg) {
+        printf("ERROR: Failed to allocate netlink message for msg.\n");
+        return -ENOMEM;
+    }
+    ssids_to_scan = nlmsg_alloc();
+    if (!ssids_to_scan) {
+        printf("ERROR: Failed to allocate netlink message for ssids_to_scan.\n");
+        nlmsg_free(msg);
+        return -ENOMEM;
+    }
+    cb = nl_cb_alloc(NL_CB_DEFAULT);
+    if (!cb) {
+        printf("ERROR: Failed to allocate netlink callbacks.\n");
+        nlmsg_free(msg);
+        nlmsg_free(ssids_to_scan);
+        return -ENOMEM;
+    }
+
+    // Setup the messages and callback handler.
+    genlmsg_put(msg, 0, 0, inf->nl80211_id, 0, 0, NL80211_CMD_TRIGGER_SCAN, 0);  // Setup which command to run.
+    nla_put_u32(msg, NL80211_ATTR_IFINDEX, inf->ifindex);  // Add message attribute, which interface to use.
+    nla_put(ssids_to_scan, 1, 0, "");  // Scan all SSIDs.
+    nla_put_nested(msg, NL80211_ATTR_SCAN_SSIDS, ssids_to_scan);  // Add message attribute, which SSIDs to scan for.
+    nlmsg_free(ssids_to_scan);  // Copied to `msg` above, no longer need this.
+    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, scan_callback_trigger, &results);  // Add the callback.
+    nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
+    nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
+    nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
+    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);  // No sequence checking for multicast messages.
+
+    // Send NL80211_CMD_TRIGGER_SCAN to start the scan. The kernel may reply with NL80211_CMD_NEW_SCAN_RESULTS on
+    // success or NL80211_CMD_SCAN_ABORTED if another scan was started by another process.
+    err = 1;
+    ret = nl_send_auto(inf->nl_sock, msg);  // Send the message.
+    while (err > 0) ret = nl_recvmsgs(inf->nl_sock, cb);  // First wait for ack_handler(). This helps with basic errors.
+    if (err < 0) {
+        printf("WARNING: err has a value of %d.\n", err);
+    }
+    if (ret < 0) {
+        printf("ERROR: nl_recvmsgs() returned %d (%s).\n", ret, nl_geterror(-ret));
+        return ret;
+    }
+    while (!results.done) nl_recvmsgs(inf->nl_sock, cb);  // Now wait until the scan is done or aborted.
+    if (results.aborted) {
+        printf("ERROR: Kernel aborted scan.\n");
+        return 1;
+    }
+
+    // Cleanup.
+    nlmsg_free(msg);
+    nl_cb_put(cb);
+    return 0;
+}
+
 static void
 add_interface (char *ptr)
 {
@@ -1077,6 +1343,7 @@ add_interface (char *ptr)
          */
         ifr.ifr_flags = 0;
     }
+
     if ((ifr.ifr_flags & IFF_LOOPBACK) == 0) {
         fprintf(stderr, "%s is NOT the loopback!\n", inf->ifname);
         inf->is_loopback = 0;
@@ -1168,13 +1435,6 @@ add_interface (char *ptr)
             return;
         }
 #if 0
-        printf("\nask for beacons\n");
-        if (register_beacon_frame(inf) < 1) {
-            free(inf);
-            return;
-        }
-#endif 
-#if 0
         printf("\nask for auth frames\n");
         if (register_auth_frame(inf) < 1) {
             free(inf);
@@ -1217,91 +1477,6 @@ add_interface (char *ptr)
     return;
 }
 
-static unsigned long
-chan2freq (unsigned int chan)
-{
-    if (chan == 14) {
-        return 2484;
-    }
-    if (chan < 14) {
-        return 2407 + chan * 5;
-    }
-    if (chan < 27) {
-        return 2512 + ((chan - 15)*20);
-    }
-    return 5000 + (chan * 5);
-}
-
-int
-change_channel (unsigned char *mymac, unsigned char class, unsigned char channel)
-{
-#if 0
-    struct nl_msg *msg;
-    unsigned long long cookie;
-#endif
-    int i, maxregs;
-    unsigned long freak;
-    struct interface *inf;
-    
-    TAILQ_FOREACH(inf, &interfaces, entry) {
-        if (memcmp(mymac, inf->bssid, ETH_ALEN) == 0) {
-            break;
-        }
-    }
-    if (inf == NULL) {
-        fprintf(stderr, "can't find " MACSTR " to change channel!\n",
-                MAC2STR(mymac));
-        return -1;
-    }
-    if (inf->is_loopback) {
-        return 1;
-    }
-
-    freak = chan2freq(channel);
-    printf("trying to change to channel %d (%ld)\n", channel, freak);
-    maxregs = (sizeof(regulatory)/sizeof(struct _regulatory));
-    for (i = 0; i < maxregs; i++) {
-        if ((regulatory[i].class == class) && (regulatory[i].channel == channel)) {
-            break;
-        }
-    }
-    if (i == maxregs) {
-        fprintf(stderr, "opclass %d and channel %d is not supported!\n",
-                class, channel);
-        return -1;
-    }
-#if 0
-    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
-        fprintf(stderr, "can't allocate an nl_msg!\n");
-        return -1;
-    }
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
-    /*
-     * for the time being ignore HT, VHT...
-     */
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-    cookie = 0;
-    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
-        fprintf(stderr, "unable to change channel!\n");
-        return -1;
-    }
-#endif
-    inf->freq = freak;
-    printf("changing channel to %d and operating class %d (frequency %ld)\n", channel, class, inf->freq);
-    return 1;
-}
-
-int
-change_dpp_channel (dpp_handle handle, unsigned char class, unsigned char channel)
-{
-    struct dpp_instance *instance;
-
-    if ((instance = find_instance_by_handle(handle)) == NULL) {
-        return -1;
-    }
-    return change_channel(instance->mymac, class, channel);
-}
-
 /*
  * takes one of our mac addresses and an index into the bootstrapping key file.
  * Initiates DPP to peer whose DPP URI is at "keyidx".
@@ -1337,7 +1512,7 @@ bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
     fclose(fp);
     printf("peer is on operating class %d and channel %d, checking...\n", opclass, channel);
     printf("peer's bootstrapping key is %s\n", keyb64);
-    if (change_channel(mymac, opclass, channel) < 0) {
+    if (change_freq(mymac, chan2freq(channel)) < 0) {
         fprintf(stderr, "peer's channel and operating class is not supported!\n");
         return -1;
     }
@@ -1372,6 +1547,7 @@ main (int argc, char **argv)
     char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    struct nl_msg *msg;
 
     if ((srvctx = srv_create_context()) == NULL) {
         fprintf(stderr, "%s: cannot create service context!\n", argv[0]);
@@ -1387,6 +1563,9 @@ main (int argc, char **argv)
     memset(pkexinfo, 0, 80);
     for (;;) {
         c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:t");
+        /*
+         * left: j, l, o, q, v, w, y
+         */
         if (c < 0) {
             break;
         }
@@ -1469,14 +1648,13 @@ main (int argc, char **argv)
             default:
             case 'h':
                 fprintf(stderr, 
-                        "USAGE: %s [-hCIBapkceirdfgst]\n"
+                        "USAGE: %s [-hIBapkceirdfgst]\n"
                         "\t-h  show usage, and exit\n"
                         "\t-c <signkey> run DPP as the configurator, sign connectors with <signkey>\n"
                         "\t-e <role> run DPP as the enrollee in the role of <role> (sta or ap)\n"
                         "\t-i  run DPP as the initiator\n"
                         "\t-r  run DPP as the responder\n"
                         "\t-a  do not perform mutual authentication in DPP\n"
-                        "\t-C <filename> of radio configuration file\n"
                         "\t-I <interface> to add to DPP\n"
                         "\t-B <filename> of peer bootstrappign keys\n"
                         "\t-p <password> to use for PKEX\n"
@@ -1514,20 +1692,6 @@ main (int argc, char **argv)
         fprintf(stderr, "%s: no interfaces defined!\n", argv[0]);
         add_interface("lo");
     }
-    printf("interfaces and MAC addresses:\n");
-    TAILQ_FOREACH(inf, &interfaces, entry) {
-        printf("\t%s: " MACSTR "\n", inf->ifname, MAC2STR(inf->bssid));
-        inf->freq = chan2freq(channel);
-        printf("channel %ld\n", inf->freq);
-        
-        /*
-         * if we're not changing the channel in DPP after the 1st message then
-         * just set it now.
-         */
-        if (chchandpp == 0 ) {
-            change_channel(inf->bssid, opclass, channel);
-        }
-    }
     if (is_initiator) {
         printf("initiating to " MACSTR "\n", MAC2STR(targetmac));
     }
@@ -1548,13 +1712,54 @@ main (int argc, char **argv)
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           mudurl[0] == 0 ? NULL : mudurl, chirp,
+                           mudurl[0] == 0 ? NULL : mudurl, chirp, 
                            chchandpp ? opclass : 0, chchandpp ? channel : 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }
     }
     
+    /*
+     * set up default channels for our interfaces or generate a
+     * chirp list if we're chirping
+     */
+    printf("interfaces and MAC addresses:\n");
+    TAILQ_FOREACH(inf, &interfaces, entry) {
+        printf("\t%s: " MACSTR "\n", inf->ifname, MAC2STR(inf->bssid));
+        if (chirp) {
+            /*
+             * first add channel 6 since we support 2.4GHz
+             */
+            dpp_add_chirp_freq(inf->bssid, 2437);
+            /*
+             * then add all the APs that are beaconing out a DPP ConfigConn IE
+             */
+            printf("chirping, so scan for APs\n");
+            if (do_scan_trigger(inf) == 0) {
+                msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
+                if (send_nl_msg(msg, inf, callback_dump, inf)) {
+                    printf("can't get scan info from kernel!\n");
+                }
+            } else {
+                printf("can't scan to find chirping channel :-(\n");
+            }
+            /*
+             * then add the configured channel if it's not on the list already
+             */
+            dpp_add_chirp_freq(inf->bssid, chan2freq(channel));
+        }
+        inf->freq = chan2freq(channel);
+        printf("configured channel %ld\n", inf->freq);
+        
+        /*
+         * if we're not changing the channel in DPP after the 1st message then
+         * just set it now.
+         */
+        if (chchandpp == 0 ) {
+            change_freq(inf->bssid, inf->freq);
+        }
+    }
+
     TAILQ_FOREACH(inf, &interfaces, entry) {
         /*
          * For each interface we're active on...

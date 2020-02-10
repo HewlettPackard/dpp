@@ -350,6 +350,9 @@ bpf_in (int fd, void *data)
                                                 MAC2STR(frame->sa));
                                     }
                                     break;
+                                case DPP_CHIRP:
+                                    fprintf(stderr, "got a chirp... not really my thing\n");
+                                    break;
                                 default:
                                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
                                     break;
@@ -374,7 +377,7 @@ bpf_in (int fd, void *data)
                             }
                             break;
                         default:
-                            fprintf(stderr, "weird action field (%x)\n", frame->action.field);
+//                            fprintf(stderr, "weird action field (%x)\n", frame->action.field);
                             break;
                     }
                     break;
@@ -948,6 +951,21 @@ chan2freq(unsigned int chan)
     return 5000 + (chan*5);
 }
 
+static unsigned char
+freq2chan (unsigned long freq)
+{
+    if (freq == 2484) {                 /* chan 14 */
+        return 14;
+    }
+    if (freq < 2473) {                  /* chan 0-13 */
+        return ((freq - 2407)/5);
+    }
+    if (freq < 2733) {                  /* chan 15-26 */
+        return (((freq - 2512)/20) + 15);
+    }
+    return ((freq - 5000)/5);
+}
+
 int
 change_channel (unsigned char *mymac, unsigned char class, unsigned char channel)
 {
@@ -1085,6 +1103,31 @@ change_channel (unsigned char *mymac, unsigned char class, unsigned char channel
     printf("setting to channel %d, global operating class %d\n", channel, class);
     close(s);
     return 1;
+}
+
+int
+change_dpp_freq (dpp_handle handle, unsigned long freq)
+{
+    struct dpp_instance *instance;
+    unsigned char channel;
+    int maxregs, i;
+
+    if ((instance = find_instance_by_handle(handle)) == NULL) {
+        return -1;
+    }
+    channel = freq2chan(freq);
+    for (i = 0; i < maxregs; i++) {
+        /*
+         * go through all the classes for this channel and if one of
+         * them works run with it, otherwise try the next...
+         */
+        if (regulatory[i].channel == channel) {
+            if (change_channel(instance->mymac, regulatory[i].class, channel) > 0) {
+                return 1;
+            }
+        }
+    }
+    return -1;
 }
 
 int
@@ -1397,7 +1440,7 @@ main (int argc, char **argv)
             memset(&ireq, 0, sizeof(struct ieee80211req));
             strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
             ireq.i_type = IEEE80211_IOC_WPA;
-            ireq.i_val = 2;
+            ireq.i_val = 5;
             if (ioctl(s, SIOCS80211, &ireq) < 0) {
                 fprintf(stderr, "%s: unable to set RSN!\n", argv[0]);
                 perror("ioctl setting RSN");
@@ -1505,6 +1548,8 @@ main (int argc, char **argv)
     }
 
     TAILQ_FOREACH(inf, &interfaces, entry) {
+
+        dpp_add_chirp_freq(inf->bssid, channel);
         /*
          * For each interface we're active on...
          *

@@ -247,7 +247,7 @@ fin (unsigned short reason, unsigned char *mac, unsigned char *key, int keylen)
 }
 
 int
-change_channel (unsigned char *blah, unsigned char foo, unsigned char bar)
+change_dpp_freq (dpp_handle unused, unsigned long blah)
 {
     return 1;
 }

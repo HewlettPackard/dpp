@@ -81,12 +81,19 @@ typedef struct _tlv {
         (x)->type == RESPONDER_PROTOCOL_KEY ? "Responder Protocol Key" : \
         (x)->type == INITIATOR_AUTH_TAG ? "Initiator Authentication Tag" : \
         (x)->type == RESPONDER_AUTH_TAG ? "Responder Authentication Tag" : \
+        (x)->type == CONFIGURATION_OBJECT ? "Configuration Object": \
+        (x)->type == CONNECTOR ? "Connector" : \
+        (x)->type == CONFIG_ATTRIBUTES_OBJECT ? "Config Attributes Object": \
+        (x)->type == BOOTSTRAP_KEY ? "Bootstrap Key" : \
+        (x)->type == HASH_OF_PEER_PK ? "Hash of Peer's Public Key": \
+        (x)->type == HASH_OF_DEVICE_NK ? "Hash of Device's Network Key" : \
         (x)->type == FINITE_CYCLIC_GROUP ? "Finite Cyclic Group" : \
         (x)->type == ENCRYPTED_KEY ? "Encrypted Key" : \
-        (x)->type == BOOTSTRAP_KEY ? "Bootstrapping Key" : \
         (x)->type == CODE_IDENTIFIER ? "PKEX Code Identifier" : \
         (x)->type == TRANSACTION_IDENTIFIER ? "Transaction Identifier" : \
         (x)->type == CHANGE_CHANNEL ? "Change Channel" : \
+        (x)->type == PROTOCOL_VERSION ? "Protocol Version" : \
+        (x)->type == DPP_ENVELOPED_DATA ? "Enveloped Data" : \
         "unknown"
 
 TLV *TLV_set_tlv(TLV *, unsigned short, unsigned short, unsigned char *);

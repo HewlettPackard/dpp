@@ -39,6 +39,7 @@ typedef unsigned int dpp_handle;
  * exported APIs to interact with the DPP module
  */
 int dpp_initialize(int, char *, char *, char *, char *, int, int, int, int);
+void dpp_add_chirp_freq(unsigned char *, unsigned long);
 dpp_handle dpp_create_peer(unsigned char *, int, int);
 void dpp_free_peer(dpp_handle);
 int process_dpp_auth_frame(unsigned char *, int, dpp_handle);

@@ -171,26 +171,28 @@ speaks DPP solely through TCP/IP, no action frames used.
   To run it you need either a controller and a device or a controller, a relay,
 and a regualar instance of sss. For example,
 
-On freebsd, sss is running as a responder not doing mutual authentication
-(i.e. like a typical IoT device)
+For instance, sss is running as a responder not doing mutual authentication
+(i.e. like a typical IoT device) and will "chirp" it's unprovisioned status:
 
- % sudo ./sss -I ath0 -r -e sta -k respp256.pem -a -d 63
+ % sudo ./sss -I ath0 -r -e sta -k respp256.pem -a -t -d 63
 
-On linux a relay is running that would connect to a controller 10.10.10.99
-if anyone initiated to it and it will snoop for DPP frames with a responder's
-bootstrapping key indicated by the contents of controller.pem:
+Then on a different computer a relay is running that would connect to a
+controller at 10.10.10.99 if anyone initiated to it and it will snoop for DPP
+frames with a responder's bootstrapping key indicated by the contents of
+controller_b64:
 
- % sudo ./relay -I wlp58s0 -C 10.10.10.99 -k controller.pem -d 63
+ % sudo ./relay -I wlp58s0 -C 10.10.10.99 -b controller_b64.txt -d 63
 
-And on macos the controller can be run to attach to a relay at 10.10.10.98
-and assuming the IoT device's (freebsd sss) public key has been bootstrapped
-into index 1 of initbkeys.txt:
+And on a 3rd computer the controller can be run to attach to a relay at
+10.10.10.98 and assuming the IoT device's (sss) public key has been bootstrapped
+into initbkeys.txt:
 
  % sudo ./controller -i -c signp256.pem -I 10.10.10.98 -k controller.pem \
--B initbkeys.txt -x 1 -d 63
+-B initbkeys.txt -d 63
 
-The controller will initiate through the relay to the IoT device and provision
-a connector on it.
+The controller will identify the unprovisioned peer from the "chirp", find a matching
+bootstrapping key in the index file, initiate through the relay to the IoT device and
+provision a connector on it.
 
 CONTENTS OF DISTRIBUTION
 

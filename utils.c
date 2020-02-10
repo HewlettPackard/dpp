@@ -532,14 +532,14 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
 #ifdef HAS_BRAINPOOL
                       nid == NID_X9_62_prime256v1 ? "ES256" : \
                       nid == NID_secp384r1 ? "ES384" : \
-                      nid == NID_secp521r1 ? "ES521" : \
+                      nid == NID_secp521r1 ? "ES512" : \
                       nid == NID_brainpoolP256r1 ? "BS256" : \
                       nid == NID_brainpoolP384r1 ? "BS384" : \
                       nid == NID_brainpoolP512r1 ? "BS512" : "unknown");
 #else
                       nid == NID_X9_62_prime256v1 ? "ES256" : \
                       nid == NID_secp384r1 ? "ES384" : \
-                      nid == NID_secp521r1 ? "ES521" : "unknown");
+                      nid == NID_secp521r1 ? "ES512" : "unknown");
 #endif  /* HAS_BRAINPOOL */
     
     if ((sofar = base64urlencode(connector, (unsigned char *)buf, buflen)) < 0) {
@@ -589,7 +589,7 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
     buflen = snprintf(buf, sizeof(buf),
                       "{\"groups\":[{\"groupId\":\"interop\",\"netRole\":\"%s\"}],"
                       "\"netAccessKey\":{\"kty\":\"EC\",\"crv\":\"%s\",\"x\":\"%s\",\"y\":\"%s\","
-                      "\"kid\":\"%s\"},\"expiry\":\"2020-01-01T01:01:01\"}", role, 
+                      "\"kid\":\"%s\"},\"expiry\":\"2021-01-01T01:01:01\"}", role, 
 #ifdef HAS_BRAINPOOL
                       nid == NID_X9_62_prime256v1 ? "P-256" : \
                       nid == NID_secp384r1 ? "P-384" : \

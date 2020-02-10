@@ -104,11 +104,22 @@
 #define P512_COORD_LEN          64
 #define P521_COORD_LEN          66
 
+/*
+ * a list of BSSIDs and frequencies to chirp on
+ */
+struct chirpdest {
+    TAILQ_ENTRY(chirpdest) entry;
+    char bssid[ETH_ALEN];
+    unsigned long freq;
+};
+TAILQ_HEAD(fubar, chirpdest) chirpdests;
+
 struct candidate {
     TAILQ_ENTRY(candidate) entry;
     dpp_handle handle;
     unsigned char version;
 
+    struct chirpdest *chirpto;
     EC_KEY *peer_bootstrap;
     /*
      * DPP auth stuff
@@ -180,6 +191,10 @@ struct _dpp_instance {
     int nid;                    /* ditto */
 } dpp_instance;
 
+/*
+ * forward reference
+ */
+static void start_dpp_chirp (timerid id, void *data);
 /*
  * global variables
  */
@@ -334,22 +349,6 @@ debug_asn1_ec(int level, char *str, EC_KEY *key, int b64it)
     return;
 }
 
-#if 0
-static void
-dump_tlvs (unsigned char *attributes, int len)
-{
-    unsigned char *ptr = attributes;
-    TLV *tlv;
-
-    while (ptr < (attributes + len)) {
-        tlv = (TLV *)ptr;
-        ptr = (unsigned char *)TLV_next(tlv);
-        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "type %d, length %d, ", TLV_type(tlv), TLV_length(tlv));
-        print_buffer("value", TLV_value(tlv), TLV_length(tlv));
-    }
-}
-#endif
-
 static void
 dpp_debug (int level, const char *fmt, ...)
 {
@@ -359,6 +358,21 @@ dpp_debug (int level, const char *fmt, ...)
         va_start(argptr, fmt);
         vfprintf(stdout, fmt, argptr);
         va_end(argptr);
+    }
+}
+
+static void
+dump_tlvs (unsigned char *attributes, int len)
+{
+    unsigned char *ptr = attributes;
+    TLV *tlv;
+
+    while (ptr < (attributes + len)) {
+        tlv = (TLV *)ptr;
+        ptr = (unsigned char *)TLV_next(tlv);
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "type %s, length %d, ",
+                  TLV_type_string(tlv), TLV_length(tlv));
+        print_buffer("value", TLV_value(tlv), TLV_length(tlv));
     }
 }
 
@@ -452,7 +466,37 @@ compute_bootstrap_key_hash (EC_KEY *key, unsigned char *digest)
 }
 
 static void
-send_dpp_chirp (timerid id, void *data)
+next_dpp_chirp (timerid id, void *data)
+{
+    struct candidate *peer = (struct candidate *)data;
+
+    if (peer->chirpto == NULL) {
+        /*
+         * we ran through the chirp list so wait 30s and do it all over again
+         */
+        printf("exhausted chirp list, wait a bit and try again\n");
+        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(30), start_dpp_chirp, peer);
+        return;
+    }
+    /*
+     * the chirp is already in the buffer, just change channels and send again
+     */
+    if (change_dpp_freq(peer->handle, peer->chirpto->freq)) {
+        dpp_debug(DPP_DEBUG_ERR, "can't change channel to chirp!\n");
+    }
+    if (send_dpp_action_frame(peer)) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "chirp on %ld...\n", peer->chirpto->freq);
+    }
+    /*
+     * next!
+     */
+    peer->chirpto = TAILQ_NEXT(peer->chirpto, entry);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), next_dpp_chirp, peer);
+    return;
+}
+
+static void
+start_dpp_chirp (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
     unsigned char bootkeyhash[SHA256_DIGEST_LENGTH], *asn1;
@@ -494,14 +538,19 @@ send_dpp_chirp (timerid id, void *data)
 
     setup_dpp_action_frame(peer, DPP_CHIRP);
     peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+    peer->chirpto = TAILQ_FIRST(&chirpdests);
+    if (change_dpp_freq(peer->handle, peer->chirpto->freq)) {
+        dpp_debug(DPP_DEBUG_ERR, "can't change channel to chirp!\n");
+    }
     if (send_dpp_action_frame(peer)) {
-        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "chirp...\n");
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "chirp on %ld...\n", peer->chirpto->freq);
     }
 fin:
     /*
      * keep chirping, when we get a response we'll stop
      */
-    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(30), send_dpp_chirp, peer);
+    peer->chirpto = TAILQ_NEXT(peer->chirpto, entry);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), next_dpp_chirp, peer);
     return;
 }
 
@@ -552,7 +601,7 @@ fail_dpp_peer (struct candidate *peer)
      * in here, we want to stay with state = DPP_FAILED) then start all over again
      */
     if (do_chirp) {
-        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), send_dpp_chirp, peer);
+        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), start_dpp_chirp, peer);
     } else {
         (void)srv_add_timeout(srvctx, SRV_MSEC(1), destroy_peer, peer);
     }
@@ -1098,7 +1147,7 @@ send_dpp_config_result (struct candidate *peer, unsigned char status)
     siv_encrypt(&ctx, wraptlv->value + AES_BLOCK_SIZE, wraptlv->value + AES_BLOCK_SIZE,
                 (unsigned char *)tlv - ((unsigned char *)wraptlv->value + AES_BLOCK_SIZE),
                 wraptlv->value,
-                1, &peer->frame, sizeof(dpp_action_frame));
+                2, &peer->frame, sizeof(dpp_action_frame), peer->buffer, 0);
     
     send_dpp_action_frame(peer);
 
@@ -1190,7 +1239,7 @@ problemo:
                          "\"ch_list\":[{\"ch\":11}]},\"cred\":{\"akm\":\"dpp\",\"signedConnector\":"
                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
-                         "\"expiry\":\"2020-01-01T01:01:01\"}}",
+                         "\"expiry\":\"2021-01-01T01:01:01\"}}",
                          conn,
 #ifdef HAS_BRAINPOOL
                          nid == NID_X9_62_prime256v1 ? "P-256" : \
@@ -1374,7 +1423,7 @@ process_dpp_config_result (struct candidate *peer, unsigned char *data, int len)
     
     if (siv_decrypt(&ctx, TLV_value(tlv) + AES_BLOCK_SIZE, TLV_value(tlv) + AES_BLOCK_SIZE,
                     TLV_length(tlv) - AES_BLOCK_SIZE, TLV_value(tlv),
-                    1, data, sizeof(dpp_action_frame)) < 1) {
+                    2, data, sizeof(dpp_action_frame), frame->attributes, 0) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't decrypt DPP Config result!\n");
         goto fin;
     }
@@ -2448,6 +2497,13 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         }
         tlv = TLV_set_tlv(tlv, INITIATOR_BOOT_HASH, SHA256_DIGEST_LENGTH, bootkeyhash);
     }
+
+    /*
+     * negotiate the version if the peer supports v2.0 or later
+     */
+    if (peer->version > 1) {
+        tlv  = TLV_set_tlv(tlv, PROTOCOL_VERSION, 1, &peer->version);
+    }
     
     /*
      * if status is not OK then there is no protocol key
@@ -3026,6 +3082,22 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
         }
     }
 
+    /*
+     * check DPP version (if v1, peer doesn't send attribute)
+     */
+    if ((tlv = find_tlv(PROTOCOL_VERSION, attrs, len)) != NULL) {
+        if (peer->version != *((unsigned char *)TLV_value(tlv))) {
+            dpp_debug(DPP_DEBUG_ERR, "version mismatch: we are %d, peer says %d\n",
+                      peer->version, *((unsigned char *)TLV_value(tlv)));
+            goto fin;
+        }
+    } else {
+        if (peer->version > 1) {
+            dpp_debug(DPP_DEBUG_ERR, "Peer did not include version in DPP Auth Response\n");
+            goto fin;
+        }
+    }
+
     if (*val != STATUS_OK) {
         /*
          * status is bad so decrypt data wrapped with k1
@@ -3584,6 +3656,12 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
      * fix up the lengths of all the TLVs...
      */
     ieeeize_ntoh_attributes(frame->attributes, len - sizeof(dpp_action_frame));
+
+    if (debug & DPP_DEBUG_TRACE) {
+        dpp_debug(DPP_DEBUG_TRACE, "Got a DPP Auth Frame!\n");
+        dump_tlvs(frame->attributes, len - sizeof(dpp_action_frame));
+    }
+    
     /*
      * implement the state machine for DPP
      */
@@ -3769,7 +3847,14 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth)
     if (peer->is_initiator) {
         peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(200), init_dpp_auth, peer);
     } else if (do_chirp) {
-        peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(10), send_dpp_chirp, peer);
+        struct chirpdest *chirpto;
+
+        printf("chirp list:\n");
+        TAILQ_FOREACH(chirpto, &chirpdests, entry) {
+            printf("\t%ld\n", chirpto->freq);
+        }
+        printf("start chirping...\n");
+        peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(10), start_dpp_chirp, peer);
     }
     
     return peer->handle;
@@ -3793,10 +3878,32 @@ dpp_free_peer (dpp_handle handle)
     return;
 }
 
+void
+dpp_add_chirp_freq (unsigned char *bssid, unsigned long freq)
+{
+    struct chirpdest *chirpto;
+
+    /*
+     * see if this frequency is already on the list
+     */
+    TAILQ_FOREACH(chirpto, &chirpdests, entry) {
+        if (chirpto->freq == freq) {
+            return;
+        }
+    }
+    if ((chirpto = (struct chirpdest *)malloc(sizeof(struct chirpdest))) == NULL) {
+        return;
+    }
+    memcpy(chirpto->bssid, bssid, ETH_ALEN);
+    chirpto->freq = freq;
+    TAILQ_INSERT_TAIL(&chirpdests, chirpto, entry);
+    return;
+}
+
 int
 dpp_initialize (int core, char *keyfile, char *signkeyfile,
                 char *enrolleerole, char *mudurl, int chirp,
-                int opclass, int channel, int verbosity)
+                int confobj, int opclass, int channel, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;
@@ -3815,6 +3922,7 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
      * set defaults and read in config
      */
     debug = verbosity;
+    TAILQ_INIT(&chirpdests);
     do_chirp = chirp;
 
     if (!core) {                /* have to chose one! */

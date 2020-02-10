@@ -97,6 +97,7 @@ TAILQ_HEAD(foo, cstate) cstates;
 service_context srvctx;
 static uint32_t port_bitmap[32] = { 0 };
 unsigned int opclass = 81, channel = 6;
+unsigned short portin, portout;
 char bootstrapfile[80], controller[30];
 
 static int
@@ -554,7 +555,7 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                          */
                         clnt.sin_family = AF_INET;
                         clnt.sin_addr.s_addr = inet_addr(controller);
-                        clnt.sin_port = htons(8741);
+                        clnt.sin_port = htons(portout);
                         if ((cs->fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
                             free(cs);
                             return;
@@ -1334,8 +1335,10 @@ main (int argc, char **argv)
     }
     TAILQ_INIT(&interfaces);
     TAILQ_INIT(&cstates);
+    portin = 8741;
+    portout = 7871;
     for (;;) {
-        c = getopt(argc, argv, "hI:d:f:g:C:k:");
+        c = getopt(argc, argv, "hI:d:f:g:C:k:i:o:");
         if (c < 0) {
             break;
         }
@@ -1361,6 +1364,12 @@ main (int argc, char **argv)
             case 'k':
                 strcpy(bkfile, optarg);
                 break;
+            case 'i':
+                portin = atoi(optarg);
+                break;
+            case 'o':
+                portout = atoi(optarg);
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -1370,6 +1379,8 @@ main (int argc, char **argv)
                         "\t-C <controller> to whom DPP frames are sent\n"
                         "\t-f <channel> to use with DPP\n"
                         "\t-g <opclass> operating class to use with DPP\n"
+                        "\t-i <num> port number for inbound (default 8741)\n"
+                        "\t-o <num> port number for outbound (default 7871)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -1411,7 +1422,7 @@ main (int argc, char **argv)
     memset((char *)&serv, 0, sizeof(struct sockaddr_in));
     serv.sin_family = AF_INET;
     serv.sin_addr.s_addr = INADDR_ANY;
-    serv.sin_port = htons(8741);
+    serv.sin_port = htons(portin);
     if ((bind(infd, (struct sockaddr *)&serv, sizeof(struct sockaddr_in)) < 0) ||
         (listen(infd, 0) < 0)) {
         fprintf(stderr, "%s: unable to bind/listen TCP socket!\n", argv[0]);
