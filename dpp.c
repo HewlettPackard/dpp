@@ -481,7 +481,7 @@ next_dpp_chirp (timerid id, void *data)
     /*
      * the chirp is already in the buffer, just change channels and send again
      */
-    if (change_dpp_freq(peer->handle, peer->chirpto->freq)) {
+    if (change_dpp_freq(peer->handle, peer->chirpto->freq) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't change channel to chirp!\n");
     }
     if (send_dpp_action_frame(peer)) {
@@ -539,7 +539,7 @@ start_dpp_chirp (timerid id, void *data)
     setup_dpp_action_frame(peer, DPP_CHIRP);
     peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
     peer->chirpto = TAILQ_FIRST(&chirpdests);
-    if (change_dpp_freq(peer->handle, peer->chirpto->freq)) {
+    if (change_dpp_freq(peer->handle, peer->chirpto->freq) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't change channel to chirp!\n");
     }
     if (send_dpp_action_frame(peer)) {
@@ -3854,7 +3854,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth)
             printf("\t%ld\n", chirpto->freq);
         }
         printf("start chirping...\n");
-        peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(10), start_dpp_chirp, peer);
+        peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(500), start_dpp_chirp, peer);
     }
     
     return peer->handle;
@@ -3903,7 +3903,7 @@ dpp_add_chirp_freq (unsigned char *bssid, unsigned long freq)
 int
 dpp_initialize (int core, char *keyfile, char *signkeyfile,
                 char *enrolleerole, char *mudurl, int chirp,
-                int confobj, int opclass, int channel, int verbosity)
+                int opclass, int channel, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;

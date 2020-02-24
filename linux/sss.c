@@ -62,12 +62,14 @@ struct interface {
     unsigned char bssid[ETH_ALEN];
     unsigned char is_loopback;
     int nl80211_id;
-    struct nl_sock *nl_sock;
-    struct nl_sock *nl_mlme;
     struct nl_cb *nl_cb;
+    struct nl_sock *nl_sock;
+    struct nl_sock *nl_event;
     unsigned long ifindex;
     unsigned long wiphy;
     unsigned long freq;
+    unsigned char offchan_tx_ok;
+    unsigned long max_roc;
     int fd;     /* BPF socket */
 };
 TAILQ_HEAD(bar, interface) interfaces;
@@ -94,7 +96,6 @@ struct trigger_results {
 service_context srvctx;
 static int discovered = -1;
 char our_ssid[33];
-static uint32_t port_bitmap[32] = { 0 };
 unsigned int opclass = 81, channel = 6;
 char bootstrapfile[80];
 
@@ -206,14 +207,20 @@ struct dpp_instance *
 create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
 {
     struct dpp_instance *instance;
-    
-    if ((instance = (struct dpp_instance *)malloc(sizeof(struct dpp_instance))) == NULL) {
-        return NULL;
+
+    /*
+     * reuse an instance if the peer who spoke DPP Auth and Config also
+     * does DPP Discovery
+     */
+    if ((instance = find_instance_by_mac(mymac, peermac)) == NULL) {
+        if ((instance = (struct dpp_instance *)malloc(sizeof(struct dpp_instance))) == NULL) {
+            return NULL;
+        }
+        memcpy(instance->mymac, mymac, ETH_ALEN);
+        memcpy(instance->peermac, peermac, ETH_ALEN);
+        TAILQ_INSERT_HEAD(&dpp_instances, instance, entry);
     }
-    memcpy(instance->mymac, mymac, ETH_ALEN);
-    memcpy(instance->peermac, peermac, ETH_ALEN);
     instance->tid = get_dpp_discovery_tid();
-    TAILQ_INSERT_HEAD(&dpp_instances, instance, entry);
     
     return instance;
 }
@@ -368,6 +375,9 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                 }
                 break;
             case IEEE802_11_FC_STYPE_BEACON:
+                if ((instance = find_instance_by_mac(inf->bssid, frame->sa)) == NULL) {
+                    return;
+                }
                 if (discovered != 0) {
                     /*
                      * not yet provisioned or already discovered
@@ -446,13 +456,27 @@ mgmt_frame_in (struct nl_msg *msg, void *data)
 }
 
 static void
-nl_frame_in (int fd, void *data)
+nl_sock_in (int fd, void *data)
 {
     struct interface *inf = (struct interface *)data;
     int res;
     
-    if ((res = nl_recvmsgs(inf->nl_mlme, inf->nl_cb)) < 0) {
+    if ((res = nl_recvmsgs(inf->nl_sock, inf->nl_cb)) < 0) {
         fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
+        srv_rem_input(srvctx, nl_socket_get_fd(inf->nl_sock));
+    }
+    
+}
+
+static void
+nl_event_in (int fd, void *data)
+{
+    struct interface *inf = (struct interface *)data;
+    int res;
+    
+    if ((res = nl_recvmsgs(inf->nl_event, inf->nl_cb)) < 0) {
+        fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
+        srv_rem_input(srvctx, nl_socket_get_fd(inf->nl_event));
     }
     
 }
@@ -558,51 +582,6 @@ nlmsg_clear(struct nl_msg *msg)
     }
 }
 
-#if 0
-static int send_and_recv(struct nl_cb *nl_cb,
-			 struct nl_sock *nl_sock, struct nl_msg *msg,
-			 int (*valid_handler)(struct nl_msg *, void *),
-			 void *valid_data)
-{
-    struct nl_cb *cb;
-    int err = -ENOMEM;
-
-    if (!msg)
-        return -ENOMEM;
-
-    cb = nl_cb_clone(nl_cb);
-    if (!cb)
-        goto out;
-
-    err = nl_send_auto_complete(nl_sock, msg);
-    if (err < 0)
-        goto out;
-
-    err = 1;
-
-    nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
-    nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
-    nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
-
-    if (valid_handler)
-        nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM,
-                  valid_handler, valid_data);
-
-    while (err > 0) {
-        int res = nl_recvmsgs(nl_sock, cb);
-        if (res < 0) {
-            printf("nl80211: %s->nl_recvmsgs failed: %d", __func__, res);
-        }
-    }
-  out:
-    nl_cb_put(cb);
-    if (!valid_handler && valid_data == (void *) -1)
-        nlmsg_clear(msg);
-    nlmsg_free(msg);
-    return err;
-}
-#endif
-
 static int
 get_phy_info (struct nl_msg *msg, void *arg)
 {
@@ -626,54 +605,6 @@ get_phy_info (struct nl_msg *msg, void *arg)
     }
 
     return NL_SKIP;
-}
-
-static int
-send_mgmt_msg (struct nl_msg *msg, struct interface *inf,
-               int (*handler)(struct nl_msg *, void *), void *data)
-{
-    struct nl_cb *cb;
-    int err = 0;
-    
-    if ((cb = nl_cb_clone(inf->nl_cb)) == NULL) {
-        fprintf(stderr, "can't clone an nl_cb!\n");
-        nlmsg_free(msg);
-        return -1;
-    }
-
-    if (nl_send_auto_complete(inf->nl_mlme, msg) < 0) {
-        fprintf(stderr, "can't send an nl_msg!\n");
-        nlmsg_free(msg);
-        return -1;
-    }
-
-    nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
-    nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
-    nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
-    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
-    if (handler) {
-        nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, handler, data);
-    }
-
-    err = 1;
-    while (err > 0) {
-        int res;
-        if ((res = nl_recvmsgs(inf->nl_mlme, cb)) < 0) {
-            fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
-        }
-    }
-    if (err < 0) {
-        fprintf(stderr, "send_mgmt_msg: error receiving nl_msgs: %d\n", err);
-    }
-    
-    nl_cb_put(cb);
-    printf("nl_mgmt_msg sent\n");
-    if (!handler && data == (void *) -1) {
-        nlmsg_clear(msg);
-    }
-    nlmsg_free(msg);
-
-    return err;
 }
 
 static int
@@ -790,8 +721,11 @@ cons_action_frame (unsigned char field, unsigned char *mymac, unsigned char *pee
         }
         nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, inf->freq);
         nla_put_u32(msg, NL80211_ATTR_DURATION, 500);
-        nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
+        if (inf->offchan_tx_ok) {
+            nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
+        }
         nla_put(msg, NL80211_ATTR_FRAME, framesize, buf);
+        printf("sending frame on %ld\n", inf->freq);
         cookie = 0;
         if (send_nl_msg(msg, inf, cookie_handler, &cookie) < 0) {
             fprintf(stderr, "can't send nl msg!\n");
@@ -819,10 +753,8 @@ chan2freq (unsigned int chan)
 static int
 change_freq (unsigned char *mac, unsigned long freak)
 {
-#if 0
-    struct nl_msg *msg;
-    unsigned long long cookie;
-#endif
+//    struct nl_msg *msg;
+//    unsigned long long cookie;
     struct interface *inf;
     
     TAILQ_FOREACH(inf, &interfaces, entry) {
@@ -839,22 +771,20 @@ change_freq (unsigned char *mac, unsigned long freak)
         return 1;
     }
 
-#if 0
-    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
-        fprintf(stderr, "can't allocate an nl_msg!\n");
-        return -1;
-    }
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
-    /*
-     * for the time being ignore HT, VHT...
-     */
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-    cookie = 0;
-    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
-        fprintf(stderr, "unable to change channel!\n");
-        return -1;
-    }
-#endif
+//    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
+//        fprintf(stderr, "can't allocate an nl_msg!\n");
+//        return -1;
+//    }
+//    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
+//    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
+//    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+//    cookie = 0;
+
+//    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
+//        fprintf(stderr, "unable to change channel!\n");
+//        return -1;
+//    }
+    printf("changing frequency to %ld\n", freak);
     inf->freq = freak;
     return 1;
 }
@@ -945,13 +875,13 @@ register_action_frame (struct interface *inf, int flags, unsigned char *match, i
     struct nl_msg *msg;
     unsigned short type = (IEEE802_11_FC_TYPE_MGMT << 2 | IEEE802_11_FC_STYPE_ACTION << 4);
 
-    if ((msg = get_nl_msg(inf, flags, NL80211_CMD_REGISTER_FRAME)) == NULL) {
+    if ((msg = get_nl_msg(inf, flags, NL80211_CMD_REGISTER_ACTION)) == NULL) {
         fprintf(stderr, "can't allocate an nl_msg!\n");
         return -1;
     }
     nla_put_u16(msg, NL80211_ATTR_FRAME_TYPE, type);
     nla_put(msg, NL80211_ATTR_FRAME_MATCH, match_len, match);
-    if (send_mgmt_msg(msg, inf, mgmt_frame_in, inf)) {
+    if (send_nl_msg(msg, inf, mgmt_frame_in, inf)) {
         fprintf(stderr, "unable to register for action frame!\n");
         return -1;
     }
@@ -1006,71 +936,15 @@ send_beacon (timerid tid, void *data)
     srv_add_timeout(srvctx, SRV_MSEC(100), send_beacon, inf);
     return;
 }
-
-int
-provision_connector (char *role, unsigned char *ssid, int ssidlen,
-                     unsigned char *connector, int connlen, dpp_handle handle)
-{
-    struct interface *inf = NULL;
-    struct dpp_instance *instance;
-    
-    if ((instance = find_instance_by_handle(handle)) == NULL) {
-        fprintf(stderr, "no DPP instance to provision a connector for!\n");
-        return -1;
-    }
-    
-    printf("connector:\n%.*s\nwith ", connlen, connector);
-    if (ssidlen == 1 && ssid[0] == '*') {
-        printf("any SSID\n");
-    } else {
-        printf("SSID %.*s\n", ssidlen, ssid);
-    }
-
-    memcpy(our_ssid, ssid, ssidlen);
-    if (strncmp(role, "ap", 2) == 0) {
-        TAILQ_FOREACH(inf, &interfaces, entry) {
-            if (memcmp(instance->mymac, inf->bssid, ETH_ALEN) == 0) {
-                break;
-            }
-        }
-        if (inf == NULL) {
-            fprintf(stderr, "can't find " MACSTR " to send mgmt frame!\n",
-                    MAC2STR(instance->mymac));
-            return -1;
-        }
-        discovered = 1;
-
-        srv_add_timeout(srvctx, SRV_MSEC(1), send_beacon, inf);
-    } else if (strncmp(role, "sta", 3) == 0) {
-        discovered = 0;
-    } else {
-        fprintf(stderr, "don't know what kind of device we are to do discovery: %s!\n", role);
-    }
-    return 1;
-}
-
 static struct nl_sock *
 create_nl_socket (struct nl_cb *cb)
 {
     struct nl_sock *sock;
-    uint32_t pid = getpid() & 0x3fffff;
-    int i;
     
     if ((sock = nl_socket_alloc_cb(cb)) == NULL) {
         fprintf(stderr, "unable to alloc an nl socket\n");
         return NULL;
     }
-
-    for (i = 0; i < 1024; i++) {
-        if (port_bitmap[i/32] & (1 << (i % 32))) {
-            continue;
-        }
-        port_bitmap[i/32] |= 1 << (i % 32);
-        pid += i << 22;
-        break;
-    }
-    nl_socket_set_local_port(sock, pid);
-
     if (genl_connect(sock)) {
         fprintf(stderr, "unable to connect an nl socket!\n");
         return NULL;
@@ -1181,7 +1055,6 @@ find_dpp_conie (unsigned char *ie, int ielen) {
 static int
 callback_dump(struct nl_msg *msg, void *arg)
 {
-    // Called by the kernel with a dump of the successful scan's data. Called for each SSID.
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
     struct nlattr *tb[NL80211_ATTR_MAX + 1];
     struct nlattr *bss[NL80211_BSS_MAX + 1];
@@ -1201,7 +1074,6 @@ callback_dump(struct nl_msg *msg, void *arg)
     struct interface *inf = (struct interface *)arg;
     uint32_t freq;
 
-    // Parse and error check.
     nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
     if (!tb[NL80211_ATTR_BSS]) {
         printf("bss info missing!\n");
@@ -1227,72 +1099,245 @@ callback_dump(struct nl_msg *msg, void *arg)
 }
 
 int
-do_scan_trigger(struct interface *inf)
+trigger_scan(struct interface *inf, char *lookfor)
 {
-    // Starts the scan and waits for it to finish. Does not return until the scan is done or has been aborted.
     struct trigger_results results = { .done = 0, .aborted = 0 };
     struct nl_msg *msg;
     struct nl_cb *cb;
-    struct nl_msg *ssids_to_scan;
-    int err;
-    int ret;
-    int mcid = nl_get_multicast_id(inf, "nl80211", "scan");
-    nl_socket_add_membership(inf->nl_sock, mcid);  // Without this, callback_trigger() won't be called.
-
-    // Allocate the messages and callback handler.
-    msg = nlmsg_alloc();
-    if (!msg) {
-        printf("ERROR: Failed to allocate netlink message for msg.\n");
-        return -ENOMEM;
+    int err = 0;
+    
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_TRIGGER_SCAN)) == NULL) {
+        fprintf(stderr, "can't create nlmsg to trigger a scan!\n");
+        return -1;
     }
-    ssids_to_scan = nlmsg_alloc();
-    if (!ssids_to_scan) {
-        printf("ERROR: Failed to allocate netlink message for ssids_to_scan.\n");
-        nlmsg_free(msg);
-        return -ENOMEM;
-    }
-    cb = nl_cb_alloc(NL_CB_DEFAULT);
-    if (!cb) {
-        printf("ERROR: Failed to allocate netlink callbacks.\n");
-        nlmsg_free(msg);
-        nlmsg_free(ssids_to_scan);
-        return -ENOMEM;
+    if (lookfor != NULL) {
+        struct nlattr *ssids;
+        
+        printf("scanning for %s\n", lookfor);
+        ssids = nla_nest_start(msg, NL80211_ATTR_SCAN_SSIDS);
+        nla_put(msg, 1, strlen(lookfor), lookfor);
+        nla_nest_end(msg, ssids);
+    } else {
+        printf("scanning for all SSIDs\n");
     }
 
-    // Setup the messages and callback handler.
-    genlmsg_put(msg, 0, 0, inf->nl80211_id, 0, 0, NL80211_CMD_TRIGGER_SCAN, 0);  // Setup which command to run.
-    nla_put_u32(msg, NL80211_ATTR_IFINDEX, inf->ifindex);  // Add message attribute, which interface to use.
-    nla_put(ssids_to_scan, 1, 0, "");  // Scan all SSIDs.
-    nla_put_nested(msg, NL80211_ATTR_SCAN_SSIDS, ssids_to_scan);  // Add message attribute, which SSIDs to scan for.
-    nlmsg_free(ssids_to_scan);  // Copied to `msg` above, no longer need this.
-    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, scan_callback_trigger, &results);  // Add the callback.
+    if ((cb = nl_cb_clone(inf->nl_cb)) == NULL) {
+        fprintf(stderr, "can't clone an nl_cb!\n");
+        nlmsg_free(msg);
+        return -1;
+    }
+
+    if (nl_send_auto_complete(inf->nl_event, msg) < 0) {
+        fprintf(stderr, "can't send an nl_msg!\n");
+        nlmsg_free(msg);
+        return -1;
+    }
     nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
     nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
     nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
-    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);  // No sequence checking for multicast messages.
+    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
+    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, scan_callback_trigger, &results);
 
-    // Send NL80211_CMD_TRIGGER_SCAN to start the scan. The kernel may reply with NL80211_CMD_NEW_SCAN_RESULTS on
-    // success or NL80211_CMD_SCAN_ABORTED if another scan was started by another process.
     err = 1;
-    ret = nl_send_auto(inf->nl_sock, msg);  // Send the message.
-    while (err > 0) ret = nl_recvmsgs(inf->nl_sock, cb);  // First wait for ack_handler(). This helps with basic errors.
+    while (err > 0) {
+        int res;
+        if ((res = nl_recvmsgs(inf->nl_event, cb)) < 0) {
+            fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
+        }
+    }
     if (err < 0) {
-        printf("WARNING: err has a value of %d.\n", err);
+        fprintf(stderr, "send_nl_msg: error receiving nl_msgs: %d\n", err);
     }
-    if (ret < 0) {
-        printf("ERROR: nl_recvmsgs() returned %d (%s).\n", ret, nl_geterror(-ret));
-        return ret;
+    while (!results.done) {
+        nl_recvmsgs(inf->nl_event, cb);
     }
-    while (!results.done) nl_recvmsgs(inf->nl_sock, cb);  // Now wait until the scan is done or aborted.
     if (results.aborted) {
-        printf("ERROR: Kernel aborted scan.\n");
-        return 1;
+        fprintf(stderr, "kernel aborted our scan :-(\n");
+    } else {
+        printf("scan finished.\n");
+    }
+    
+    nl_cb_put(cb);
+    nlmsg_free(msg);
+
+    return 0;
+}
+
+int
+find_dpp_ap (unsigned char *ie, int ielen, char *ssid) {
+    uint8_t len;
+    uint8_t *data;
+
+    while (ielen >= 2 && ielen >= ie[1]) {
+        if (ie[0] == 0 && ie[1] >= 0 && ie[1] <= 32) {
+            len = ie[1];
+            data = ie + 2;
+            if ((strlen(ssid) == len) && (memcmp(ssid, data, len) == 0)) {
+                printf("found %s!\n", ssid);
+                return 1;
+            }
+        }
+        ielen -= ie[1] + 2;
+        ie += ie[1] + 2;
+    }
+    return 0;
+}
+
+int
+find_dpp_access_point (struct nl_msg *msg, void *arg)
+{
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct nlattr *bss[NL80211_BSS_MAX + 1];
+    static struct nla_policy bss_policy[NL80211_BSS_MAX + 1] = {
+        [NL80211_BSS_TSF] = { .type = NLA_U64 },
+        [NL80211_BSS_FREQUENCY] = { .type = NLA_U32 },
+        [NL80211_BSS_BSSID] = { },
+        [NL80211_BSS_BEACON_INTERVAL] = { .type = NLA_U16 },
+        [NL80211_BSS_CAPABILITY] = { .type = NLA_U16 },
+        [NL80211_BSS_INFORMATION_ELEMENTS] = { },
+        [NL80211_BSS_SIGNAL_MBM] = { .type = NLA_U32 },
+        [NL80211_BSS_SIGNAL_UNSPEC] = { .type = NLA_U8 },
+        [NL80211_BSS_STATUS] = { .type = NLA_U32 },
+        [NL80211_BSS_SEEN_MS_AGO] = { .type = NLA_U32 },
+        [NL80211_BSS_BEACON_IES] = { },
+    };
+    struct interface *inf = (struct interface *)arg;
+    struct dpp_instance *instance;
+
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+    if (!tb[NL80211_ATTR_BSS]) {
+        printf("bss info missing!\n");
+        return NL_SKIP;
+    }
+    if (nla_parse_nested(bss, NL80211_BSS_MAX, tb[NL80211_ATTR_BSS], bss_policy)) {
+        printf("failed to parse nested attributes!\n");
+        return NL_SKIP;
+    }
+    if (!bss[NL80211_BSS_BSSID]) return NL_SKIP;
+    if (!bss[NL80211_BSS_INFORMATION_ELEMENTS]) return NL_SKIP;
+
+    /*
+     * find a DPP AP beaconing out this SSID
+     */
+    if (find_dpp_ap(nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]),
+                    nla_len(bss[NL80211_BSS_INFORMATION_ELEMENTS]), our_ssid) > 0) {
+        /*
+         * create a new instance since the DPP AP might not be the peer
+         * to whom we spoke DPP Auth and provisioning
+         */
+        if ((instance = create_discovery_instance(inf->bssid, nla_data(bss[NL80211_BSS_BSSID]))) != NULL) {
+            if (dpp_begin_discovery(instance->tid) > 0) {
+                discovered = 1;
+            }
+        }
+    }
+    
+    return NL_SKIP;
+}
+
+int
+provision_connector (char *role, unsigned char *ssid, int ssidlen,
+                     unsigned char *connector, int connlen, dpp_handle handle)
+{
+    struct interface *inf = NULL;
+    struct dpp_instance *instance;
+    struct nl_msg *msg;
+    
+    if ((instance = find_instance_by_handle(handle)) == NULL) {
+        fprintf(stderr, "no DPP instance to provision a connector for!\n");
+        return -1;
+    }
+    
+    printf("connector:\n%.*s\nwith ", connlen, connector);
+    if (ssidlen == 1 && ssid[0] == '*') {
+        printf("any SSID\n");
+    } else {
+        printf("SSID %.*s\n", ssidlen, ssid);
     }
 
-    // Cleanup.
-    nlmsg_free(msg);
-    nl_cb_put(cb);
-    return 0;
+    memset(our_ssid, 0, 33);
+    memcpy(our_ssid, ssid, ssidlen);
+    if (strncmp(role, "ap", 2) == 0) {
+        TAILQ_FOREACH(inf, &interfaces, entry) {
+            if (memcmp(instance->mymac, inf->bssid, ETH_ALEN) == 0) {
+                break;
+            }
+        }
+        if (inf == NULL) {
+            fprintf(stderr, "can't find " MACSTR " to send mgmt frame!\n",
+                    MAC2STR(instance->mymac));
+            return -1;
+        }
+        discovered = 1;
+
+        if (inf->is_loopback) {
+            srv_add_timeout(srvctx, SRV_MSEC(1), send_beacon, inf);
+        }
+    } else if (strncmp(role, "sta", 3) == 0) {
+        TAILQ_FOREACH(inf, &interfaces, entry) {
+            if (memcmp(instance->mymac, inf->bssid, ETH_ALEN) == 0) {
+                break;
+            }
+        }
+        if (inf == NULL) {
+            fprintf(stderr, "can't find " MACSTR " to send mgmt frame!\n",
+                    MAC2STR(instance->mymac));
+            return -1;
+        }
+        if (!inf->is_loopback) {
+            if (trigger_scan(inf, our_ssid) == 0) {
+                msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
+                if (send_nl_msg(msg, inf, find_dpp_access_point, inf)) {
+                    fprintf(stderr, "unable to register for action frame!\n");
+                    return -1;
+                }
+            }
+        }
+        discovered = 0;
+    } else {
+        fprintf(stderr, "don't know what kind of device we are to do discovery: %s!\n", role);
+    }
+    return 1;
+}
+
+static int
+capabilities_handler (struct nl_msg *msg, void *arg)
+{
+    struct interface *inf = arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+              genlmsg_attrlen(gnlh, 0), NULL);
+    if (tb[NL80211_ATTR_OFFCHANNEL_TX_OK]) {
+        inf->offchan_tx_ok = 1;
+    } else {
+        inf->offchan_tx_ok = 0;
+    }
+    if (tb[NL80211_ATTR_MAX_REMAIN_ON_CHANNEL_DURATION]) {
+        inf->max_roc = nla_get_u32(tb[NL80211_ATTR_MAX_REMAIN_ON_CHANNEL_DURATION]);
+    } else {
+        inf->max_roc = 5000;
+    }
+    return NL_SKIP;
+}
+
+static int
+get_driver_capabilities (struct interface *inf)
+{
+    struct nl_msg *msg;
+
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_GET_WIPHY)) == NULL) {
+        fprintf(stderr, "unable to create nl_msg to get driver capabilities\n");
+        return -1;
+    }
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+    if (send_nl_msg(msg, inf, capabilities_handler, inf) < 0) {
+        fprintf(stderr, "unable to send nl_msg to get driver capabilities\n");
+        return -1;
+    }
+    return 1;
 }
 
 static void
@@ -1363,11 +1408,6 @@ add_interface (char *ptr)
             free(inf);
             return;
         }
-        if ((inf->nl_mlme = create_nl_socket(inf->nl_cb)) == NULL) {
-            fprintf(stderr, "failed to create nl_sock on %s\n", inf->ifname);
-            free(inf);
-            return;
-        }
 
         if ((inf->nl80211_id = genl_ctrl_resolve(inf->nl_sock, "nl80211")) < 0) {
             fprintf(stderr, "unable to get nl80211 id!\n");
@@ -1376,13 +1416,38 @@ add_interface (char *ptr)
             return;
         }
 
-        if ((mid = nl_get_multicast_id(inf, "nl80211", "mlme")) < 0) {
-            fprintf(stderr, "unable to get multicast id for mlme!\n");
-            nl_socket_free(inf->nl_sock);
+        if ((inf->nl_event = create_nl_socket(inf->nl_cb)) == NULL) {
+            fprintf(stderr, "failed to create nl_event on %s\n", inf->ifname);
             free(inf);
             return;
         }
-        nl_socket_add_membership(inf->nl_mlme, mid);
+
+        if ((mid = nl_get_multicast_id(inf, "nl80211", "scan")) < 0) {
+            fprintf(stderr, "unable to get multicast id for mlme!\n");
+            nl_socket_free(inf->nl_sock);
+            nl_socket_free(inf->nl_event);
+            free(inf);
+            return;
+        }
+        nl_socket_add_membership(inf->nl_event, mid);
+
+        if ((mid = nl_get_multicast_id(inf, "nl80211", "mlme")) < 0) {
+            fprintf(stderr, "unable to get multicast id for mlme!\n");
+            nl_socket_free(inf->nl_sock);
+            nl_socket_free(inf->nl_event);
+            free(inf);
+            return;
+        }
+        nl_socket_add_membership(inf->nl_event, mid);
+
+        if ((mid = nl_get_multicast_id(inf, "nl80211", "regulatory")) < 0) {
+            fprintf(stderr, "unable to get multicast id for mlme!\n");
+            nl_socket_free(inf->nl_sock);
+            nl_socket_free(inf->nl_event);
+            free(inf);
+            return;
+        }
+        nl_socket_add_membership(inf->nl_event, mid);
 
         if ((msg = get_nl_msg(inf, 0, NL80211_CMD_GET_INTERFACE)) == NULL) {
             fprintf(stderr, "unable to get nl_msg to get interface!\n");
@@ -1406,6 +1471,16 @@ add_interface (char *ptr)
 
         nl_cb_set(inf->nl_cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
         nl_cb_set(inf->nl_cb, NL_CB_VALID, NL_CB_CUSTOM, mgmt_frame_in, inf);
+
+        if (get_driver_capabilities(inf) < 0) {
+            printf("can't get driver capabilities!\n");
+            inf->offchan_tx_ok = 1;
+            inf->max_roc = 5000;
+        } else {
+            printf("got driver capabilities, off chan is %s, max_roc is %ld\n",
+                   inf->offchan_tx_ok ? "ok" : "not ok", inf->max_roc);
+        }
+
         /*
          * register the various action frames we want to see
          */
@@ -1434,16 +1509,11 @@ add_interface (char *ptr)
             free(inf);
             return;
         }
-#if 0
-        printf("\nask for auth frames\n");
-        if (register_auth_frame(inf) < 1) {
-            free(inf);
-            return;
-        }
-#endif
 
-        nl_socket_set_nonblocking(inf->nl_mlme);
-        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_mlme), inf, nl_frame_in);
+        nl_socket_set_nonblocking(inf->nl_sock);
+        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_sock), inf, nl_sock_in);
+        nl_socket_set_nonblocking(inf->nl_event);
+        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_event), inf, nl_event_in);
     } else {
         inf->is_loopback = 1;
         memset(&ifr, 0, sizeof(ifr));
@@ -1735,7 +1805,7 @@ main (int argc, char **argv)
              * then add all the APs that are beaconing out a DPP ConfigConn IE
              */
             printf("chirping, so scan for APs\n");
-            if (do_scan_trigger(inf) == 0) {
+            if (trigger_scan(inf, NULL) == 0) {
                 msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
                 if (send_nl_msg(msg, inf, callback_dump, inf)) {
                     printf("can't get scan info from kernel!\n");

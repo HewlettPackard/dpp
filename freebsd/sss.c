@@ -1440,7 +1440,7 @@ main (int argc, char **argv)
             memset(&ireq, 0, sizeof(struct ieee80211req));
             strlcpy(ireq.i_name, inf->ifname, IFNAMSIZ);
             ireq.i_type = IEEE80211_IOC_WPA;
-            ireq.i_val = 5;
+            ireq.i_val = 2;
             if (ioctl(s, SIOCS80211, &ireq) < 0) {
                 fprintf(stderr, "%s: unable to set RSN!\n", argv[0]);
                 perror("ioctl setting RSN");

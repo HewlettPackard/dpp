@@ -681,7 +681,7 @@ main (int argc, char **argv)
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           mudurl[0] == 0 ? NULL : mudurl,0, 0, 0, debug) < 0) {
+                           mudurl[0] == 0 ? NULL : mudurl, 0, 0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }

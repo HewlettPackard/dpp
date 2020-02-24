@@ -492,9 +492,9 @@ new_connection (int fd, void *data)
                 EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
                 EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
                 EVP_DigestFinal(mdctx, keyhash, &mdlen);
-                print_buffer("decoded", keyasn1, asn1len);
-                print_buffer("from chirp", TLV_value(rhash), SHA256_DIGEST_LENGTH);
-                print_buffer("computed", keyhash, SHA256_DIGEST_LENGTH);
+//                print_buffer("decoded", keyasn1, asn1len);
+//                print_buffer("from chirp", TLV_value(rhash), SHA256_DIGEST_LENGTH);
+//                print_buffer("computed", keyhash, SHA256_DIGEST_LENGTH);
                 if (memcmp(keyhash, TLV_value(rhash), SHA256_DIGEST_LENGTH) == 0) {
                     printf("YES!!!\n");
                     /* 
@@ -792,6 +792,11 @@ main (int argc, char **argv)
     if (is_initiator && !do_pkex && (keyidx == 0)) {
         fprintf(stderr, "%s: either do PKEX or specify an index into bootstrapping file with -x\n",
                 argv[0]);
+        exit(1);
+    }
+#else
+    if (bootstrapfile[0] == 0) {
+        fprintf(stderr, "%s: specify a peer bootstrapping key file with -B <filename>\n", argv[0]);
         exit(1);
     }
 #endif
