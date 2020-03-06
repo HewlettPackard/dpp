@@ -194,6 +194,26 @@ The controller will identify the unprovisioned peer from the "chirp", find a mat
 bootstrapping key in the index file, initiate through the relay to the IoT device and
 provision a connector on it.
 
+WORKING WITH WPA_SUPPLICANT
+
+Upon successful provisioning with a connector, a configuration file will be created
+that is suitable for using with wpa_supplicant. The name of the file will be
+<ssid>.conf where <ssid> is the SSID sent back in the DPP Configuration Object.
+This file can be used directly with wpa_supplicant. For example:
+
+% sudo ./sss -I ath0 -r -e sta -p fubar -n blah -k respp256.pem -B respbkeys.txt -d 63
+
+(this will create a .conf file, let's call it goaway.conf assuming the SSID
+provisioned is "goaway")
+
+% sudo wpa_supplicant -Dnl80211 -iath0 -dd -c./goaway.conf
+
+Will bring up a supplicant to connect to "goaway" using the DPP Network Discovery
+protocol followed by the 802.11 authentication, association, and the 4way handshake,
+assuming that there is a DPP-compatible AP advertising "goaway" that has been
+provisioned by the same Configurator.
+
+
 CONTENTS OF DISTRIBUTION
 
   There are various keys to use by the initiator (initXXX.pem) and the responder
