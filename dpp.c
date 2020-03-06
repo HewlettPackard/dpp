@@ -1067,11 +1067,13 @@ process_dpp_discovery_frame (unsigned char *data, int len, unsigned char transac
  * hostapd/wpa_supplicant-- this is the stuff to use to connect.
  */
 static void
-dump_key_con (struct candidate *peer)
+dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
 {
     FILE *fp;
     char *buf;
-    int buflen;
+    unsigned char *asn1, data[1024];
+    char conffile[80], netname[33];
+    int buflen, asn1len, i;
     BIO *bio;
 
     /*
@@ -1088,24 +1090,71 @@ dump_key_con (struct candidate *peer)
     memcpy(buf, connector, connector_len);
     buf[connector_len] = '\0';
     fprintf(fp, "%s\n", buf);
-    free(buf);
     fclose(fp);
     dpp_debug(DPP_DEBUG_TRACE, "wrote %d byte connector\n", connector_len);
 
     if ((bio = BIO_new(BIO_s_file())) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to save network access key!\n");
+        free(buf);
         return;
     }
     if ((fp = fopen("netaccesskey", "w")) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to store the network access key!\n");
+        free(buf);
         return;
     }
     BIO_set_fp(bio, fp, BIO_CLOSE);
     buflen = PEM_write_bio_ECPrivateKey(bio, netaccesskey, NULL, NULL, 0, NULL, NULL);
     dpp_debug(DPP_DEBUG_TRACE, "%s netaccesskey\n", buflen > 0 ? "wrote" : "didn't write");
-
     fflush(fp);
     BIO_free(bio);
+
+    memset(netname, 0, sizeof(netname));
+    memset(conffile, 0, sizeof(conffile));
+    if (ssid == NULL || ssidlen == 0) {
+        strcpy(netname, "*");
+        strcpy(conffile, "wildcard.conf");
+    } else {
+        memcpy(netname, ssid, ssidlen);
+        sprintf(conffile, "%s.conf", netname);
+    }
+    if ((fp = fopen(conffile, "w")) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to create wpa_supplicant config file!\n");
+        free(buf);
+        return;
+    }
+
+    fprintf(fp, "ctrl_interface=/var/run/wpa_supplicant\n");
+    fprintf(fp, "ctrl_interface_group=0\n");
+    fprintf(fp, "update_config=1\n");
+    fprintf(fp, "pmf=2\n");
+    fprintf(fp, "dpp_config_processing=2\n");
+    fprintf(fp, "network={\n");
+    fprintf(fp, "\tssid=\"%s\"\n", netname);
+    fprintf(fp, "\tkey_mgmt=DPP\n");
+    fprintf(fp, "\tieee80211w=2\n");
+    fprintf(fp, "\tdpp_connector=\"%s\"\n", buf);
+
+    fprintf(fp, "\tdpp_netaccesskey=");
+    memset(data, 0, sizeof(data));
+    asn1 = data;
+    asn1len = i2d_ECPrivateKey(netaccesskey, &asn1);
+    for (i = 0; i < asn1len; i++) {
+        fprintf(fp, "%02x", data[i]);
+    }
+
+    fprintf(fp, "\n\tdpp_csign=");
+    memset(data, 0, sizeof(data));
+    asn1 = data;
+    asn1len = i2d_EC_PUBKEY(configurator_signkey, &asn1);
+    for (i = 0; i < asn1len; i++) {
+        fprintf(fp, "%02x", data[i]);
+    }
+    fprintf(fp, "\n}\n");
+    fclose(fp);
+    dpp_debug(DPP_DEBUG_TRACE, "created %s for wpa_supplicant configuration\n", conffile);
+
+    free(buf);
 }
 
 static int
@@ -1684,15 +1733,15 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             goto fin;
         }
 
-        dump_key_con(peer);
-
         if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                   &sstr, &estr, 2, "discovery", "ssid")) == 0) {
             provision_connector(dpp_instance.enrollee_role, "*", 1,
                                 connector, connector_len, peer->handle);
+            dump_key_con(peer, NULL, 0);
         } else {
             provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
                                 connector, connector_len, peer->handle);
+            dump_key_con(peer, sstr, (int)(estr - sstr));
         }
     } else if (strncmp(sstr, "psk", 3) == 0) {
         /*
