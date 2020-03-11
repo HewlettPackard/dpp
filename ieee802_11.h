@@ -158,7 +158,8 @@ typedef struct _dpp_action_frame {
 #define PKEX_SUB_COM_REV_REQ        9
 #define PKEX_SUB_COM_REV_RESP       10
 #define DPP_CONFIG_RESULT           11
-#define DPP_CHIRP                   12
+#define CONNECTION_STATUS_RESULT    12
+#define DPP_CHIRP                   13
     unsigned char attributes[0];
 } __attribute__ ((packed)) dpp_action_frame;
 
