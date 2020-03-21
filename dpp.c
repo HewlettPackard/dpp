@@ -3200,7 +3200,8 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
              * give the guy 20s to get our bootstrapping key.... then destroy him.
              */
             peer->t0 = srv_add_timeout(srvctx, SRV_SEC(20), destroy_peer, peer);
-            return 1;
+            ret = 1;
+            goto fin;
         } else {
             val = TLV_value(tlv);
             dpp_debug(DPP_DEBUG_TRACE, "incompatible responder role: %s (%x)\n", *val == DPP_CONFIGURATOR ? "configurator" : \
