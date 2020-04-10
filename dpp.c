@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016-2020 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -113,6 +113,14 @@ struct chirpdest {
     unsigned long freq;
 };
 TAILQ_HEAD(fubar, chirpdest) chirpdests;
+
+struct cpolicy {
+    TAILQ_ENTRY(cpolicy) entry;
+    char akm[4];        // "psk" or "sae" or "dpp"
+    char password[80];  // no hex, password only
+    char ssid[33];
+};
+TAILQ_HEAD(frobnitz, cpolicy) cpolicies;
 
 struct candidate {
     TAILQ_ENTRY(candidate) entry;
@@ -364,15 +372,14 @@ dpp_debug (int level, const char *fmt, ...)
 static void
 dump_tlvs (unsigned char *attributes, int len)
 {
-    unsigned char *ptr = attributes;
+    int i;
     TLV *tlv;
 
-    while (ptr < (attributes + len)) {
-        tlv = (TLV *)ptr;
-        ptr = (unsigned char *)TLV_next(tlv);
+    tlv = (TLV *)attributes;
+    TLV_foreach(tlv, i, len) {
         dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "type %s, length %d, ",
                   TLV_type_string(tlv), TLV_length(tlv));
-        print_buffer("value", TLV_value(tlv), TLV_length(tlv));
+        debug_buffer(DPP_DEBUG_PROTOCOL_MSG, "value", TLV_value(tlv), TLV_length(tlv));
     }
 }
 
@@ -1072,7 +1079,7 @@ dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
     FILE *fp;
     char *buf;
     unsigned char *asn1, data[1024];
-    char conffile[80], netname[33];
+    char conffile[45], netname[33];
     int buflen, asn1len, i;
     BIO *bio;
 
@@ -1113,10 +1120,10 @@ dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
     memset(conffile, 0, sizeof(conffile));
     if (ssid == NULL || ssidlen == 0) {
         strcpy(netname, "*");
-        strcpy(conffile, "wildcard.conf");
+        strcpy(conffile, "wildcard_dpp.conf");
     } else {
         memcpy(netname, ssid, ssidlen);
-        sprintf(conffile, "%s.conf", netname);
+        snprintf(conffile, sizeof(conffile), "%s_dpp.conf", netname);
     }
     if ((fp = fopen(conffile, "w")) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to create wpa_supplicant config file!\n");
@@ -1155,6 +1162,46 @@ dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
     dpp_debug(DPP_DEBUG_TRACE, "created %s for wpa_supplicant configuration\n", conffile);
 
     free(buf);
+}
+
+static void
+dump_pwd_con (char *ssid, int ssidlen, char *pwd, int sae)
+{
+    FILE *fp;
+    char conffile[45], netname[33];
+
+    memset(netname, 0, sizeof(netname));
+    memset(conffile, 0, sizeof(conffile));
+    if (ssid == NULL || ssidlen == 0) {
+        strcpy(netname, "*");
+        snprintf(conffile, sizeof(conffile), "wildcard_%s.conf", sae ? "sae" : "psk");
+    } else {
+        memcpy(netname, ssid, ssidlen);
+        snprintf(conffile, sizeof(conffile), "%s_%s.conf", netname, sae ? "sae" : "psk");
+    }
+    if ((fp = fopen(conffile, "w")) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to create wpa_supplicant config file!\n");
+        return;
+    }
+
+    fprintf(fp, "ctrl_interface=/var/run/wpa_supplicant\n");
+    fprintf(fp, "ctrl_interface_group=0\n");
+    fprintf(fp, "update_config=1\n");
+    if (sae) {
+        fprintf(fp, "pmf=2\n");
+    }
+    fprintf(fp, "network={\n");
+    fprintf(fp, "\tssid=\"%s\"\n", netname);
+    fprintf(fp, "\tproto=RSN\n");
+    fprintf(fp, "\tkey_mgmt=%s\n", sae ? "SAE" : "WPA-PSK");
+    fprintf(fp, "\tpsk=\"%s\"\n", pwd);
+    fprintf(fp, "\tpairwise=CCMP\n");
+    fprintf(fp, "\tgroup=CCMP\n");
+    fprintf(fp, "}\n");
+    fclose(fp);
+    dpp_debug(DPP_DEBUG_TRACE, "created %s for wpa_supplicant configuration\n", conffile);
+
+    return;
 }
 
 static int
@@ -1217,6 +1264,9 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     const EC_GROUP *signgroup;
     unsigned char *encrypt_ptr = NULL;
     unsigned short wrapped_len = 0;
+    time_t t;
+    struct tm *bdt;
+    struct cpolicy *cp;
 
     memset(peer->buffer, 0, sizeof(peer->buffer));
     peer->bufferlen = 0;
@@ -1281,31 +1331,67 @@ problemo:
     /*
      * if we're go then cons up a configuration object
      */
+    sofar = 0;
     if (status == STATUS_OK) {
-        nid = EC_GROUP_get_curve_name(signgroup);
-        sofar = snprintf(confobj, sizeof(confobj),
-                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"goaway\",\"op_cl\":81,"
-                         "\"ch_list\":[{\"ch\":11}]},\"cred\":{\"akm\":\"dpp\",\"signedConnector\":"
-                         "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
-                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
-                         "\"expiry\":\"2021-01-01T01:01:01\"}}",
-                         conn,
+        /*
+         * make the configuration objects are good for 1 year (tm_year + 1901) from right now
+         */
+        t = time(NULL);
+        bdt = gmtime(&t);
+        TAILQ_FOREACH(cp, &cpolicies, entry) {
+            if (strcmp(cp->akm, "dpp") == 0) {
+                nid = EC_GROUP_get_curve_name(signgroup);
+                sofar = snprintf(confobj, sizeof(confobj),
+                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                 "\"cred\":{\"akm\":\"%s\","
+                                 "\"signedConnector\":"
+                                 "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                 "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                 cp->ssid, cp->akm, conn,
 #ifdef HAS_BRAINPOOL
-                         nid == NID_X9_62_prime256v1 ? "P-256" : \
-                         nid == NID_secp384r1 ? "P-384" : \
-                         nid == NID_secp521r1 ? "P-521" : \
-                         nid == NID_brainpoolP256r1 ? "BP-256" : \
-                         nid == NID_brainpoolP384r1 ? "BP-384" : \
-                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+                                 nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                 nid == NID_secp384r1 ? "P-384" : \
+                                 nid == NID_secp521r1 ? "P-521" : \
+                                 nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                 nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                 nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
 #else
-                         nid == NID_X9_62_prime256v1 ? "P-256" : \
-                         nid == NID_secp384r1 ? "P-384" : \
-                         nid == NID_secp521r1 ? "P-521" : "unknown",
+                                 nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                 nid == NID_secp384r1 ? "P-384" : \
+                                 nid == NID_secp521r1 ? "P-521" : "unknown",
 #endif  /* HAS_BRAINPOOL */
-                         burlx, burly, kid);
-        tlv = TLV_set_tlv(tlv, CONFIGURATION_OBJECT, sofar, (unsigned char *)confobj);
+                                 burlx, burly, kid,
+                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+            } else if (strcmp(cp->akm, "sae") == 0) {
+                sofar = snprintf(confobj, sizeof(confobj),
+                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                 "\"cred\":{\"akm\":\"%s\","
+                                 "\"pass\":\"%s\","
+                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                 cp->ssid, cp->akm, cp->password,
+                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+            } else if (strcmp(cp->akm, "psk") == 0) {
+                sofar = snprintf(confobj, sizeof(confobj),
+                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                 "\"cred\":{\"akm\":\"%s\","
+                                 "\"pass\":\"%s\","
+                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                 cp->ssid, cp->akm, cp->password,
+                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                                 
+            } else {
+                dpp_debug(DPP_DEBUG_ERR, "unknown akm for config response: %s\n", cp->akm);
+            }
+            tlv = TLV_set_tlv(tlv, CONFIGURATION_OBJECT, sofar, (unsigned char *)confobj);
+            dpp_debug(DPP_DEBUG_TRACE, "adding config object for %s to %s\n",
+                      cp->akm, cp->ssid);
+        }
     }
-
+    
     wraptlv->length = (int)((unsigned char *)tlv - (unsigned char *)wraptlv->value);
     wrapped_len = wraptlv->length - AES_BLOCK_SIZE;
     /*
@@ -1507,7 +1593,7 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
     const EC_GROUP *signgroup;
     siv_ctx ctx;
     char *sstr, *estr, *dot;
-    int ntok, ncred, unburllen, cl, coordlen, signnid, ret = -1;
+    int i, wrapdatalen, ntok, ncred, unburllen, cl, coordlen, signnid, ret = -1;
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config response!\n");
 
@@ -1540,8 +1626,9 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             dpp_debug(DPP_DEBUG_ERR, "unknown digest length %d!\n", dpp_instance.digestlen);
             goto fin;
     }
+    wrapdatalen = TLV_length(tlv) - AES_BLOCK_SIZE;
     if (siv_decrypt(&ctx, TLV_value(tlv) + AES_BLOCK_SIZE, TLV_value(tlv) + AES_BLOCK_SIZE,
-                    TLV_length(tlv) - AES_BLOCK_SIZE, TLV_value(tlv), 1, attrs,
+                    wrapdatalen, TLV_value(tlv), 1, attrs,
                     (int)((unsigned char *)tlv - attrs)) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't decrypt DPP Config response!\n");
         goto fin;
@@ -1555,217 +1642,262 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
         dpp_debug(DPP_DEBUG_ERR, "configurator did not return the right nonce!!!\n");
         goto fin;
     }
+    /*
+     * keep track of how much wrapped data we have left
+     */
+    wrapdatalen -= TLV_length(tlv);
+    
     if (*val != STATUS_OK) {
         dpp_debug(DPP_DEBUG_ERR, "Configurator returned %d as status in DPP Config Response: FAIL!\n",
                   *val);
         goto fin;
     }
     tlv = TLV_next(tlv);
-    if (TLV_type(tlv) != CONFIGURATION_OBJECT) {
-        dpp_debug(DPP_DEBUG_ERR, "No Configuration Object in the DPP Config response!\n");
-        goto fin;
-    }
-    printf("\ncredential object:\n");
-    printf("%.*s\n\n", TLV_length(tlv), TLV_value(tlv));
-    if ((ncred = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                               &sstr, &estr, 2, "cred", "akm")) == 0) {
-        dpp_debug(DPP_DEBUG_ERR, "No AKM credential in DPP Config response!\n");
-        goto fin;
-    }
-    if (ncred < 1) {
-        dpp_debug(DPP_DEBUG_ERR, "Got back %d credentials... bailing!\n", ncred);
-        goto fin;
-    }
-    printf("we got back %d credential(s): %.*s\n", ncred, (int)(estr - sstr), sstr);
-    if (strncmp(sstr, "dpp", 3) == 0) {
-        /*
-         * we got a connector!
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
-            dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
+    /*
+     * we should have one or more configuration objects now, scroll through them
+     */
+    TLV_foreach(tlv, i, wrapdatalen) {
+        if (TLV_type(tlv) != CONFIGURATION_OBJECT) {
+            dpp_debug(DPP_DEBUG_ERR, "Other than Configuration Object in the DPP Config response: %s!\n",
+                      TLV_type_string(tlv));
+            printf("we're at %d and need to get to %d\n", i, wrapdatalen);
+            /*
+             * be liberal in what we accept...
+             */
+            continue;
+        }
+        dpp_debug(DPP_DEBUG_TRACE, "\ncredential object:\n");
+        dpp_debug(DPP_DEBUG_TRACE, "%.*s\n\n", TLV_length(tlv), TLV_value(tlv));
+        if ((ncred = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                   &sstr, &estr, 2, "cred", "akm")) == 0) {
+            dpp_debug(DPP_DEBUG_ERR, "No AKM credential in DPP Config response!\n");
             goto fin;
         }
-        dot = strstr(sstr, ".");
-        memset(unb64url, 0, sizeof(unb64url));
-        /*
-         * decode the JWS Protected Header
-         */
-        if ((unburllen = base64urldecode(unb64url, (unsigned char *)sstr, dot-sstr)) < 1) {
-            dpp_debug(DPP_DEBUG_ERR, "Cannot base64url decode the JWS Protected Header!\n");
+        if (ncred < 1) {
+            dpp_debug(DPP_DEBUG_ERR, "Got back %d credentials... bailing!\n", ncred);
             goto fin;
         }
-        if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "alg")) != 1) {
-            dpp_debug(DPP_DEBUG_ERR, "Failed to get 'alg' from JWS Protected Header!\n");
-            goto fin;
-        }
-        printf("connector is signed with %.*s, ", (int)(estr - sstr), sstr);
-        if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "kid")) != 1) {
-            dpp_debug(DPP_DEBUG_ERR, "Failed to get 'kid' from JWS Protected Header!\n");
-            goto fin;
-        }
-        printf("by key with key id:\n %.*s\n", (int)(estr - sstr), sstr);
-        /*
-         * get the Configurator's signing key from the "csign" portion of the DPP Config Object
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 3, "cred", "csign", "crv")) != 1) {
-            dpp_debug(DPP_DEBUG_ERR, "No 'crv' coordinate in 'csign' portion of the response!\n");
-            goto fin;
-        }
-        if ((int)(estr - sstr) > 6) {
-            dpp_debug(DPP_DEBUG_ERR, "malformed 'crv' in 'csign' portion of response (%d chars)\n",
-                      (int)(estr - sstr));
-            goto fin;
-        }
+        if (strncmp(sstr, "dpp", 3) == 0) {
+            /*
+             * we got a connector!
+             */
+            dpp_debug(DPP_DEBUG_TRACE, "A DPP AKM Configuration Object!\n");
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
+                dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
+                goto fin;
+            }
+            dot = strstr(sstr, ".");
+            memset(unb64url, 0, sizeof(unb64url));
+            /*
+             * decode the JWS Protected Header
+             */
+            if ((unburllen = base64urldecode(unb64url, (unsigned char *)sstr, dot-sstr)) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "Cannot base64url decode the JWS Protected Header!\n");
+                goto fin;
+            }
+            if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "alg")) != 1) {
+                dpp_debug(DPP_DEBUG_ERR, "Failed to get 'alg' from JWS Protected Header!\n");
+                goto fin;
+            }
+            dpp_debug(DPP_DEBUG_TRACE, "connector is signed with %.*s, ", (int)(estr - sstr), sstr);
+            if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "kid")) != 1) {
+                dpp_debug(DPP_DEBUG_ERR, "Failed to get 'kid' from JWS Protected Header!\n");
+                goto fin;
+            }
+            dpp_debug(DPP_DEBUG_TRACE, "by key with key id:\n %.*s\n", (int)(estr - sstr), sstr);
+            /*
+             * get the Configurator's signing key from the "csign" portion of the DPP Config Object
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "csign", "crv")) != 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No 'crv' coordinate in 'csign' portion of the response!\n");
+                goto fin;
+            }
+            if ((int)(estr - sstr) > 6) {
+                dpp_debug(DPP_DEBUG_ERR, "malformed 'crv' in 'csign' portion of response (%d chars)\n",
+                          (int)(estr - sstr));
+                goto fin;
+            }
     
-        if (strncmp(sstr, "P-256", 5) == 0) {
-            signnid = NID_X9_62_prime256v1;
-            coordlen = P256_COORD_LEN;
-        } else if (strncmp(sstr, "P-384", 5) == 0) {
-            signnid = NID_secp384r1;
-            coordlen = P384_COORD_LEN;
-        } else if (strncmp(sstr, "P-521", 5) == 0) {
-            signnid = NID_secp521r1;
-            coordlen = P521_COORD_LEN;
+            if (strncmp(sstr, "P-256", 5) == 0) {
+                signnid = NID_X9_62_prime256v1;
+                coordlen = P256_COORD_LEN;
+            } else if (strncmp(sstr, "P-384", 5) == 0) {
+                signnid = NID_secp384r1;
+                coordlen = P384_COORD_LEN;
+            } else if (strncmp(sstr, "P-521", 5) == 0) {
+                signnid = NID_secp521r1;
+                coordlen = P521_COORD_LEN;
 #ifdef HAS_BRAINPOOL
-        } else if (strncmp(sstr, "BP-256", 6) == 0) {
-            signnid = NID_brainpoolP256r1;
-            coordlen = P256_COORD_LEN;
-        } else if (strncmp(sstr, "BP-384", 6) == 0) {
-            signnid = NID_brainpoolP384r1;
-            coordlen = P384_COORD_LEN;
-        } else if (strncmp(sstr, "BP-512", 6) == 0) {
-            signnid = NID_brainpoolP512r1;
-            coordlen = P512_COORD_LEN;
+            } else if (strncmp(sstr, "BP-256", 6) == 0) {
+                signnid = NID_brainpoolP256r1;
+                coordlen = P256_COORD_LEN;
+            } else if (strncmp(sstr, "BP-384", 6) == 0) {
+                signnid = NID_brainpoolP384r1;
+                coordlen = P384_COORD_LEN;
+            } else if (strncmp(sstr, "BP-512", 6) == 0) {
+                signnid = NID_brainpoolP512r1;
+                coordlen = P512_COORD_LEN;
 #endif  /* HAS_BRAINPOOL */
-        } else {
-            dpp_debug(DPP_DEBUG_ERR, "unknown elliptic curve %.*s!\n", (int)(estr - sstr), sstr);
-            goto fin;
-        }
+            } else {
+                dpp_debug(DPP_DEBUG_ERR, "unknown elliptic curve %.*s!\n", (int)(estr - sstr), sstr);
+                goto fin;
+            }
 
-        if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
-            dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates to create configurator's signing key\n");
-            goto fin;
-        }
-        /*
-         * get the x-coordinate...
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 3, "cred", "csign", "x")) != 1) {
-            dpp_debug(DPP_DEBUG_ERR, "No 'x' coordinate in 'csign' portion of the response!\n");
-            goto fin;
-        }
+            if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates to create configurator's signing key\n");
+                goto fin;
+            }
+            /*
+             * get the x-coordinate...
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "csign", "x")) != 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No 'x' coordinate in 'csign' portion of the response!\n");
+                goto fin;
+            }
     
-        if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
-            dpp_debug(DPP_DEBUG_ERR, "Mal-sized x-coordinate (%d)\n",
-                      (int)(estr - sstr));
-            goto fin;
-        }
-        memset(coordbin, 0, coordlen);
-        if ((cl = base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr)))) != coordlen) {
-            dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate: %d instead of %d\n", cl, coordlen);
-            print_buffer("coord-x", coordbin, cl);
-            goto fin;
-        }
-        BN_bin2bn(coordbin, coordlen, x);
-        /*
-         * get the y-coordinate...
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 3, "cred", "csign", "y")) != 1) {
-            dpp_debug(DPP_DEBUG_ERR, "No 'y' coordinate in 'csign' portion of the response!\n");
-            goto fin;
-        }
-        if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
-            dpp_debug(DPP_DEBUG_ERR, "Mal-sized y-coordinate (%d)\n",
-                      (int)(estr - sstr));
-            goto fin;
-        }
-        memset(coordbin, 0, coordlen);
-        if (base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr))) != coordlen) {
-            dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate\n");
-            goto fin;
-        }
-        BN_bin2bn(coordbin, coordlen, y);
+            if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
+                dpp_debug(DPP_DEBUG_ERR, "Mal-sized x-coordinate (%d)\n",
+                          (int)(estr - sstr));
+                goto fin;
+            }
+            memset(coordbin, 0, coordlen);
+            if ((cl = base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr)))) != coordlen) {
+                dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate: %d instead of %d\n", cl, coordlen);
+                print_buffer("coord-x", coordbin, cl);
+                goto fin;
+            }
+            BN_bin2bn(coordbin, coordlen, x);
+            /*
+             * get the y-coordinate...
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "csign", "y")) != 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No 'y' coordinate in 'csign' portion of the response!\n");
+                goto fin;
+            }
+            if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
+                dpp_debug(DPP_DEBUG_ERR, "Mal-sized y-coordinate (%d)\n",
+                          (int)(estr - sstr));
+                goto fin;
+            }
+            memset(coordbin, 0, coordlen);
+            if (base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr))) != coordlen) {
+                dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate\n");
+                goto fin;
+            }
+            BN_bin2bn(coordbin, coordlen, y);
 
-        /*
-         * create an EC_KEY out of "crv", "x", and "y"
-         */
-        configurator_signkey = EC_KEY_new_by_curve_name(signnid);
-        EC_KEY_set_public_key_affine_coordinates(configurator_signkey, x, y);
-        EC_KEY_set_conv_form(configurator_signkey, POINT_CONVERSION_COMPRESSED);
-        EC_KEY_set_asn1_flag(configurator_signkey, OPENSSL_EC_NAMED_CURVE);
-        if (((signgroup = EC_KEY_get0_group(configurator_signkey)) == NULL) ||
-            ((P = EC_KEY_get0_public_key(configurator_signkey)) == NULL) ||
-            !EC_POINT_is_on_curve(signgroup, P, bnctx)) {
-            dpp_debug(DPP_DEBUG_ERR, "configurator's signing key is not valid!\n");
-            goto fin;
-        }
-        dpp_debug(DPP_DEBUG_TRACE, "configurator's signing key is valid!!!\n");
+            /*
+             * create an EC_KEY out of "crv", "x", and "y"
+             */
+            configurator_signkey = EC_KEY_new_by_curve_name(signnid);
+            EC_KEY_set_public_key_affine_coordinates(configurator_signkey, x, y);
+            EC_KEY_set_conv_form(configurator_signkey, POINT_CONVERSION_COMPRESSED);
+            EC_KEY_set_asn1_flag(configurator_signkey, OPENSSL_EC_NAMED_CURVE);
+            if (((signgroup = EC_KEY_get0_group(configurator_signkey)) == NULL) ||
+                ((P = EC_KEY_get0_public_key(configurator_signkey)) == NULL) ||
+                !EC_POINT_is_on_curve(signgroup, P, bnctx)) {
+                dpp_debug(DPP_DEBUG_ERR, "configurator's signing key is not valid!\n");
+                goto fin;
+            }
+            dpp_debug(DPP_DEBUG_TRACE, "configurator's signing key is valid!!!\n");
 
-        if (get_kid_from_point(csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
-            dpp_debug(DPP_DEBUG_ERR, "can't get key id for configurator's sign key!\n");
-            goto fin;
-        }
+            if (get_kid_from_point(csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
+                dpp_debug(DPP_DEBUG_ERR, "can't get key id for configurator's sign key!\n");
+                goto fin;
+            }
         
-        /*
-         * validate the connector
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
-            dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
-            goto fin;
-        }
-        if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), configurator_signkey, bnctx) < 0) {
-            dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
-            goto fin;
-        }
-        connector_len = (int)(estr - sstr);
-        if ((connector = malloc(connector_len)) == NULL) {
-            connector_len = 0;
-            dpp_debug(DPP_DEBUG_ERR, "Unable to allocate a connector!!\n");
-            goto fin;
-        }
-        memcpy(connector, sstr, connector_len);
-        if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
-            dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
-            goto fin;
-        }
+            /*
+             * validate the connector
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
+                dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
+                goto fin;
+            }
+            if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), configurator_signkey, bnctx) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
+                goto fin;
+            }
+            connector_len = (int)(estr - sstr);
+            if ((connector = malloc(connector_len)) == NULL) {
+                connector_len = 0;
+                dpp_debug(DPP_DEBUG_ERR, "Unable to allocate a connector!!\n");
+                goto fin;
+            }
+            memcpy(connector, sstr, connector_len);
+            if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
+                goto fin;
+            }
 
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-            provision_connector(dpp_instance.enrollee_role, "*", 1,
-                                connector, connector_len, peer->handle);
-            dump_key_con(peer, NULL, 0);
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                provision_connector(dpp_instance.enrollee_role, "*", 1,
+                                    connector, connector_len, peer->handle);
+                dump_key_con(peer, NULL, 0);
+            } else {
+                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                    connector, connector_len, peer->handle);
+                dump_key_con(peer, sstr, (int)(estr - sstr));
+            }
+        } else if (strncmp(sstr, "sae", 3) == 0) {
+            char pwd[80];
+
+            dpp_debug(DPP_DEBUG_TRACE, "An SAE AKM Configuration Object!\n");
+            memset(pwd, 0, 80);
+            /*
+             * got a PSK configuration!
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "cred", "pass")) != 0) {
+                printf("use password '%.*s' ", (int)(estr - sstr), sstr);
+                strncpy(pwd, sstr, (int)(estr - sstr));
+            } else {
+                dpp_debug(DPP_DEBUG_ERR, "Unknown type of sae, not 'pass'\n");
+                goto fin;
+            }
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                printf("with an any SSID I guess\n");
+            } else {
+                printf("with SSID %.*s\n", (int)(estr - sstr), sstr);
+            }
+            dump_pwd_con(sstr, (int)(estr - sstr), pwd, 1);
+        } else if (strncmp(sstr, "psk", 3) == 0) {
+            char pwd[80];
+
+            dpp_debug(DPP_DEBUG_TRACE, "An PSK AKM Configuration Object!\n");
+            memset(pwd, 0, 80);
+            /*
+             * got a PSK configuration!
+             */
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "cred", "pass")) != 0) {
+                printf("use passphrase '%.*s' ", (int)(estr - sstr), sstr);
+                strncpy(pwd, sstr, (int)(estr - sstr));
+            } else if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                             &sstr, &estr, 2, "cred", "psk_hex")) != 0) {
+                printf("use hexstring '%.*s' ", (int)(estr - sstr), sstr);
+                strncpy(pwd, sstr, (int)(estr - sstr));
+            } else {
+                dpp_debug(DPP_DEBUG_ERR, "Unknown type of psk, not 'pass' and not 'psk_hex'\n");
+                goto fin;
+            }
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                printf("with an any SSID I guess\n");
+            } else {
+                printf("with SSID %.*s\n", (int)(estr - sstr), sstr);
+            }
+            dump_pwd_con(sstr, (int)(estr - sstr), pwd, 0);
         } else {
-            provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                connector, connector_len, peer->handle);
-            dump_key_con(peer, sstr, (int)(estr - sstr));
-        }
-    } else if (strncmp(sstr, "psk", 3) == 0) {
-        /*
-         * got a PSK configuration!
-         */
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 2, "cred", "pass")) != 0) {
-            printf("use passphrase '%.*s' ", (int)(estr - sstr), sstr);
-        } else if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                         &sstr, &estr, 2, "cred", "psk_hex")) != 0) {
-            printf("use hexstring '%.*s' ", (int)(estr - sstr), sstr);
-        } else {
-            dpp_debug(DPP_DEBUG_ERR, "Unknown type of psk, not 'pass' and not 'psk_hex'\n");
+            dpp_debug(DPP_DEBUG_ERR, "Unknown credential type %.*s!\n", (int)(estr - sstr), sstr);
             goto fin;
         }
-        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                  &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-            printf("with an any SSID I guess\n");
-        } else {
-            printf("with SSID %.*s\n", (int)(estr - sstr), sstr);
-        }
-    } else {
-        dpp_debug(DPP_DEBUG_ERR, "Unknown credential type %.*s!\n", (int)(estr - sstr), sstr);
-        goto fin;
     }
     ret = 1;
 fin:
@@ -1868,7 +2000,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
                               &sstr, &estr, 1, "mudurl")) > 0) {
         dpp_debug(DPP_DEBUG_ANY, "got a MUD URL of %.*s\n",
                   estr - sstr, sstr);
-// when we handle pending responses do this
+// TODO: when we handle pending responses do this
 //        return 0;
     }
     return 1;
@@ -3950,6 +4082,21 @@ dpp_add_chirp_freq (unsigned char *bssid, unsigned long freq)
     return;
 }
 
+static void
+addpolicy (char *akm, char *password, char *ssid)
+{
+    struct cpolicy *cp;
+
+    if ((cp = (struct cpolicy *)malloc(sizeof(struct cpolicy))) == NULL) {
+        return;
+    }
+    strcpy(cp->akm, akm);
+    strcpy(cp->password, password);
+    strcpy(cp->ssid, ssid);
+    TAILQ_INSERT_TAIL(&cpolicies, cp, entry);
+    return;
+}
+
 int
 dpp_initialize (int core, char *keyfile, char *signkeyfile,
                 char *enrolleerole, char *mudurl, int chirp,
@@ -3957,8 +4104,9 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
 {
     FILE *fp;
     BIO *bio = NULL;
-    int ret = 0;
+    int ret = 0, ndppakm;
     BIGNUM *prime = NULL;
+    struct cpolicy cp, *pol;
 
     /*
      * initialize globals 
@@ -3973,6 +4121,7 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
      */
     debug = verbosity;
     TAILQ_INIT(&chirpdests);
+    TAILQ_INIT(&cpolicies);
     do_chirp = chirp;
 
     if (!core) {                /* have to chose one! */
@@ -4011,6 +4160,40 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
             goto fin;
         }
         BIO_free(bio);
+
+        if ((fp = fopen("configakm", "r")) != NULL) {
+            while (!feof(fp)) {
+                if (fscanf(fp, "%s %s %s", cp.akm, cp.password, cp.ssid) < 1) {
+                    fclose(fp);
+                    break;
+                }
+                addpolicy(cp.akm, cp.password, cp.ssid);
+            }
+        }
+        /*
+         * if there are no policies just make one up for testing purposes
+         */
+        if (TAILQ_EMPTY(&cpolicies)) {
+            addpolicy("dpp", "<none>", "goaway");
+        }
+        ndppakm = 0;
+        TAILQ_FOREACH(pol, &cpolicies, entry) {
+            if (strstr(pol->akm, "dpp") != NULL) {
+                ndppakm++;
+            }
+        }
+        /*
+         * DPPv2 requires a connector, if only PSK or SAE AKMs have been
+         * specified, clone the first with DPP to include a connector.
+         */
+        if (ndppakm == 0) {
+            pol = TAILQ_FIRST(&cpolicies);
+            addpolicy("dpp", "<none>", pol->ssid);
+        }
+        TAILQ_FOREACH(pol, &cpolicies, entry) {
+            printf("AKM: %s, password: %s, SSID: %s\n",
+                   pol->akm, pol->password, pol->ssid);
+        }
     } else {
         strcpy(dpp_instance.enrollee_role, enrolleerole);
         if (mudurl) {

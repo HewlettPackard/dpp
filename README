@@ -48,7 +48,7 @@ OS with these patchs.
 
    Then configure the package like this:
 
-% ./configure --with-ssl="<directory>" [--enable-brainpool] 
+% ./configure --with-ssl=<directory> [--enable-brainpool] 
 
 where <directory> is the top level directory of openssl. Enable
 Brainpool if you have support for those curves. Then change
@@ -91,6 +91,14 @@ USAGE: ./sss [-hCIBapkceirdfgs]
 	-t  send DPP chirps (responder only)
         -d <debug> set debugging mask
 
+The debugging mask is a bitmask to set the following:
+    - 0x01 -- error
+    - 0x02 -- protocol messages
+    - 0x04 -- state machine transitions
+    - 0x08 -- crypto operations
+    - 0x10 -- crypto operations in verbose mode
+    - 0x20 -- chatty protocol tracing
+so "-d 18" would turn on protocol messages and verbose crypto operations
 
 * PKEX Only
 
@@ -161,6 +169,23 @@ This is printed because debugging is set to verbose.
 which, when it completes, will obtain a connector useful for a STA and told to 
 connect to "goaway". When it does it will exchange connectors and derive a PMK.
 
+A flat file called "configakm" in the same directory as sss contains information
+about the network policies for a configurator to provision on an enrollee. The
+format is:
+
+  <akm> <password> <ssid>
+
+So for instance, one could provision a DPP on "byteme" and an SAE network on
+"goaway" using "fubar" as the password with the following:
+
+  dpp none byteme
+  sae fubar goaway
+
+This will result in the configurator generating 2 Configuration Objects during
+the DPP Configuration exchange.
+
+This distribution does not currently support hybrid AKMs like sae+dpp.
+
 * Wired DPP
 
   A TCP/IP version of DPP is included with relay.c, controller.c, and device.c
@@ -196,22 +221,23 @@ provision a connector on it.
 
 WORKING WITH WPA_SUPPLICANT
 
-Upon successful provisioning with a connector, a configuration file will be created
-that is suitable for using with wpa_supplicant. The name of the file will be
-<ssid>.conf where <ssid> is the SSID sent back in the DPP Configuration Object.
+Upon successful provisioning, a configuration file will be created that is suitable
+for using with wpa_supplicant. The name of the file will be <ssid>_<akm>.conf where
+<ssid> is the SSID and <akm> is the AKM sent back in the DPP Configuration Object.
 This file can be used directly with wpa_supplicant. For example:
 
 % sudo ./sss -I ath0 -r -e sta -p fubar -n blah -k respp256.pem -B respbkeys.txt -d 63
 
-(this will create a .conf file, let's call it goaway.conf assuming the SSID
-provisioned is "goaway")
+will create a .conf file, let's call it goaway_dpp.conf assuming the SSID provisioned
+is "goaway" and assuming "goaway" is a DPP network.
 
-% sudo wpa_supplicant -Dnl80211 -iath0 -dd -c./goaway.conf
+% sudo wpa_supplicant -Dnl80211 -iath0 -dd -c./goaway_dpp.conf
 
 Will bring up a supplicant to connect to "goaway" using the DPP Network Discovery
 protocol followed by the 802.11 authentication, association, and the 4way handshake,
 assuming that there is a DPP-compatible AP advertising "goaway" that has been
-provisioned by the same Configurator.
+provisioned by the same Configurator. If "goaway" is a PSK or SAE network a
+wpa_supplicant configuration file will be created to connect to one of those networks.
 
 
 CONTENTS OF DISTRIBUTION

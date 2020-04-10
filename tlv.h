@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016-2020 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -68,6 +68,10 @@ typedef struct _tlv {
 #define TLV_value(x) (unsigned char *)(x)->value
 #define TLV_length(x) (x)->length
 #define TLV_next(x) (TLV *)(x->value + x->length)
+#define TLV_foreach(x, i, t)                    \
+    for ((i) = sizeof(TLV);                     \
+         (i) < (t);                             \
+         (i)+=(TLV_length((x))+sizeof(TLV)),(x) = TLV_next((x)))
 #define TLV_lookahead(x) ((TLV *)(x->value + x->length))->type
 #define TLV_type_string(x) (x)->type == DPP_STATUS ? "Status" : \
         (x)->type == INITIATOR_BOOT_HASH ? "Initiator Bootstrap Hash" : \

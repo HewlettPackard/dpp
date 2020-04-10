@@ -1,5 +1,5 @@
 /*
- * (c) Copyright 2016, 2017, 2018, 2019 Hewlett Packard Enterprise Development LP
+ * (c) Copyright 2016-2020 Hewlett Packard Enterprise Development LP
  *
  * All rights reserved.
  *
@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/evp.h>
@@ -504,6 +505,9 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
     const EC_POINT *signpub;
     const EC_GROUP *signgroup;
     ECDSA_SIG *ecsig;
+    time_t t;
+    struct tm *bdt;
+    
 
     if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
         ((prime = BN_new()) == NULL) || ((bio = BIO_new(BIO_s_mem())) == NULL)) {
@@ -582,6 +586,11 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
         goto fail;
     }
 
+   /*
+    * get the current time so we can make the connector be good for 1 year
+    */
+    t = time(NULL);
+    bdt = gmtime(&t);
     /*
      * generate the connector body (the JWS Payload)
      */
@@ -589,7 +598,7 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
     buflen = snprintf(buf, sizeof(buf),
                       "{\"groups\":[{\"groupId\":\"interop\",\"netRole\":\"%s\"}],"
                       "\"netAccessKey\":{\"kty\":\"EC\",\"crv\":\"%s\",\"x\":\"%s\",\"y\":\"%s\","
-                      "\"kid\":\"%s\"},\"expiry\":\"2021-01-01T01:01:01\"}", role, 
+                      "\"kid\":\"%s\"},\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}", role, 
 #ifdef HAS_BRAINPOOL
                       nid == NID_X9_62_prime256v1 ? "P-256" : \
                       nid == NID_secp384r1 ? "P-384" : \
@@ -602,7 +611,9 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
                       nid == NID_secp384r1 ? "P-384" : \
                       nid == NID_secp521r1 ? "P-521" : "unknown",
 #endif  /* HAS_BRAINPOOL */
-                      burlx, burly, kid);
+                      burlx, burly, kid,
+                      bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                      bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
     if ((burllen = base64urlencode(connector+sofar, (unsigned char *)buf, buflen)) < 0) {
         goto fail;
     }
