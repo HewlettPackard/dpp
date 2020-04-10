@@ -36,9 +36,6 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
-#ifdef FREEBSD
-#include "helpers.h"
-#endif  /* FREEBSD */
 
 int
 hkdf (const EVP_MD *h, int skip,

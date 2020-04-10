@@ -4876,12 +4876,12 @@ else
   givemsg="yes" ld_msg="LD_LIBRARY_PATH"
 
 fi
-
+	LIBS="$LIBS -lc_r"
 	ac_config_files="$ac_config_files freebsd/Makefile"
 
 	;;
 *)
-	as_fn_error $? "EST has not been ported to your OS yet" "$LINENO" 5
+	as_fn_error $? "DPP has not been ported to your OS yet" "$LINENO" 5
 
 esac
 
@@ -4891,7 +4891,8 @@ if ${ac_cv_lib_crypto_EC_GROUP_get_order+:} false; then :
   $as_echo_n "(cached) " >&6
 else
   ac_check_lib_save_LIBS=$LIBS
-LIBS="-lcrypto  $LIBS"
+
+LIBS="-lcrypto $LIBS"
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 

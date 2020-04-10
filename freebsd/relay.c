@@ -64,9 +64,6 @@
 #include "tlv.h"
 #include "pkex.h"
 #include "dpp.h"
-#ifdef FREEBSD
-#include "helpers.h"
-#endif  /* FREEBSD */
 
 struct interface {
     TAILQ_ENTRY(interface) entry;
@@ -690,7 +687,7 @@ add_interface (char *ptr)
         /*
          * make up a bssid for the loopback interface
          */
-        RAND_pseudo_bytes(&inf->bssid[0], ETH_ALEN);
+        RAND_bytes(&inf->bssid[0], ETH_ALEN);
         var = DLT_NULL;
         if (ioctl(inf->fd, BIOCSDLT, &var)) {
             fprintf(stderr, "can't set bpf link layer type!\n");

@@ -894,7 +894,7 @@ add_interface (unsigned char *ptr)
         /*
          * make up a bssid for the loopback interface
          */
-        RAND_pseudo_bytes(&inf->bssid[0], ETH_ALEN);
+        RAND_bytes(&inf->bssid[0], ETH_ALEN);
         var = DLT_NULL;
         if (ioctl(inf->fd, BIOCSDLT, &var)) {
             fprintf(stderr, "can't set bpf link layer type!\n");

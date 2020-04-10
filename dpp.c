@@ -61,9 +61,6 @@
 #include "hkdf.h"
 #include "os_glue.h"
 #include "utils.h"
-#ifdef FREEBSD
-#include "helpers.h"
-#endif  /* FREEBSD */
 
 /*
  * DPP debugging bitmask

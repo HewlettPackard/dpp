@@ -60,9 +60,6 @@
 #include "tlv.h"
 #include "hkdf.h"
 #include "os_glue.h"
-#ifdef FREEBSD
-#include "helpers.h"
-#endif  /* FREEBSD */
 
 /*
  * PKEX debugging bitmasks

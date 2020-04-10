@@ -41,9 +41,6 @@
 #include <openssl/sha.h>
 #include <openssl/ecdsa.h>
 #include "jsmn.h"
-#ifdef FREEBSD
-#include "helpers.h"
-#endif  /* FREEBSD */
 
 static int skip_object(jsmntok_t *t);
 static int skip_array(jsmntok_t *t);
