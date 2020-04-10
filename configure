@@ -4519,12 +4519,14 @@ done
 
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking enable-brainpool" >&5
 $as_echo_n "checking enable-brainpool... " >&6; }
+# Check whether --enable-brainpool was given.
 if test "${enable_brainpool+set}" = set; then :
   enableval=$enable_brainpool; CFLAGS="$CFLAGS -DHAS_BRAINPOOL"
   $as_echo "yes" >&6
 else
   $as_echo "no" >&6
 fi
+
 
 # OS specific stuff
 # Make sure we can run config.sub.
@@ -4891,8 +4893,7 @@ if ${ac_cv_lib_crypto_EC_GROUP_get_order+:} false; then :
   $as_echo_n "(cached) " >&6
 else
   ac_check_lib_save_LIBS=$LIBS
-
-LIBS="-lcrypto $LIBS"
+LIBS="-lcrypto  $LIBS"
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 
