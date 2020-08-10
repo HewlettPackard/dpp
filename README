@@ -27,6 +27,19 @@ RESTRICTIONS
 
   Freebsd currently only supports Atheros radios.
 
+  the libnl code under linux doesn't seem to work with some radios (like
+  broadcom) who block userspace apps (like dpp) from sending 802.11 action
+  frames that it doesn't already know about (like dpp).
+
+  <rant>
+  I wish chipset vendors were not such fascists who operate under the
+  idea of "that which is not required is forbidden". Just because it's
+  not _YET_ in the 802.11 standard does not mean I should be prevented
+  from issueing such a frame!
+
+  That goes for OS vendors as well! Stop telling me what I'm allowed to do!
+  </rant>
+
 REQUIREMENTS
 
   libcrypto from OpenSSL, version 0.9.8 or later. Basically, all
@@ -89,6 +102,7 @@ USAGE: ./sss [-hCIBapkceirdfgs]
         -s  change opclass/channel to what was set with -f and -g
 	-u <url> to find a MUD file (enrollee only)
 	-t  send DPP chirps (responder only)
+	-w <ipaddr> the IP address where a CA is listening
         -d <debug> set debugging mask
 
 The debugging mask is a bitmask to set the following:
@@ -98,6 +112,7 @@ The debugging mask is a bitmask to set the following:
     - 0x08 -- crypto operations
     - 0x10 -- crypto operations in verbose mode
     - 0x20 -- chatty protocol tracing
+    - 0x40 -- PKI operations
 so "-d 18" would turn on protocol messages and verbose crypto operations
 
 * PKEX Only
@@ -184,7 +199,48 @@ So for instance, one could provision a DPP on "byteme" and an SAE network on
 This will result in the configurator generating 2 Configuration Objects during
 the DPP Configuration exchange.
 
-This distribution does not currently support hybrid AKMs like sae+dpp.
+The following AKMs are supported: dpp, dot1x, sae, psk.
+
+This distribution does not currently support hybrid AKMs like sae+dpp but as
+part of DPPv2 will send a connector with each Configuration Object regardless
+of AKM. 
+
+* Enterprise credentials
+
+There is an openssl app in ecca named ecca.c. It's about as simple as it comes.
+To generate a CA, locally run genecca and answer the questions to name your CA.
+Then start it up:
+
+% ./ecca [something]
+
+where [something] is any optional parameter. Passing nothing will result in the
+CA not including its certificate in the PKCS7 it returns back with the client
+cert, but it will send its cert in a separate request. If there is something
+passed then the CA will include its cert in a client PKCS7 and send back nothing
+if asked for its cert by itself.
+
+The interface to the CA has been abstracted with talk2ca.c. This exposes some
+APIs to dpp.c to get the CA cert (or not), to send a PKCS10 to the CA, and to
+obtain a PKCS7 from the CA. To support asychronicity of such a req/resp exchange
+DPP sends a callback along with the PKCS10 which will get called when the CA
+responds. Should be self-explanitory if you look at talk2ca.c and dpp.c where
+it exercises the APIs.
+
+It should be straightforward to substitute any communication to a CA and retain
+the interface between dpp.c and talk2ca.c, how the actual communication is done
+doesn't matter to dpp. In addition, if the callback operation doesn't work for
+your particular use case, the APIs have been isolated in dpp.c into p10toca()
+and p7fromca() so it should be pretty straightforward to plug in anything there.
+
+A Configurator supporting certificates will respond to a Config Request that
+does not have a PKCS10 with a response containing a list of attributes in the
+form of a CSR Request. The particular attributes it sends are determined by
+the file csrattrs.nconf which is, as the name suggests, an NCONF file that is
+parsed to construct an ASN.1 SEQUENCE. It should be pretty obvious how to
+add new stuff. NIDs can be found in <openssl>/crypto/objects/objects.txt if
+you want to customize what goes into your certs. Of course, adding anything
+exotic will require the Enrollee to understand what it is you're asking so
+be prepared to write some more code if you want to get really weird.
 
 * Wired DPP
 

@@ -69,7 +69,7 @@ dpp_handle handle;
 static int
 cons_action_frame (unsigned char field, char *data, int len)
 {
-    char buf[2048], *ptr;
+    char buf[8192], *ptr;
     uint32_t netlen;
 
     memset(buf, 0, sizeof(buf));
@@ -84,7 +84,7 @@ cons_action_frame (unsigned char field, char *data, int len)
     
     memcpy(ptr, data, len);
 
-    if (write(fd, buf, len + 1 + sizeof(uint32_t)) < 1) {
+    if (write(fd, buf, len + sizeof(unsigned char) + sizeof(uint32_t)) < 1) {
         fprintf(stderr, "can't send message to controller!\n");
         return -1;
     }
@@ -122,7 +122,7 @@ transmit_pkex_frame (unsigned char *mymac, unsigned char *peermac, char *data, i
 }
 
 static int
-process_incoming_mgmt_frame(unsigned char type, unsigned char *msg, int len)
+process_incoming_mgmt_frame (unsigned char type, unsigned char *msg, int len)
 {
     dpp_action_frame *dpp;
 
@@ -192,7 +192,7 @@ process_incoming_mgmt_frame(unsigned char type, unsigned char *msg, int len)
 void
 message_from_controller (int ifd, void *data)
 {
-    unsigned char buf[3000];
+    unsigned char buf[8192];
     uint32_t netlen;
     int len, rlen;
 
@@ -203,9 +203,8 @@ message_from_controller (int ifd, void *data)
         return;
     }
     netlen = ntohl(netlen);
-    if (netlen > sizeof(buf)) {
-        fprintf(stderr, "overflow attack by controller! Not gonna read in %d bytes\n",
-                netlen);
+    if ((netlen > sizeof(buf)) || netlen < 1) {
+        fprintf(stderr, "Not gonna read in %d bytes\n", netlen);
         srv_rem_input(srvctx, ifd);
         close(ifd);
         return;
@@ -356,7 +355,7 @@ bootstrap_peer (int keyidx, int is_initiator, int mauth)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
+    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
         fprintf(stderr, "unable to create peer!\n");
         return -1;
     }
@@ -499,7 +498,7 @@ main (int argc, char **argv)
     }
     if (dpp_initialize(config_or_enroll, keyfile,
                        signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                       mudurl[0] == 0 ? NULL : mudurl, 0, 0, 0, debug) < 0) {
+                       mudurl[0] == 0 ? NULL : mudurl, 0, NULL, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);
     }

@@ -70,12 +70,13 @@ struct interface {
     unsigned char bkhash[SHA256_DIGEST_LENGTH];
     unsigned char is_loopback;
     int nl80211_id;
-    struct nl_sock *nl_sock;
-    struct nl_sock *nl_mlme;
     struct nl_cb *nl_cb;
+    struct nl_sock *nl_sock;
     unsigned long ifindex;
     unsigned long wiphy;
     unsigned long freq;
+    unsigned char offchan_tx_ok;
+    unsigned long max_roc;
     int fd;     /* BPF socket */
 };
 TAILQ_HEAD(bar, interface) interfaces;
@@ -85,11 +86,17 @@ struct family_data {
     int id;
 };
 
+#define WIRELESS_MTU    1300
+
 struct cstate {
     TAILQ_ENTRY(cstate) entry;
     unsigned char peeraddr[ETH_ALEN];
     unsigned char myaddr[ETH_ALEN];
     unsigned char bkhash[SHA256_DIGEST_LENGTH];
+    gas_action_comeback_resp_frame cbresp_hdr;
+    char *buf;
+    int left;
+    int sofar;
     int fd;
 };
 TAILQ_HEAD(foo, cstate) cstates;
@@ -99,6 +106,31 @@ static uint32_t port_bitmap[32] = { 0 };
 unsigned int opclass = 81, channel = 6;
 unsigned short portin, portout;
 char bootstrapfile[80], controller[30];
+
+static void
+dump_buffer (unsigned char *buf, int len)
+{
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (i && (i%4 == 0)) {
+            printf(" ");
+        }
+        if (i && (i%32 == 0)) {
+            printf("\n");
+        }
+        printf("%02x", buf[i]);
+    }
+    printf("\n");
+}
+
+static void
+print_buffer (char *str, unsigned char *buf, int len)
+{
+    printf("%s:\n", str);
+    dump_buffer(buf, len);
+    printf("\n");
+}
 
 static int
 ack_handler (struct nl_msg *msg, void *arg)
@@ -124,7 +156,7 @@ static int
 finish_handler (struct nl_msg *msg, void *arg)
 {
     int *ret = arg;
-//    printf("finished...\n");
+
     *ret = 0;
     return NL_SKIP;
 }
@@ -170,51 +202,6 @@ nlmsg_clear(struct nl_msg *msg)
     }
 }
 
-#if 0
-static int send_and_recv(struct nl_cb *nl_cb,
-			 struct nl_sock *nl_sock, struct nl_msg *msg,
-			 int (*valid_handler)(struct nl_msg *, void *),
-			 void *valid_data)
-{
-    struct nl_cb *cb;
-    int err = -ENOMEM;
-
-    if (!msg)
-        return -ENOMEM;
-
-    cb = nl_cb_clone(nl_cb);
-    if (!cb)
-        goto out;
-
-    err = nl_send_auto_complete(nl_sock, msg);
-    if (err < 0)
-        goto out;
-
-    err = 1;
-
-    nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
-    nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
-    nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
-
-    if (valid_handler)
-        nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM,
-                  valid_handler, valid_data);
-
-    while (err > 0) {
-        int res = nl_recvmsgs(nl_sock, cb);
-        if (res < 0) {
-            printf("nl80211: %s->nl_recvmsgs failed: %d", __func__, res);
-        }
-    }
-  out:
-    nl_cb_put(cb);
-    if (!valid_handler && valid_data == (void *) -1)
-        nlmsg_clear(msg);
-    nlmsg_free(msg);
-    return err;
-}
-#endif
-
 static int
 get_phy_info (struct nl_msg *msg, void *arg)
 {
@@ -253,7 +240,7 @@ send_mgmt_msg (struct nl_msg *msg, struct interface *inf,
         return -1;
     }
 
-    if (nl_send_auto_complete(inf->nl_mlme, msg) < 0) {
+    if (nl_send_auto_complete(inf->nl_sock, msg) < 0) {
         fprintf(stderr, "can't send an nl_msg!\n");
         nlmsg_free(msg);
         return -1;
@@ -270,7 +257,7 @@ send_mgmt_msg (struct nl_msg *msg, struct interface *inf,
     err = 1;
     while (err > 0) {
         int res;
-        if ((res = nl_recvmsgs(inf->nl_mlme, cb)) < 0) {
+        if ((res = nl_recvmsgs(inf->nl_sock, cb)) < 0) {
             fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
         }
     }
@@ -293,13 +280,20 @@ send_nl_msg (struct nl_msg *msg, struct interface *inf,
              int (*handler)(struct nl_msg *, void *), void *data)
 {
     struct nl_cb *cb;
-    int err = 0;
+    int opt, err = 0;
     
     if ((cb = nl_cb_clone(inf->nl_cb)) == NULL) {
         fprintf(stderr, "can't clone an nl_cb!\n");
         nlmsg_free(msg);
         return -1;
     }
+
+    opt = 1;
+    setsockopt(nl_socket_get_fd(inf->nl_sock), SOL_NETLINK,
+               NETLINK_EXT_ACK, &opt, sizeof(opt));
+    opt = 1;
+    setsockopt(nl_socket_get_fd(inf->nl_sock), SOL_NETLINK,
+               NETLINK_CAP_ACK, &opt, sizeof(opt));
 
     if (nl_send_auto_complete(inf->nl_sock, msg) < 0) {
         fprintf(stderr, "can't send an nl_msg!\n");
@@ -391,6 +385,7 @@ cons_action_frame (unsigned char field,
     frame->action.category = ACTION_PUBLIC;
     frame->action.field = field;
     memcpy(frame->action.variable, data, len);
+    printf("sending %d byte frame...\n", len);
     if (inf->is_loopback) {
         if (write(inf->fd, buf, framesize) < 0) {
             fprintf(stderr, "unable to write management frame!\n");
@@ -403,7 +398,9 @@ cons_action_frame (unsigned char field,
         }
         nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, inf->freq);
         nla_put_u32(msg, NL80211_ATTR_DURATION, 500);
-        nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
+        if (inf->offchan_tx_ok) {
+            nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
+        }
         nla_put(msg, NL80211_ATTR_FRAME, framesize, buf);
         cookie = 0;
         if (send_nl_msg(msg, inf, cookie_handler, &cookie) < 0) {
@@ -414,10 +411,55 @@ cons_action_frame (unsigned char field,
     return len;
 }
 
+static int
+cons_next_fragment (struct cstate *cs)
+{
+    char buffer[WIRELESS_MTU+sizeof(gas_action_comeback_resp_frame)];
+    gas_action_comeback_resp_frame *cb_resp;
+    
+    if (cs->buf == NULL) {
+        fprintf(stderr, "trying to send next fragment of NULL!\n");
+        return 0;
+    }
+    /*
+     * technically it's MTU+sizeof(comeback response header)....
+     * just don't set WIRELESS_MTU to be *exactly* the MTU
+     *
+     * Copy over the comeback response header
+     */
+    cb_resp = (gas_action_comeback_resp_frame *)&buffer[0];
+    memcpy(cb_resp, &cs->cbresp_hdr, sizeof(gas_action_comeback_resp_frame));
+    cb_resp->comeback_delay = 0;
+    cb_resp->fragment_id = cs->left/WIRELESS_MTU;
+    if (cs->left > WIRELESS_MTU) {
+        printf("sending next fragment of %d to " MACSTR ", %d so far and %d left\n",
+               WIRELESS_MTU, MAC2STR(cs->peeraddr), cs->sofar, cs->left);
+        cb_resp->query_resplen = WIRELESS_MTU;
+        cb_resp->fragment_id |= 0x80;  // more fragme
+        memcpy(cb_resp->query_resp, cs->buf+cs->sofar, WIRELESS_MTU);
+        cons_action_frame(GAS_COMEBACK_RESPONSE, cs->myaddr, cs->peeraddr,
+                          buffer, WIRELESS_MTU + sizeof(gas_action_comeback_resp_frame));
+        cs->sofar += WIRELESS_MTU;
+        cs->left -= WIRELESS_MTU;
+    } else {
+        cb_resp->query_resplen = cs->left;
+        printf("sending final fragment of %d to " MACSTR ", %d so far and %d left\n",
+               cs->left, MAC2STR(cs->peeraddr), cs->sofar, cs->left);
+        memcpy(cb_resp->query_resp, cs->buf+cs->sofar, cs->left);
+        cons_action_frame(GAS_COMEBACK_RESPONSE, cs->myaddr, cs->peeraddr,
+                          buffer, cs->left + sizeof(gas_action_comeback_resp_frame));
+        cs->sofar = cs->left = 0;
+        memset(&cs->cbresp_hdr, 0, sizeof(gas_action_comeback_resp_frame));
+        free(cs->buf); cs->buf = NULL;
+    }
+    return cs->left;
+}
+
 void
 message_from_controller (int fd, void *data)
 {
     struct cstate *cs = (struct cstate *)data;
+    gas_action_comeback_resp_frame *cb_resp;
     char buf[3000];
     uint32_t netlen;
     int len, rlen;
@@ -430,7 +472,7 @@ message_from_controller (int fd, void *data)
     }
     netlen = ntohl(netlen);
     if (netlen > sizeof(buf)) {
-        fprintf(stderr, "overflow attack by controller! Not gonna read in %d bytes\n",
+        fprintf(stderr, "Not gonna read in %d bytes\n",
                 netlen);
         srv_rem_input(srvctx, cs->fd);
         close(cs->fd);
@@ -454,20 +496,54 @@ message_from_controller (int fd, void *data)
     }
         
     printf("read %d byte message from controller\n", len);
-    printf("sending message from " MACSTR " to " MACSTR "\n\n",
-           MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
-    if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
-                          &buf[1], len - 1) < 1) {
-        fprintf(stderr, "unable to send message from controller to peer!\n");
-        srv_rem_input(srvctx, cs->fd);
-        close(cs->fd);
+    if (cs->left) {
+        fprintf(stderr, "we're still defraging the last message, chill!\n");
         return;
+    }
+    if (len > WIRELESS_MTU) {
+        if (buf[0] != GAS_COMEBACK_RESPONSE) {
+            fprintf(stderr, "dropping message larger than %d that cannot be fragmented!\n",
+                    WIRELESS_MTU);
+            return;
+        }
+        len--;
+        /*
+         * keep a copy of the comeback response header for each fragment
+         */
+        cb_resp = (gas_action_comeback_resp_frame *)&buf[1];
+        memcpy(&cs->cbresp_hdr, cb_resp, sizeof(gas_action_comeback_resp_frame));
+        len -= sizeof(gas_action_comeback_resp_frame);
+
+        if ((cs->buf = malloc(len)) == NULL) {
+            fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
+            return;
+        }
+        /*
+         * the actual response is copied into the buffer that gets fragmented
+         */
+        printf("need to fragment message that is %d, buffer is %d\n",
+               cb_resp->query_resplen, len);
+        memcpy(cs->buf, cb_resp->query_resp, len);
+        print_buffer("First 32 octets that I'm gonna fragment", cs->buf, 32); 
+        cs->sofar = 0;
+        cs->left = len;
+        cons_next_fragment(cs);
+    } else {
+        printf("sending message from " MACSTR " to " MACSTR "\n\n",
+               MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
+        if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
+                              &buf[1], len - 1) < 1) {
+            fprintf(stderr, "unable to send message from controller to peer!\n");
+            srv_rem_input(srvctx, cs->fd);
+            close(cs->fd);
+            return;
+        }
     }
     return;
 }
 
 static void
-process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *frame, int framesize)
+process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame *frame, int framesize)
 {
     dpp_action_frame *dpp;
     struct cstate *cs;
@@ -622,6 +698,7 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                     case DPP_SUB_PEER_DISCOVER_RESP:
                     case PKEX_SUB_COM_REV_REQ:
                     case PKEX_SUB_COM_REV_RESP:
+                    case DPP_CONFIG_RESULT:
                         /*
                          * find the client state and send this off!
                          */
@@ -693,11 +770,23 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                 if (cs == NULL) {
                     return;
                 }
-                printf("sending %ld byte message from " MACSTR " back to controller...\n\n",
-                       left+sizeof(uint32_t)+1, MAC2STR(cs->peeraddr));
-                if (write(cs->fd, buf, left+sizeof(uint32_t)+1) < 1) {
-                    fprintf(stderr, "unable to send message to controller!\n");
-                    return;
+                if (cs->left) {
+                    if (frame->action.field != GAS_COMEBACK_REQUEST) {
+                        fprintf(stderr, "in the middle of fragmenting got a %s\n",
+                                frame->action.field == GAS_INITIAL_REQUEST ? "GAS Initial Request" : \
+                                frame->action.field == GAS_INITIAL_RESPONSE ? "GAS Initial Response" : \
+                                "GAS Comeback Response");
+                        return;
+                    }
+                    printf("sending next fragment, %d left\n", cs->left);
+                    cons_next_fragment(cs);
+                } else {
+                    printf("sending %ld byte message from " MACSTR " back to controller...\n\n",
+                           left+sizeof(uint32_t)+1, MAC2STR(cs->peeraddr));
+                    if (write(cs->fd, buf, left+sizeof(uint32_t)+1) < 1) {
+                        fprintf(stderr, "unable to send message to controller!\n");
+                        return;
+                    }
                 }
                 break;
             default:
@@ -727,15 +816,15 @@ mgmt_frame_in (struct nl_msg *msg, void *data)
 }
 
 static void
-nl_frame_in (int fd, void *data)
+nl_sock_in (int fd, void *data)
 {
     struct interface *inf = (struct interface *)data;
     int res;
     
-    if ((res = nl_recvmsgs(inf->nl_mlme, inf->nl_cb)) < 0) {
-        fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
+    if ((res = nl_recvmsgs(inf->nl_sock, inf->nl_cb)) < 0) {
+        fprintf(stderr, "nl_recvmsgs failed: %d (%s)\n", res, nl_geterror(res));
+        srv_rem_input(srvctx, nl_socket_get_fd(inf->nl_sock));
     }
-    
 }
 
 static void
@@ -874,7 +963,6 @@ nl_get_multicast_id (struct interface *inf, const char *family, const char *grou
     if ((msg = nlmsg_alloc()) == NULL) {
         return -1;
     }
-    printf("getting multicast id for %s/%s\n", family, group);
     if (!genlmsg_put(msg, 0, 0, genl_ctrl_resolve(inf->nl_sock, "nlctrl"), 0, 0,
                      CTRL_CMD_GETFAMILY, 0) ||
         nla_put_string(msg, CTRL_ATTR_FAMILY_NAME, family)) {
@@ -887,6 +975,45 @@ nl_get_multicast_id (struct interface *inf, const char *family, const char *grou
     return res.id;
 }
     
+static int
+capabilities_handler (struct nl_msg *msg, void *arg)
+{
+    struct interface *inf = arg;
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+              genlmsg_attrlen(gnlh, 0), NULL);
+    if (tb[NL80211_ATTR_OFFCHANNEL_TX_OK]) {
+        inf->offchan_tx_ok = 1;
+    } else {
+        inf->offchan_tx_ok = 0;
+    }
+    if (tb[NL80211_ATTR_MAX_REMAIN_ON_CHANNEL_DURATION]) {
+        inf->max_roc = nla_get_u32(tb[NL80211_ATTR_MAX_REMAIN_ON_CHANNEL_DURATION]);
+    } else {
+        inf->max_roc = 5000;
+    }
+    return NL_SKIP;
+}
+
+static int
+get_driver_capabilities (struct interface *inf)
+{
+    struct nl_msg *msg;
+
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_GET_WIPHY)) == NULL) {
+        fprintf(stderr, "unable to create nl_msg to get driver capabilities\n");
+        return -1;
+    }
+    nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
+    if (send_nl_msg(msg, inf, capabilities_handler, inf) < 0) {
+        fprintf(stderr, "unable to send nl_msg to get driver capabilities\n");
+        return -1;
+    }
+    return 1;
+}
+
 static void
 add_interface (char *ptr)
 {
@@ -945,14 +1072,10 @@ add_interface (char *ptr)
         if ((inf->nl_cb = nl_cb_alloc(NL_CB_DEFAULT)) == NULL) {
             fprintf(stderr, "unable to alloc an nl cb on %s\n", inf->ifname);
             free(inf);
+            return;
         }
 
         if ((inf->nl_sock = create_nl_socket(inf->nl_cb)) == NULL) {
-            fprintf(stderr, "failed to create nl_sock on %s\n", inf->ifname);
-            free(inf);
-            return;
-        }
-        if ((inf->nl_mlme = create_nl_socket(inf->nl_cb)) == NULL) {
             fprintf(stderr, "failed to create nl_sock on %s\n", inf->ifname);
             free(inf);
             return;
@@ -965,13 +1088,29 @@ add_interface (char *ptr)
             return;
         }
 
+        if ((mid = nl_get_multicast_id(inf, "nl80211", "scan")) < 0) {
+            fprintf(stderr, "unable to get multicast id for mlme!\n");
+            nl_socket_free(inf->nl_sock);
+            free(inf);
+            return;
+        }
+        nl_socket_add_membership(inf->nl_sock, mid);
+
         if ((mid = nl_get_multicast_id(inf, "nl80211", "mlme")) < 0) {
             fprintf(stderr, "unable to get multicast id for mlme!\n");
             nl_socket_free(inf->nl_sock);
             free(inf);
             return;
         }
-        nl_socket_add_membership(inf->nl_mlme, mid);
+        nl_socket_add_membership(inf->nl_sock, mid);
+
+        if ((mid = nl_get_multicast_id(inf, "nl80211", "regulatory")) < 0) {
+            fprintf(stderr, "unable to get multicast id for mlme!\n");
+            nl_socket_free(inf->nl_sock);
+            free(inf);
+            return;
+        }
+        nl_socket_add_membership(inf->nl_sock, mid);
 
         if ((msg = get_nl_msg(inf, 0, NL80211_CMD_GET_INTERFACE)) == NULL) {
             fprintf(stderr, "unable to get nl_msg to get interface!\n");
@@ -995,6 +1134,16 @@ add_interface (char *ptr)
 
         nl_cb_set(inf->nl_cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
         nl_cb_set(inf->nl_cb, NL_CB_VALID, NL_CB_CUSTOM, mgmt_frame_in, inf);
+
+        if (get_driver_capabilities(inf) < 0) {
+            printf("can't get driver capabilities!\n");
+            inf->offchan_tx_ok = 1;
+            inf->max_roc = 5000;
+        } else {
+            printf("got driver capabilities, off chan is %s, max_roc is %ld\n",
+                   inf->offchan_tx_ok ? "ok" : "not ok", inf->max_roc);
+        }
+
         /*
          * register the various action frames we want to see
          */
@@ -1023,23 +1172,10 @@ add_interface (char *ptr)
             free(inf);
             return;
         }
-#if 0
-        printf("\nask for beacons\n");
-        if (register_beacon_frame(inf) < 1) {
-            free(inf);
-            return;
-        }
-#endif 
-#if 0
-        printf("\nask for auth frames\n");
-        if (register_auth_frame(inf) < 1) {
-            free(inf);
-            return;
-        }
-#endif
 
-        nl_socket_set_nonblocking(inf->nl_mlme);
-        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_mlme), inf, nl_frame_in);
+        nl_socket_set_nonblocking(inf->nl_sock);
+        printf("socket %d is for nl_sock_in\n", nl_socket_get_fd(inf->nl_sock));
+        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_sock), inf, nl_sock_in);
     } else {
         inf->is_loopback = 1;
         memset(&ifr, 0, sizeof(ifr));
@@ -1073,6 +1209,45 @@ add_interface (char *ptr)
     return;
 }
 
+static int
+change_freq (unsigned char *mac, unsigned long freak)
+{
+    struct nl_msg *msg;
+    unsigned long long cookie;
+    struct interface *inf;
+    
+    TAILQ_FOREACH(inf, &interfaces, entry) {
+        if (memcmp(mac, inf->bssid, ETH_ALEN) == 0) {
+            break;
+        }
+    }
+    if (inf == NULL) {
+        fprintf(stderr, "can't find " MACSTR " to change channel!\n",
+                MAC2STR(mac));
+        return -1;
+    }
+    if (inf->is_loopback) {
+        return 1;
+    }
+
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
+        fprintf(stderr, "can't allocate an nl_msg!\n");
+        return -1;
+    }
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
+    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+    cookie = 0;
+
+    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
+        fprintf(stderr, "unable to change channel!\n");
+//        return -1;
+    }
+    printf("changing frequency to %ld\n", freak);
+    inf->freq = freak;
+    return 1;
+}
+
 static unsigned long
 chan2freq (unsigned int chan)
 {
@@ -1091,30 +1266,12 @@ chan2freq (unsigned int chan)
 int
 change_channel (unsigned char *mymac, unsigned char class, unsigned char channel)
 {
-#if 0
-    struct nl_msg *msg;
-    unsigned long long cookie;
-#endif
     int i, maxregs;
     unsigned long freak;
-    struct interface *inf;
-    
-    TAILQ_FOREACH(inf, &interfaces, entry) {
-        if (memcmp(mymac, inf->bssid, ETH_ALEN) == 0) {
-            break;
-        }
-    }
-    if (inf == NULL) {
-        fprintf(stderr, "can't find " MACSTR " to change channel!\n",
-                MAC2STR(mymac));
-        return -1;
-    }
-    if (inf->is_loopback) {
-        return 1;
-    }
 
-    freak = chan2freq(channel);
-    printf("trying to change to channel %d (%ld)\n", channel, freak);
+    /*
+     * make sure it's a valid class/channel
+     */
     maxregs = (sizeof(regulatory)/sizeof(struct _regulatory));
     for (i = 0; i < maxregs; i++) {
         if ((regulatory[i].class == class) && (regulatory[i].channel == channel)) {
@@ -1126,25 +1283,10 @@ change_channel (unsigned char *mymac, unsigned char class, unsigned char channel
                 class, channel);
         return -1;
     }
-#if 0
-    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
-        fprintf(stderr, "can't allocate an nl_msg!\n");
-        return -1;
-    }
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
-    /*
-     * for the time being ignore HT, VHT...
-     */
-    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-    cookie = 0;
-    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
-        fprintf(stderr, "unable to change channel!\n");
-        return -1;
-    }
-#endif
-    inf->freq = freak;
-    printf("changing channel to %d and operating class %d (frequency %ld)\n", channel, class, inf->freq);
-    return 1;
+
+    freak = chan2freq(channel);
+    printf("changing channel to %d and operating class %d (frequency %ld)\n", channel, class, freak);
+    return change_freq(mymac, freak);
 }
 
 void
@@ -1377,6 +1519,7 @@ main (int argc, char **argv)
                         "\t-h  show usage, and exit\n"
                         "\t-I <interface> to add to DPP\n"
                         "\t-C <controller> to whom DPP frames are sent\n"
+                        "\t-k <file> which is the Controller's bootstrapping key\n"
                         "\t-f <channel> to use with DPP\n"
                         "\t-g <opclass> operating class to use with DPP\n"
                         "\t-i <num> port number for inbound (default 8741)\n"
@@ -1399,8 +1542,10 @@ main (int argc, char **argv)
     TAILQ_FOREACH(inf, &interfaces, entry) {
         printf("\t%s: " MACSTR "\n", inf->ifname, MAC2STR(inf->bssid));
         /*
-         * for now just make all interfaces have the same bootstrap key
+         * for now just make all interfaces have the same bootstrap key and are on the
+         * same channel
          */
+        change_channel(inf->bssid, opclass, channel);
         compute_bk_hash(inf, bkfile);
     }
     printf("controller is at %s\n", controller);

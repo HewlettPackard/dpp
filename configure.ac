@@ -75,14 +75,14 @@ case $host in
 		[givemsg="yes" ld_msg="LD_LIBRARY_PATH"]
 	)
 	CFLAGS="$CFLAGS -I/usr/include/libnl3"
-	AC_CONFIG_FILES([linux/Makefile
+	AC_CONFIG_FILES([linux/Makefile 
 	])
 	;;
 *-darwin*)
 	dnl static building is not supported on OSX
 	givemsg="yes"
 	ld_msg="DYLD_LIBRARY_PATH"
-	AC_CONFIG_FILES([macos/Makefile
+	AC_CONFIG_FILES([macos/Makefile 
 	])
 	;;
 *-freebsd*)
@@ -91,13 +91,15 @@ case $host in
 		LDFLAGS="$LDFLAGS -static",
 		[givemsg="yes" ld_msg="LD_LIBRARY_PATH"]
 	)
-	AC_CONFIG_FILES([freebsd/Makefile
+	AC_CONFIG_FILES([freebsd/Makefile 
 	])
 	;;
 *)
-	AC_MSG_ERROR([EST has not been ported to your OS yet])
+	AC_MSG_ERROR([DPP has not been ported to your OS yet])
 
 esac
+
+AC_CONFIG_FILES([ecca/Makefile])
 
 AC_CHECK_LIB([crypto], [EC_GROUP_get_order], [],
 	[AC_MSG_FAILURE([can't find libcrypto])],

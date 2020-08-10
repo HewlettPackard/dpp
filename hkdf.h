@@ -33,6 +33,16 @@
 #ifndef _HKDF_H_
 #define _HKDF_H_
 
+int hkdf_extract(const EVP_MD *,
+                 unsigned char *, int,
+                 unsigned char *, int,
+                 unsigned char *);
+
+int hkdf_expand(const EVP_MD *,
+                unsigned char *, int,
+                unsigned char *, int,
+                unsigned char *, int);
+
 int hkdf(const EVP_MD *, int,
          unsigned char *, int,
          unsigned char *, int,

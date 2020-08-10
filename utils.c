@@ -41,6 +41,7 @@
 #include <openssl/sha.h>
 #include <openssl/ecdsa.h>
 #include "jsmn.h"
+#include "utils.h"
 
 static int skip_object(jsmntok_t *t);
 static int skip_array(jsmntok_t *t);
@@ -125,6 +126,9 @@ find_token (jsmntok_t *toks, int *n, int ntoks, char *buffer, char *str)
     num = *n;
     for (i = 0; i < ntoks; i++) {
         tok = &toks[num];
+        if (tok == NULL) {
+            return -1;
+        }
         /*
          * we should be looking at a token of type string
          */
@@ -489,7 +493,7 @@ int
 generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT *netackey,
                     char *role, EC_KEY *signkey, BN_CTX *bnctx)
 {
-    unsigned char kid[2*SHA256_DIGEST_LENGTH];
+    unsigned char kid[KID_LENGTH];
     char buf[1024];
     unsigned char burlx[256], burly[256], *bn = NULL;
     unsigned char digest[SHA512_DIGEST_LENGTH], sig[BIGGEST_POSSIBLE_SIGNATURE];
@@ -501,7 +505,7 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
     BIO *bio = NULL;
     const EC_POINT *signpub;
     const EC_GROUP *signgroup;
-    ECDSA_SIG *ecsig;
+    ECDSA_SIG *ecsig = NULL;
     time_t t;
     struct tm *bdt;
     
@@ -592,7 +596,8 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
      * generate the connector body (the JWS Payload)
      */
     nid = EC_GROUP_get_curve_name(group);
-    buflen = snprintf(buf, sizeof(buf),
+    memset(buf, 0, sizeof(buf));
+    buflen = snprintf(buf, sizeof(buf)-1,
                       "{\"groups\":[{\"groupId\":\"interop\",\"netRole\":\"%s\"}],"
                       "\"netAccessKey\":{\"kty\":\"EC\",\"crv\":\"%s\",\"x\":\"%s\",\"y\":\"%s\","
                       "\"kid\":\"%s\"},\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}", role, 
@@ -695,6 +700,12 @@ fail:
     if (bn != NULL) {
         free(bn);
     }
+    if (mdctx != NULL) {
+        EVP_MD_CTX_free(mdctx);
+    }
+    if (ecsig != NULL) {
+        ECDSA_SIG_free(ecsig);
+    }
     return sofar;
 }
 
@@ -776,6 +787,9 @@ validate_connector (unsigned char *connector, int len, EC_KEY *signkey, BN_CTX *
     ret = 1;
 
 fail:
+    if (ecsig != NULL) {
+        ECDSA_SIG_free(ecsig);
+    }
     if (mdctx != NULL) {
         EVP_MD_CTX_free(mdctx);
     }

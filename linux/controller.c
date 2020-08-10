@@ -48,9 +48,12 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 #include "ieee802_11.h"
 #include "service.h"
 #include "common.h"
+#include "tlv.h"
 #include "pkex.h"
 #include "dpp.h"
 
@@ -71,7 +74,7 @@ message_from_relay (int fd, void *data)
 {
     struct conversation *conv = (struct conversation *)data;
     dpp_action_frame *dpp;
-    unsigned char buf[3000], pmk[PMK_LEN], pmkid[PMKID_LEN];
+    unsigned char buf[8192], pmk[PMK_LEN], pmkid[PMKID_LEN];
     int framesize, rlen;
     uint32_t netlen;
 
@@ -84,9 +87,8 @@ message_from_relay (int fd, void *data)
         return;
     }
     netlen = ntohl(netlen);
-    if (netlen > sizeof(buf)) {
-        fprintf(stderr, "overflow attack by relay/client! Not gonna read in %d bytes\n",
-                netlen);
+    if ((netlen > sizeof(buf)) || (netlen < 1)) {
+        fprintf(stderr, "Not gonna read in %d bytes\n", netlen);
         srv_rem_input(srvctx, fd);
         close(fd);
         TAILQ_REMOVE(&conversations, conv, entry);
@@ -107,7 +109,6 @@ message_from_relay (int fd, void *data)
         framesize += rlen;
         netlen -= rlen;
     }
-    
     printf("read %d byte message from relay!\n", framesize);
 
     switch (buf[0]) {
@@ -163,6 +164,19 @@ message_from_relay (int fd, void *data)
                     }
 */
                     break;
+                case DPP_CONFIG_RESULT:
+                    printf("DPP config result message...\n");
+                    if (process_dpp_config_frame(BAD_DPP_SPEC_MESSAGE, &buf[1], framesize - 1, conv->handle) < 0) {
+                        fprintf(stderr, "error processing DPP Config frame\n");
+                    }
+                    /*
+                     * all done!
+                     */
+                    srv_rem_input(srvctx, fd);
+                    close(fd);
+                    TAILQ_REMOVE(&conversations, conv, entry);
+                    free(conv);
+                    break;
                 default:
                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
                     break;
@@ -192,7 +206,7 @@ static int
 cons_action_frame (unsigned char field, dpp_handle handle,
                    char *data, int len)
 {
-    char buf[3000], *ptr;
+    char buf[8192], *ptr;
     uint32_t netlen;
     struct conversation *conv = NULL;
 
@@ -309,11 +323,15 @@ new_connection (int fd, void *data)
 {
     struct sockaddr_in *serv = (struct sockaddr_in *)data;
     struct conversation *conv;
-    int sd, rlen, framesize;
+    int sd, rlen, framesize, ret, opclass, channel, asn1len, found = 0;
     uint32_t netlen;
-    unsigned int clen;
-    unsigned char buf[3000];
+    unsigned int clen, mdlen = SHA256_DIGEST_LENGTH;
+    char pkey[200];
+    unsigned char buf[3000], mac[20], keyasn1[1024], keyhash[SHA256_DIGEST_LENGTH];
     dpp_action_frame *frame;
+    EVP_MD_CTX *mdctx = NULL;
+    TLV *rhash;
+    FILE *fp;
     
     printf("new connection!!!\n");
     clen = sizeof(struct sockaddr_in);
@@ -328,7 +346,7 @@ new_connection (int fd, void *data)
     }
     memset(conv, 0, sizeof(struct conversation));
     conv->fd = sd;
-    if ((conv->handle = dpp_create_peer(NULL, 0, 0)) < 1) {
+    if ((conv->handle = dpp_create_peer(NULL, 0, 0, 0)) < 1) {
         free(conv);
         return;
     }
@@ -380,6 +398,54 @@ new_connection (int fd, void *data)
             }
             break;
         case DPP_CHIRP:
+            /*
+             * see if we know about this guy...
+             */
+            printf("DPP chirp!\n");
+            if ((rhash = find_tlv(RESPONDER_BOOT_HASH, frame->attributes, framesize - 1)) == NULL) {
+                goto fail;
+            }
+            if ((fp = fopen(bootstrapfile, "r")) == NULL) {
+                goto fail;
+            }
+            if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+                goto fail;
+            }
+            while (!feof(fp)) {
+                memset(pkey, 0, sizeof(pkey));
+                if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, pkey) < 0) {
+                    continue;
+                }
+                if ((asn1len = EVP_DecodeBlock(keyasn1, (unsigned char *)pkey, strlen(pkey))) < 0) {
+                    continue;
+                }
+                printf("checking %d...", ret);
+                EVP_DigestInit(mdctx, EVP_sha256());
+                EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
+                EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
+                EVP_DigestFinal(mdctx, keyhash, &mdlen);
+//                print_buffer("decoded", keyasn1, asn1len);
+//                print_buffer("from chirp", TLV_value(rhash), SHA256_DIGEST_LENGTH);
+//                print_buffer("computed", keyhash, SHA256_DIGEST_LENGTH);
+                if (memcmp(keyhash, TLV_value(rhash), SHA256_DIGEST_LENGTH) == 0) {
+                    printf("YES!!!\n");
+                    /* 
+                     * if so, initiator and try mutual (responder decides anyway)
+                     */
+                    if ((conv->handle = dpp_create_peer((unsigned char *)&pkey[0], 1, 1, 0)) < 1) {
+                        fclose(fp);
+                        goto fail;
+                    }
+                    found = 1;
+                    break;
+                } else {
+                    printf("no\n");
+                }
+            }
+            fclose(fp);
+            if (!found) {
+                goto fail;
+            }
             break;
         default:
             fprintf(stderr, "first message from relay not a DPP/PKEX request!\n");
@@ -503,7 +569,7 @@ bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
         free(conv);
         return -1;
     }
-    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
+    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
         close(conv->fd);
         free(conv);
         return -1;
@@ -513,6 +579,13 @@ bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
     return 1;
 }
 
+void
+badconn (int fd, void *data)
+{
+    srv_rem_input(srvctx, fd);
+    close(fd);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -520,7 +593,7 @@ main (int argc, char **argv)
     int opt, infd;
     struct sockaddr_in serv;
     char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
-    char *ptr, *endptr, identifier[80], pkexinfo[80];
+    char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
     if ((srvctx = srv_create_context()) == NULL) {
@@ -533,12 +606,13 @@ main (int argc, char **argv)
     memset(mudurl, 0, 80);
     memset(identifier, 0, 80);
     memset(pkexinfo, 0, 80);
+    memset(caip, 0, 40);
 //    strcpy(bootstrapfile, "none");
 //    strcpy(signkeyfile, "none");
 //    strcpy(identifier, "none");
 //    strcpy(pkexinfo, "none");
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:bae:c:d:p:n:z:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:bae:c:d:p:n:z:w:");
         if (c < 0) {
             break;
         }
@@ -594,6 +668,9 @@ main (int argc, char **argv)
             case 'b':
                 do_pkex = 1;
                 do_dpp = 0;
+                break;
+            case 'w':
+                strcpy(caip, optarg);
                 break;
             case 'x':
                 keyidx = atoi(optarg);
@@ -665,6 +742,7 @@ main (int argc, char **argv)
         exit(1);
     }
     srv_add_input(srvctx, infd, &serv, new_connection);
+    srv_add_exceptor(srvctx, badconn);
 
     /*
      * initialize data structures...
@@ -681,7 +759,8 @@ main (int argc, char **argv)
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           mudurl[0] == 0 ? NULL : mudurl, 0, 0, 0, debug) < 0) {
+                           mudurl[0] == 0 ? NULL : mudurl, 0, caip[0] == 0 ? "127.0.0.1" : caip,
+                           0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }

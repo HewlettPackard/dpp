@@ -59,6 +59,7 @@ typedef struct _tlv {
 #define CHANGE_CHANNEL                  0x1018
 #define PROTOCOL_VERSION                0x1019
 #define DPP_ENVELOPED_DATA              0x101A
+#define CSR_ATTRS_REQUEST               0x101f    
     unsigned short type;
     unsigned short length;
     unsigned char value[0];

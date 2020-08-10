@@ -75,11 +75,17 @@ struct interface {
 };
 TAILQ_HEAD(bar, interface) interfaces;
 
+#define WIRELESS_MTU    1300
+
 struct cstate {
     TAILQ_ENTRY(cstate) entry;
     unsigned char peeraddr[ETH_ALEN];
     unsigned char myaddr[ETH_ALEN];
     unsigned char bkhash[SHA256_DIGEST_LENGTH];
+    gas_action_comeback_resp_frame cbresp_hdr;
+    char *buf;
+    int left;
+    int sofar;
     timerid t;
     int fd;
 };
@@ -172,10 +178,55 @@ cons_action_frame (unsigned char field,
     return len;
 }
 
+static int
+cons_next_fragment (struct cstate *cs)
+{
+    char buffer[WIRELESS_MTU+sizeof(gas_action_comeback_resp_frame)];
+    gas_action_comeback_resp_frame *cb_resp;
+    
+    if (cs->buf == NULL) {
+        fprintf(stderr, "trying to send next fragment of NULL!\n");
+        return 0;
+    }
+    /*
+     * technically it's MTU+sizeof(comeback response header)....
+     * just don't set WIRELESS_MTU to be *exactly* the MTU
+     *
+     * Copy over the comeback response header
+     */
+    cb_resp = (gas_action_comeback_resp_frame *)&buffer[0];
+    memcpy(cb_resp, &cs->cbresp_hdr, sizeof(gas_action_comeback_resp_frame));
+    cb_resp->comeback_delay = 0;
+    cb_resp->fragment_id = cs->left/WIRELESS_MTU;
+    if (cs->left > WIRELESS_MTU) {
+        printf("sending next fragment of %d to " MACSTR ", %d so far and %d left\n",
+               WIRELESS_MTU, MAC2STR(cs->peeraddr), cs->sofar, cs->left);
+        cb_resp->query_resplen = WIRELESS_MTU;
+        cb_resp->fragment_id |= 0x80;  // more fragme
+        memcpy(cb_resp->query_resp, cs->buf+cs->sofar, WIRELESS_MTU);
+        cons_action_frame(GAS_COMEBACK_RESPONSE, cs->myaddr, cs->peeraddr,
+                          buffer, WIRELESS_MTU + sizeof(gas_action_comeback_resp_frame));
+        cs->sofar += WIRELESS_MTU;
+        cs->left -= WIRELESS_MTU;
+    } else {
+        cb_resp->query_resplen = cs->left;
+        printf("sending final fragment of %d to " MACSTR ", %d so far and %d left\n",
+               cs->left, MAC2STR(cs->peeraddr), cs->sofar, cs->left);
+        memcpy(cb_resp->query_resp, cs->buf+cs->sofar, cs->left);
+        cons_action_frame(GAS_COMEBACK_RESPONSE, cs->myaddr, cs->peeraddr,
+                          buffer, cs->left + sizeof(gas_action_comeback_resp_frame));
+        cs->sofar = cs->left = 0;
+        memset(&cs->cbresp_hdr, 0, sizeof(gas_action_comeback_resp_frame));
+        free(cs->buf); cs->buf = NULL;
+    }
+    return cs->left;
+}
+
 void
 message_from_controller (int fd, void *data)
 {
     struct cstate *cs = (struct cstate *)data;
+    gas_action_comeback_resp_frame *cb_resp;
     char buf[3000];
     uint32_t netlen;
     int len, rlen, ret;
@@ -213,12 +264,49 @@ message_from_controller (int fd, void *data)
     }
         
     printf("read %d byte message from controller\n", len);
-    if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
-                          &buf[1], len - 1) < 1) {
-        fprintf(stderr, "unable to send message from controller to peer!\n");
-        srv_rem_input(srvctx, cs->fd);
-        close(cs->fd);
+
+    if (cs->left) {
+        fprintf(stderr, "we're still defraging the last message, chill!\n");
         return;
+    }
+    if (len > WIRELESS_MTU) {
+        if (buf[0] != GAS_COMEBACK_RESPONSE) {
+            fprintf(stderr, "dropping message larger than %d that cannot be fragmented!\n",
+                    WIRELESS_MTU);
+            return;
+        }
+        len--;
+        /*
+         * keep a copy of the comeback response header for each fragment
+         */
+        cb_resp = (gas_action_comeback_resp_frame *)&buf[1];
+        memcpy(&cs->cbresp_hdr, cb_resp, sizeof(gas_action_comeback_resp_frame));
+        len -= sizeof(gas_action_comeback_resp_frame);
+
+        if ((cs->buf = malloc(len)) == NULL) {
+            fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
+            return;
+        }
+        /*
+         * the actual response is copied into the buffer that gets fragmented
+         */
+        printf("need to fragment message that is %d, buffer is %d\n",
+               cb_resp->query_resplen, len);
+        memcpy(cs->buf, cb_resp->query_resp, len);
+        print_buffer("First 32 octets that I'm gonna fragment", cs->buf, 32); 
+        cs->sofar = 0;
+        cs->left = len;
+        cons_next_fragment(cs);
+    } else {
+        printf("sending message from " MACSTR " to " MACSTR "\n\n",
+               MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
+        if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
+                              &buf[1], len - 1) < 1) {
+            fprintf(stderr, "unable to send message from controller to peer!\n");
+            srv_rem_input(srvctx, cs->fd);
+            close(cs->fd);
+            return;
+        }
     }
     return;
 }
@@ -231,6 +319,9 @@ delete_cstate (timerid t, void *data)
     printf("deleting connection state....\n");
     TAILQ_REMOVE(&cstates, cs, entry);
     srv_rem_input(srvctx, cs->fd);
+    if (cs->left) {
+        free(cs->buf);
+    }
     close(cs->fd);
     free(cs);
 
@@ -538,20 +629,32 @@ bpf_in (int fd, void *data)
                             if (cs == NULL) {
                                 return;
                             }
-                            srv_rem_timeout(srvctx, cs->t);
-                            tcpbuflen = htonl(left+1);
-                            memcpy(tocontroller, (unsigned char *)&tcpbuflen, sizeof(uint32_t));
-                            memcpy(tocontroller + sizeof(uint32_t),
-                                   (unsigned char *)&frame->action.field, left+1);
+                            if (cs->left) {
+                                if (frame->action.field != GAS_COMEBACK_REQUEST) {
+                                    fprintf(stderr, "in the middle of fragmenting got a %s\n",
+                                            frame->action.field == GAS_INITIAL_REQUEST ? "GAS Initial Request" : \
+                                            frame->action.field == GAS_INITIAL_RESPONSE ? "GAS Initial Response" : \
+                                            "GAS Comeback Response");
+                                    return;
+                                }
+                                printf("sending next fragment, %d left\n", cs->left);
+                                cons_next_fragment(cs);
+                            } else {
+                                srv_rem_timeout(srvctx, cs->t);
+                                tcpbuflen = htonl(left+1);
+                                memcpy(tocontroller, (unsigned char *)&tcpbuflen, sizeof(uint32_t));
+                                memcpy(tocontroller + sizeof(uint32_t),
+                                       (unsigned char *)&frame->action.field, left+1);
 
-                            printf("sending %d byte message from " MACSTR " back to controller...\n\n",
-                                   left+1, MAC2STR(cs->peeraddr));
-                            print_buffer("message", tocontroller, left+1+sizeof(uint32_t));
-                            if (write(cs->fd, (unsigned char *)tocontroller, left+1+sizeof(uint32_t)) < 1) {
-                                fprintf(stderr, "relay: unable to send length of message to controller!\n");
+                                printf("sending %d byte message from " MACSTR " back to controller...\n\n",
+                                       left+1, MAC2STR(cs->peeraddr));
+                                print_buffer("message", tocontroller, left+1+sizeof(uint32_t));
+                                if (write(cs->fd, (unsigned char *)tocontroller, left+1+sizeof(uint32_t)) < 1) {
+                                    fprintf(stderr, "relay: unable to send length of message to controller!\n");
+                                }
+                                printf("sent message to controller!\n");
+                                cs->t = srv_add_timeout(srvctx, SRV_SEC(10), delete_cstate, cs);
                             }
-                            printf("sent message to controller!\n");
-                            cs->t = srv_add_timeout(srvctx, SRV_SEC(10), delete_cstate, cs);
                             break;
                         default:
                             printf("unknown action frame %d\n", frame->action.field);

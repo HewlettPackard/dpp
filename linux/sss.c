@@ -50,10 +50,13 @@
 #include <linux/if_tun.h>
 #include <linux/nl80211.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include "ieee802_11.h"
 #include "radio.h"
 #include "service.h"
 #include "pkex.h"
+#include "tlv.h"
 #include "dpp.h"
 
 struct interface {
@@ -64,7 +67,6 @@ struct interface {
     int nl80211_id;
     struct nl_cb *nl_cb;
     struct nl_sock *nl_sock;
-    struct nl_sock *nl_event;
     unsigned long ifindex;
     unsigned long wiphy;
     unsigned long freq;
@@ -93,11 +95,21 @@ struct trigger_results {
     int aborted;
 };
 
+#define WIRELESS_MTU    1300
+
 service_context srvctx;
 static int discovered = -1;
 char our_ssid[33];
 unsigned int opclass = 81, channel = 6;
 char bootstrapfile[80];
+
+extern int nl_debug;
+
+static void
+exceptor (int fd, void *unused)
+{
+    srv_rem_input(srvctx, fd);
+}
 
 static void
 dump_ssid (struct ieee80211_mgmt_frame *frame, int len)
@@ -194,7 +206,7 @@ create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char
     }
     memcpy(instance->mymac, mymac, ETH_ALEN);
     memcpy(instance->peermac, peermac, ETH_ALEN);
-    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth)) < 1) {
+    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth, WIRELESS_MTU)) < 1) {
         free(instance);
         return NULL;
     }
@@ -226,15 +238,20 @@ create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
 }
 
 static void
-process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *frame, int framesize)
+process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame *frame, int framesize)
 {
     dpp_action_frame *dpp;
     struct dpp_instance *instance;
     char el_id, el_len, ssid[33];
-    unsigned char *els, pmk[PMK_LEN], pmkid[PMKID_LEN];
+    unsigned char *els, pmk[PMK_LEN], pmkid[PMKID_LEN], pkey[200];
+    unsigned char mac[20], keyasn1[1024], keyhash[SHA256_DIGEST_LENGTH];
+    unsigned int mdlen = SHA256_DIGEST_LENGTH;
     unsigned short frame_control;
-    int type, stype, left;
+    int type, stype, left, ret, oc, chan, asn1len;
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    TLV *rhash;
+    FILE *fp;
+    EVP_MD_CTX *mdctx;
 
     /*
      * if we sent it, ignore it
@@ -254,6 +271,7 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
     type = IEEE802_11_FC_GET_TYPE(frame_control);
     stype = IEEE802_11_FC_GET_STYPE(frame_control);
 
+    printf("processing %d byte incoming management frame\n", framesize);
     if (type == IEEE802_11_FC_TYPE_MGMT) {
         switch (stype) {
             case IEEE802_11_FC_STYPE_ACTION:
@@ -261,6 +279,8 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                  * if it's not a public action frame then we don't care about it!
                  */
                 if (frame->action.category != ACTION_PUBLIC) {
+                    fprintf(stderr, "got a non public action frame from " MACSTR " to " MACSTR "\n",
+                            MAC2STR(frame->sa), MAC2STR(frame->da));
                     return;
                 }
                 left = framesize - (IEEE802_11_HDR_LEN + sizeof(frame->action));
@@ -346,6 +366,42 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                                  * this is a controller feature, let's just ignore it here.
                                  */
                                 fprintf(stderr, "got a DPP chirp from " MACSTR "\n", MAC2STR(frame->sa));
+                                if ((rhash = find_tlv(RESPONDER_BOOT_HASH, dpp->attributes, left)) == NULL) {
+                                    fprintf(stderr, "malformed though\n");
+                                    return;
+                                }
+                                if ((fp = fopen(bootstrapfile, "r")) == NULL) {
+                                    return;
+                                }
+                                if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+                                    fclose(fp);
+                                    return;
+                                }
+                                while (!feof(fp)) {
+                                    memset(pkey, 0, sizeof(pkey));
+                                    if (fscanf(fp, "%d %d %d %s %s", &ret, &oc, &chan, mac, pkey) < 0) {
+                                        continue;
+                                    }
+                                    if ((asn1len = EVP_DecodeBlock(keyasn1, (unsigned char *)pkey, strlen(pkey))) < 0) {
+                                        continue;
+                                    }
+                                    fprintf(stderr, "checking %d...", ret);
+                                    EVP_DigestInit(mdctx, EVP_sha256());
+                                    EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
+                                    EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
+                                    EVP_DigestFinal(mdctx, keyhash, &mdlen);
+                                    /*
+                                     * if we have that bootstrap key, initiate to her!
+                                     */
+                                    if (memcmp(keyhash, TLV_value(rhash), SHA256_DIGEST_LENGTH) == 0) {
+                                        fprintf(stderr, "YES!!!\n");
+                                        create_dpp_instance(inf->bssid, frame->sa, pkey, 1, 0);
+                                        break;
+                                    } else {
+                                        fprintf(stderr, "no\n");
+                                    }
+                                }
+                                fclose(fp);
                                 break;
                             default:
                                 fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -371,6 +427,8 @@ process_incoming_mgmt_frame(struct interface *inf, struct ieee80211_mgmt_frame *
                         }
                         break;
                     default:
+                        fprintf(stderr, "weird non-DPP action frame from " MACSTR " to " MACSTR "\n",
+                                MAC2STR(frame->sa), MAC2STR(frame->da));
                         break;
                 }
                 break;
@@ -450,6 +508,8 @@ mgmt_frame_in (struct nl_msg *msg, void *data)
         frame = (struct ieee80211_mgmt_frame *)nla_data(tb[NL80211_ATTR_FRAME]);
         framesize = nla_len(tb[NL80211_ATTR_FRAME]);
         process_incoming_mgmt_frame(inf, frame, framesize);
+    } else {
+        fprintf(stderr, "got something that's not a frame in mgmt_frame_in\n");
     }
     
     return NL_SKIP;
@@ -462,23 +522,9 @@ nl_sock_in (int fd, void *data)
     int res;
     
     if ((res = nl_recvmsgs(inf->nl_sock, inf->nl_cb)) < 0) {
-        fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
+        fprintf(stderr, "nl_recvmsgs failed: %d (%s)\n", res, nl_geterror(res));
         srv_rem_input(srvctx, nl_socket_get_fd(inf->nl_sock));
     }
-    
-}
-
-static void
-nl_event_in (int fd, void *data)
-{
-    struct interface *inf = (struct interface *)data;
-    int res;
-    
-    if ((res = nl_recvmsgs(inf->nl_event, inf->nl_cb)) < 0) {
-        fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
-        srv_rem_input(srvctx, nl_socket_get_fd(inf->nl_event));
-    }
-    
 }
 
 static void
@@ -612,13 +658,20 @@ send_nl_msg (struct nl_msg *msg, struct interface *inf,
              int (*handler)(struct nl_msg *, void *), void *data)
 {
     struct nl_cb *cb;
-    int err = 0;
+    int opt, err = 0;
     
     if ((cb = nl_cb_clone(inf->nl_cb)) == NULL) {
         fprintf(stderr, "can't clone an nl_cb!\n");
         nlmsg_free(msg);
         return -1;
     }
+
+    opt = 1;
+    setsockopt(nl_socket_get_fd(inf->nl_sock), SOL_NETLINK,
+               NETLINK_EXT_ACK, &opt, sizeof(opt));
+    opt = 1;
+    setsockopt(nl_socket_get_fd(inf->nl_sock), SOL_NETLINK,
+               NETLINK_CAP_ACK, &opt, sizeof(opt));
 
     if (nl_send_auto_complete(inf->nl_sock, msg) < 0) {
         fprintf(stderr, "can't send an nl_msg!\n");
@@ -725,7 +778,7 @@ cons_action_frame (unsigned char field, unsigned char *mymac, unsigned char *pee
             nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
         }
         nla_put(msg, NL80211_ATTR_FRAME, framesize, buf);
-        printf("sending frame on %ld\n", inf->freq);
+        printf("sending %ld byte frame on %ld\n", framesize, inf->freq);
         cookie = 0;
         if (send_nl_msg(msg, inf, cookie_handler, &cookie) < 0) {
             fprintf(stderr, "can't send nl msg!\n");
@@ -753,8 +806,8 @@ chan2freq (unsigned int chan)
 static int
 change_freq (unsigned char *mac, unsigned long freak)
 {
-//    struct nl_msg *msg;
-//    unsigned long long cookie;
+    struct nl_msg *msg;
+    unsigned long long cookie;
     struct interface *inf;
     
     TAILQ_FOREACH(inf, &interfaces, entry) {
@@ -771,19 +824,19 @@ change_freq (unsigned char *mac, unsigned long freak)
         return 1;
     }
 
-//    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
-//        fprintf(stderr, "can't allocate an nl_msg!\n");
-//        return -1;
-//    }
-//    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
-//    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-//    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
-//    cookie = 0;
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
+        fprintf(stderr, "can't allocate an nl_msg!\n");
+        return -1;
+    }
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
+    nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
+    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+    cookie = 0;
 
-//    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
-//        fprintf(stderr, "unable to change channel!\n");
+    if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
+        fprintf(stderr, "unable to change channel!\n");
 //        return -1;
-//    }
+    }
     printf("changing frequency to %ld\n", freak);
     inf->freq = freak;
     return 1;
@@ -838,6 +891,7 @@ transmit_config_frame (dpp_handle handle, unsigned char field, char *data, int l
     if ((instance = find_instance_by_handle(handle)) == NULL) {
         return -1;
     }
+//    nl_debug = 4;
     return cons_action_frame(field, instance->mymac, instance->peermac, data, len);
 }
 
@@ -881,7 +935,7 @@ register_action_frame (struct interface *inf, int flags, unsigned char *match, i
     }
     nla_put_u16(msg, NL80211_ATTR_FRAME_TYPE, type);
     nla_put(msg, NL80211_ATTR_FRAME_MATCH, match_len, match);
-    if (send_nl_msg(msg, inf, mgmt_frame_in, inf)) {
+    if (send_nl_msg(msg, inf, NULL, NULL)) {
         fprintf(stderr, "unable to register for action frame!\n");
         return -1;
     }
@@ -1127,7 +1181,7 @@ trigger_scan(struct interface *inf, char *lookfor)
         return -1;
     }
 
-    if (nl_send_auto_complete(inf->nl_event, msg) < 0) {
+    if (nl_send_auto_complete(inf->nl_sock, msg) < 0) {
         fprintf(stderr, "can't send an nl_msg!\n");
         nlmsg_free(msg);
         return -1;
@@ -1141,7 +1195,7 @@ trigger_scan(struct interface *inf, char *lookfor)
     err = 1;
     while (err > 0) {
         int res;
-        if ((res = nl_recvmsgs(inf->nl_event, cb)) < 0) {
+        if ((res = nl_recvmsgs(inf->nl_sock, cb)) < 0) {
             fprintf(stderr, "nl_recvmsgs failed: %d\n", res);
         }
     }
@@ -1149,7 +1203,7 @@ trigger_scan(struct interface *inf, char *lookfor)
         fprintf(stderr, "send_nl_msg: error receiving nl_msgs: %d\n", err);
     }
     while (!results.done) {
-        nl_recvmsgs(inf->nl_event, cb);
+        nl_recvmsgs(inf->nl_sock, cb);
     }
     if (results.aborted) {
         fprintf(stderr, "kernel aborted our scan :-(\n");
@@ -1416,38 +1470,29 @@ add_interface (char *ptr)
             return;
         }
 
-        if ((inf->nl_event = create_nl_socket(inf->nl_cb)) == NULL) {
-            fprintf(stderr, "failed to create nl_event on %s\n", inf->ifname);
-            free(inf);
-            return;
-        }
-
         if ((mid = nl_get_multicast_id(inf, "nl80211", "scan")) < 0) {
             fprintf(stderr, "unable to get multicast id for mlme!\n");
             nl_socket_free(inf->nl_sock);
-            nl_socket_free(inf->nl_event);
             free(inf);
             return;
         }
-        nl_socket_add_membership(inf->nl_event, mid);
+        nl_socket_add_membership(inf->nl_sock, mid);
 
         if ((mid = nl_get_multicast_id(inf, "nl80211", "mlme")) < 0) {
             fprintf(stderr, "unable to get multicast id for mlme!\n");
             nl_socket_free(inf->nl_sock);
-            nl_socket_free(inf->nl_event);
             free(inf);
             return;
         }
-        nl_socket_add_membership(inf->nl_event, mid);
+        nl_socket_add_membership(inf->nl_sock, mid);
 
         if ((mid = nl_get_multicast_id(inf, "nl80211", "regulatory")) < 0) {
             fprintf(stderr, "unable to get multicast id for mlme!\n");
             nl_socket_free(inf->nl_sock);
-            nl_socket_free(inf->nl_event);
             free(inf);
             return;
         }
-        nl_socket_add_membership(inf->nl_event, mid);
+        nl_socket_add_membership(inf->nl_sock, mid);
 
         if ((msg = get_nl_msg(inf, 0, NL80211_CMD_GET_INTERFACE)) == NULL) {
             fprintf(stderr, "unable to get nl_msg to get interface!\n");
@@ -1511,9 +1556,8 @@ add_interface (char *ptr)
         }
 
         nl_socket_set_nonblocking(inf->nl_sock);
+        printf("socket %d is for nl_sock_in\n", nl_socket_get_fd(inf->nl_sock));
         srv_add_input(srvctx, nl_socket_get_fd(inf->nl_sock), inf, nl_sock_in);
-        nl_socket_set_nonblocking(inf->nl_event);
-        srv_add_input(srvctx, nl_socket_get_fd(inf->nl_event), inf, nl_event_in);
     } else {
         inf->is_loopback = 1;
         memset(&ifr, 0, sizeof(ifr));
@@ -1615,7 +1659,7 @@ main (int argc, char **argv)
     int chchandpp = 0, chirp = 0;
     struct interface *inf;
     char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
-    char *ptr, *endptr, identifier[80], pkexinfo[80];
+    char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     struct nl_msg *msg;
 
@@ -1631,10 +1675,11 @@ main (int argc, char **argv)
     memset(mudurl, 0, 80);
     memset(identifier, 0, 80);
     memset(pkexinfo, 0, 80);
+    memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:t");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:");
         /*
-         * left: j, l, o, q, v, w, y
+         * left: j, l, o, q, v, y
          */
         if (c < 0) {
             break;
@@ -1657,6 +1702,9 @@ main (int argc, char **argv)
                 break;
             case 'n':           /* pkex identifier */
                 strcpy(identifier, optarg);
+                break;
+            case 'w':
+                strcpy(caip, optarg);
                 break;
             case 'd':           /* debug */
                 debug = atoi(optarg);
@@ -1739,6 +1787,7 @@ main (int argc, char **argv)
                         "\t-s  change opclass/channel to what was set with -f and -g during DPP\n"
                         "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-t  send DPP chirps (responder only)\n"
+                        "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -1782,7 +1831,7 @@ main (int argc, char **argv)
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           mudurl[0] == 0 ? NULL : mudurl, chirp, 
+                           mudurl[0] == 0 ? NULL : mudurl, chirp, caip[0] == 0 ? "127.0.0.1" : caip,
                            chchandpp ? opclass : 0, chchandpp ? channel : 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
@@ -1852,7 +1901,8 @@ main (int argc, char **argv)
             }
         }
     }
+    srv_add_exceptor(srvctx, exceptor);
     srv_main_loop(srvctx);
-
+    printf("main loop exited!\n");
     exit(1);
 }

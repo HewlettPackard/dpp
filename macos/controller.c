@@ -457,7 +457,7 @@ new_connection (int fd, void *data)
             /*
              * responder and non-mutual...
              */
-            if ((conv->handle = dpp_create_peer(NULL, 0, 0)) < 1) {
+            if ((conv->handle = dpp_create_peer(NULL, 0, 0, 0)) < 1) {
                 goto fail;
             }
             if (process_dpp_auth_frame((unsigned char *)dpp, framesize-1, conv->handle) < 0) {
@@ -500,7 +500,7 @@ new_connection (int fd, void *data)
                     /* 
                      * if so, initiator and try mutual (responder decides anyway)
                      */
-                    if ((conv->handle = dpp_create_peer((unsigned char *)&pkey[0], 1, 1)) < 1) {
+                    if ((conv->handle = dpp_create_peer((unsigned char *)&pkey[0], 1, 1, 0)) < 1) {
                         fclose(fp);
                         goto fail;
                     }
@@ -545,6 +545,11 @@ change_channel (unsigned char *blah, unsigned char foo, unsigned char bar)
 }
 
 int change_dpp_channel (dpp_handle handle, unsigned char foo, unsigned char bar)
+{
+    return 1;
+}
+
+int change_dpp_freq (dpp_handle handle, unsigned char foo)
 {
     return 1;
 }
@@ -647,7 +652,7 @@ bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
         fprintf(stderr, "unable to write message to relay at %s\n", relay);
         goto fail;
     }
-    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
+    if ((conv->handle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
         goto fail;
     }
 
@@ -836,7 +841,7 @@ main (int argc, char **argv)
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
                            signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                           NULL, 0, 0, 0, debug) < 0) {
+                           NULL, 0, NULL, 0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }

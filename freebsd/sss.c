@@ -50,10 +50,13 @@
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_freebsd.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include "ieee802_11.h"
 #include "service.h"
 #include "dpp.h"
 #include "pkex.h"
+#include "tlv.h"
 #include "radio.h"
 
 struct interface {
@@ -73,6 +76,8 @@ struct dpp_instance {
     unsigned char peermac[ETH_ALEN];
 };
 TAILQ_HEAD(foo, dpp_instance) dpp_instances;
+
+#define WIRELESS_MTU    1300
 
 service_context srvctx;
 static int discovered = -1;
@@ -174,7 +179,7 @@ create_dpp_instance (unsigned char *mymac, unsigned char *peermac, unsigned char
     }
     memcpy(instance->mymac, mymac, ETH_ALEN);
     memcpy(instance->peermac, peermac, ETH_ALEN);
-    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth)) < 1) {
+    if ((instance->handle = dpp_create_peer(bskey, is_initiator, mauth, WIRELESS_MTU)) < 1) {
         free(instance);
         return NULL;
     }
@@ -207,11 +212,17 @@ bpf_in (int fd, void *data)
     struct dpp_instance *instance;
     char el_id, el_len, ssid[33];
     unsigned char buf[2048], *ptr, *els, pmk[PMK_LEN], pmkid[PMKID_LEN];
+    unsigned char mac[20], keyasn1[1024], keyhash[SHA256_DIGEST_LENGTH];
+    unsigned int mdlen = SHA256_DIGEST_LENGTH;
     struct bpf_hdr *hdr;
     struct ieee80211_mgmt_frame *frame;
     unsigned short frame_control;
-    int type, stype, len, framesize, left;
+    int type, stype, len, framesize, left, ret, opclass, channel, asn1len;
+    char pkey[200];
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    TLV *rhash;
+    FILE *fp;
+    EVP_MD_CTX *mdctx;
 
     if ((len = read(fd, buf, sizeof(buf))) < 0) {
         fprintf(stderr, "can't read off bpf socket!\n");
@@ -256,7 +267,13 @@ bpf_in (int fd, void *data)
          */
         if (memcmp(frame->da, inf->bssid, ETH_ALEN) &&
             memcmp(frame->da, broadcast, ETH_ALEN)) {
-            return;
+            if (inf->is_loopback) {
+                fprintf(stderr, "weirdness on the loopback, shouldn't see frame from " MACSTR " to " MACSTR "\n",
+                        MAC2STR(inf->bssid), MAC2STR(frame->sa));
+            }
+            len -= BPF_WORDALIGN(hdr->bh_hdrlen + hdr->bh_caplen);
+            ptr += BPF_WORDALIGN(hdr->bh_hdrlen + hdr->bh_caplen);
+            continue;
         }
 
         frame_control = ieee_order(frame->frame_control);
@@ -270,6 +287,7 @@ bpf_in (int fd, void *data)
                      * if it's not a public action frame then we don't care about it!
                      */
                     if (frame->action.category != ACTION_PUBLIC) {
+                        fprintf(stderr, "got a non-public action frame\n");
                         return;
                     }
                     left = framesize - (IEEE802_11_HDR_LEN + sizeof(frame->action));
@@ -351,7 +369,43 @@ bpf_in (int fd, void *data)
                                     }
                                     break;
                                 case DPP_CHIRP:
-                                    fprintf(stderr, "got a chirp... not really my thing\n");
+                                    fprintf(stderr, "got a chirp... \n");
+                                    if ((rhash = find_tlv(RESPONDER_BOOT_HASH, dpp->attributes, left)) == NULL) {
+                                        fprintf(stderr, "malformed though\n");
+                                        return;
+                                    }
+                                    if ((fp = fopen(bootstrapfile, "r")) == NULL) {
+                                        return;
+                                    }
+                                    if ((mdctx = EVP_MD_CTX_new()) == NULL) {
+                                        fclose(fp);
+                                        return;
+                                    }
+                                    while (!feof(fp)) {
+                                        memset(pkey, 0, sizeof(pkey));
+                                        if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, pkey) < 0) {
+                                            continue;
+                                        }
+                                        if ((asn1len = EVP_DecodeBlock(keyasn1, (unsigned char *)pkey, strlen(pkey))) < 0) {
+                                            continue;
+                                        }
+                                        fprintf(stderr, "checking %d...", ret);
+                                        EVP_DigestInit(mdctx, EVP_sha256());
+                                        EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
+                                        EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
+                                        EVP_DigestFinal(mdctx, keyhash, &mdlen);
+                                        /*
+                                         * if we have that bootstrap key, initiate to her!
+                                         */
+                                        if (memcmp(keyhash, TLV_value(rhash), SHA256_DIGEST_LENGTH) == 0) {
+                                            fprintf(stderr, "YES!!!\n");
+                                            create_dpp_instance(inf->bssid, frame->sa, pkey, 1, 0);
+                                            break;
+                                        } else {
+                                            fprintf(stderr, "no\n");
+                                        }
+                                    }
+                                    fclose(fp);
                                     break;
                                 default:
                                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -377,7 +431,7 @@ bpf_in (int fd, void *data)
                             }
                             break;
                         default:
-//                            fprintf(stderr, "weird action field (%x)\n", frame->action.field);
+                            fprintf(stderr, "weird action field (%x)\n", frame->action.field);
                             break;
                     }
                     break;
@@ -483,8 +537,8 @@ cons_action_frame (unsigned char field,
     } else {
         frame = (struct ieee80211_mgmt_frame *)buf;
     }
-    printf("sending acton frame from " MACSTR " to " MACSTR "\n", 
-           MAC2STR(mymac), MAC2STR(peermac));
+    printf("sending %d byte action frame from " MACSTR " to " MACSTR "\n", 
+           len, MAC2STR(mymac), MAC2STR(peermac));
     /*
      * fill in the action frame header
      */
@@ -1216,7 +1270,7 @@ main (int argc, char **argv)
     struct ieee80211req ireq;
     struct ifmediareq ifmreq;
     char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
-    char *cruft, identifier[80], pkexinfo[80];
+    char *cruft, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     char *ptr, *endptr;
     size_t needed;
@@ -1242,8 +1296,9 @@ main (int argc, char **argv)
     mediaopt = RADIO_ADHOC;
 
     memset(mudurl, 0, 80);
+    memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:t");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:");
         if (c < 0) {
             break;
         }
@@ -1265,6 +1320,9 @@ main (int argc, char **argv)
                 break;
             case 'n':           /* pkex identifier */
                 strcpy(identifier, optarg);
+                break;
+            case 'w':
+                strcpy(caip, optarg);
                 break;
             case 'd':           /* debug */
                 debug = atoi(optarg);
@@ -1347,6 +1405,7 @@ main (int argc, char **argv)
                         "\t-s  change opclass/channel to what was set with -f and -g\n"
                         "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-t  send DPP chirps (responder only)\n"
+                        "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -1541,7 +1600,8 @@ main (int argc, char **argv)
             opclass = 0;
         }
         if (dpp_initialize(config_or_enroll, keyfile, 
-                           signkeyfile, enrollee_role, mudurl, chirp, opclass, channel, debug) < 0) {
+                           signkeyfile, enrollee_role, mudurl, chirp, caip,
+                           opclass, channel, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);
         }

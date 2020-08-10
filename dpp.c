@@ -47,6 +47,11 @@
 #include <sys/time.h>
 #include <sys/queue.h>
 #include <net/if.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/stack.h>
+#include <openssl/asn1.h>
+#include <openssl/safestack.h>
 #include <openssl/bn.h>
 #include <openssl/sha.h>
 #include <openssl/pem.h>
@@ -54,9 +59,11 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <openssl/conf.h>
 #include "ieee802_11.h"
 #include "aes_siv.h"
 #include "service.h"
+#include "talk2ca.h"
 #include "tlv.h"
 #include "hkdf.h"
 #include "os_glue.h"
@@ -65,12 +72,13 @@
 /*
  * DPP debugging bitmask
  */
-#define DPP_DEBUG_ERR           0x01
-#define DPP_DEBUG_PROTOCOL_MSG  0x02
-#define DPP_DEBUG_STATE_MACHINE 0x04
-#define DPP_DEBUG_CRYPTO        0x08
-#define DPP_DEBUG_CRYPTO_VERB   0x10
-#define DPP_DEBUG_TRACE         0x20
+#define DPP_DEBUG_ERR           0x0001
+#define DPP_DEBUG_PROTOCOL_MSG  0x0002
+#define DPP_DEBUG_STATE_MACHINE 0x0004
+#define DPP_DEBUG_CRYPTO        0x0008
+#define DPP_DEBUG_CRYPTO_VERB   0x0010
+#define DPP_DEBUG_TRACE         0x0020
+#define DPP_DEBUG_PKI           0x0040
 #define DPP_DEBUG_ANY           0xffff
 
 /*
@@ -85,7 +93,10 @@
 #define STATUS_INVALID_CONNECTOR        7
 #define STATUS_NO_MATCH                 8
 #define STATUS_CONFIG_REJECTED          9
-#define STATUS_CONFIGURE_PENDING        10
+#define STATUS_NO_AP                    10
+#define STATUS_CONFIGURE_PENDING        11
+#define STATUS_CSR_NEEDED               12
+#define STATUS_CSR_BAD                  13
 
 /*
  * DPP roles
@@ -113,7 +124,7 @@ TAILQ_HEAD(fubar, chirpdest) chirpdests;
 
 struct cpolicy {
     TAILQ_ENTRY(cpolicy) entry;
-    char akm[4];        // "psk" or "sae" or "dpp"
+    char akm[10];        // "psk" or "sae" or "dpp"
     char password[80];  // no hex, password only
     char ssid[33];
 };
@@ -139,6 +150,9 @@ struct candidate {
 #define DPP_AWAITING            7       /* the responder's state */    
 #define DPP_AUTHENTICATING      8
 #define DPP_AUTHENTICATED       9
+#define DPP_PROVISIONING        10
+#define DPP_CA_RESP_PENDING     11
+#define DPP_PROVISIONED         12
     unsigned short state;
     BIGNUM *m;
     unsigned char core;                 /* configurator or enrollee for this time */
@@ -146,14 +160,15 @@ struct candidate {
     int mauth;                          /* mutual authentication (1) or not (0) */
     unsigned char k1[SHA512_DIGEST_LENGTH];
     unsigned char k2[SHA512_DIGEST_LENGTH];
+    unsigned char bk[SHA512_DIGEST_LENGTH];
     unsigned char ke[SHA512_DIGEST_LENGTH];
     unsigned char peernonce[SHA512_DIGEST_LENGTH/2];
     unsigned char mynonce[SHA512_DIGEST_LENGTH/2];
-    unsigned char buffer[4096];         /* can be fragmented during config exchange */
+    unsigned char buffer[8192];         /* can be fragmented during config exchange */
     int bufferlen;
     unsigned char retrans;
-#define WIRELESS_MTU    1300            /* play with fragmentation */
-    unsigned char frame[WIRELESS_MTU + 40];
+    int mtu;
+    unsigned char *frame;
     int framelen;
     /*
      * dpp config stuff
@@ -161,6 +176,10 @@ struct candidate {
     int nextfragment;
     char enrollee_name[80];
     char enrollee_role[10];
+    char *p7;
+    int p7len;
+    char *csrattrs;
+    int csrattrs_len;
     unsigned char field;
     unsigned char enonce[SHA512_DIGEST_LENGTH/2];
 };
@@ -188,13 +207,35 @@ struct _dpp_instance {
     char newoc;                 /* switch to this new operating class after sending DDP Auth Req */
     char newchan;               /* swithc to this new channel after sending DPP Auth Req */
     char enrollee_role[10];     /* role for an enrollee */
+    int enterprise;             /* whether configurator provisions enterprise credentials */
     char mudurl[80];            /* MUD URL for an enrollee */
     int group_num;              /* these are handy to keep around */
     int primelen;               /* and not have to continually */
     int digestlen;              /* compute them from "bootstrap" */
     int noncelen;
     int nid;                    /* ditto */
+    char caip[40];
+    char *cacert;
+    int cacert_len;
 } dpp_instance;
+
+/*
+ * a linked list of values extracted from an ASN.1 SET for a given attribute
+ */
+typedef struct setval_t {
+    struct setval_t *next;
+    enum {
+        SETVAL_ERROR, SETVAL_NID, SETVAL_STR, SETVAL_INT,
+        SETVAL_OCTSTR, SETVAL_BITSTR
+    } type;
+    union {
+        int nid;
+        unsigned char *str;
+        int integer;
+        unsigned char *octstr;
+        unsigned char *bitstr;
+    };
+} setval;
 
 /*
  * forward reference
@@ -321,7 +362,7 @@ debug_asn1_ec(int level, char *str, EC_KEY *key, int b64it)
 {
     unsigned char *asn1, data[1024];
     int asn1len, i, num;
-    BIO *bio, *bout;
+    BIO *bio = NULL, *bout = NULL;
 
     if (debug & level) {
         if ((bio = BIO_new(BIO_s_mem())) == NULL) {
@@ -478,7 +519,7 @@ next_dpp_chirp (timerid id, void *data)
         /*
          * we ran through the chirp list so wait 30s and do it all over again
          */
-        printf("exhausted chirp list, wait a bit and try again\n");
+        dpp_debug(DPP_DEBUG_TRACE, "exhausted chirp list, wait a bit and try again\n");
         peer->t0 = srv_add_timeout(srvctx, SRV_SEC(30), start_dpp_chirp, peer);
         return;
     }
@@ -570,6 +611,7 @@ destroy_peer (timerid id, void *data)
     EC_POINT_clear_free(peer->peer_proto);
     EC_KEY_free(peer->peer_bootstrap);
     BN_free(peer->m);
+    free(peer->frame);
     /*
      * zero out our secrets and other goo
      */
@@ -630,10 +672,13 @@ retransmit_config (timerid id, void *data)
     if (peer->retrans > 5) {
         dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "too many retransmits, bailing!\n");
         fail_dpp_peer(peer);
-    } else if (transmit_config_frame(peer->handle, peer->field, peer->frame, peer->framelen)) {
-        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "retransmitting...for the %d time\n", peer->retrans);
-        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+    } else {
         peer->retrans++;
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "retransmitting %d byte frame config frame...for the %d time\n",
+                  peer->framelen, peer->retrans);
+        if (transmit_config_frame(peer->handle, peer->field, peer->frame, peer->framelen)) {
+            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
+        }
     }
     return;
 }
@@ -651,6 +696,11 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
     gas_action_comeback_resp_frame *gacresp;
     gas_action_comeback_req_frame *gacreq;
     
+    dpp_debug(DPP_DEBUG_TRACE, "sending a %s dpp config frame\n", 
+              field == GAS_INITIAL_REQUEST ? "GAS_INITIAL_REQUEST" : \
+              field == GAS_INITIAL_RESPONSE ? "GAS_INITIAL_RESPONSE" : \
+              field == GAS_COMEBACK_REQUEST ? "GAS_COMEBACK_REQUEST" : \
+              field == GAS_COMEBACK_RESPONSE ? "GAS_COMEBACK_RESPONSE" : "unknown");
     switch (field) {
         case GAS_INITIAL_REQUEST:
             /*
@@ -669,7 +719,7 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
             peer->framelen = peer->bufferlen + sizeof(gas_action_req_frame);
             break;
         case GAS_INITIAL_RESPONSE:
-            if (peer->bufferlen > WIRELESS_MTU) {
+            if ((peer->bufferlen > peer->mtu) || (peer->state == DPP_CA_RESP_PENDING)) {
                 /*
                  * fill in the generic header goo
                  */
@@ -679,10 +729,17 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
                 memcpy(garesp->ad_proto_elem, dpp_proto_elem_resp, sizeof(dpp_proto_elem_resp));
                 memcpy(garesp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id));
                 /*
-                 * comback delay of 1 indicates fragmentation and we send back a 0 length response
+                 * comeback delay of 1 indicates fragmentation and we send back a 0 length response
+                 * comeback delay of 1000 indicates a real "come back later"
                  */
                 garesp->status_code = 0;       // success!
-                garesp->comeback_delay = 1;
+                if (peer->state == DPP_CA_RESP_PENDING) {
+                    garesp->comeback_delay = 1000;
+                    dpp_debug(DPP_DEBUG_TRACE, "\t(still waiting for PKCS7, comeback in 1000 TUs)\n");
+                } else {
+                    garesp->comeback_delay = 1;
+                    dpp_debug(DPP_DEBUG_TRACE, "\t(sending 1st fragment)\n");
+                }
                 garesp->query_resplen = 0;
                 peer->field = field;
                 peer->framelen = sizeof(gas_action_resp_frame);
@@ -694,6 +751,7 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
                 garesp->dialog_token = peer->dialog_token;
                 garesp->status_code = 0; // success! 
                 garesp->comeback_delay = 0;
+                dpp_debug(DPP_DEBUG_TRACE, "\t(sending whole message)\n");
                 memcpy(garesp->ad_proto_elem, dpp_proto_elem_resp, sizeof(dpp_proto_elem_resp));
                 memcpy(garesp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id));
 
@@ -709,21 +767,38 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
             memcpy(gacresp->ad_proto_elem, dpp_proto_elem_resp, sizeof(dpp_proto_elem_resp));
             memcpy(gacresp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id));
             gacresp->status_code = 0;           // success!
-            gacresp->comeback_delay = 0;
-            /*
-             * fill in the fragment number (+1 because it starts at 1 and nextfrag starts at 0)
-             * record how big the next chunk will be
-             */
-            gacresp->fragment_id = peer->nextfragment/WIRELESS_MTU;
-            if ((peer->bufferlen - peer->nextfragment) > WIRELESS_MTU) {
-                gacresp->query_resplen = WIRELESS_MTU;
-                gacresp->fragment_id |= 0x80;   // more fragments!
+            if (peer->state == DPP_CA_RESP_PENDING) {
+                /*
+                 * just keep telling the peer to wait
+                 */
+                dpp_debug(DPP_DEBUG_TRACE, "\t(still don't have PKCS7, come back in 1000 TUs)\n");
+                gacresp->comeback_delay = 1000;
+                gacresp->fragment_id = 0;
+                gacresp->query_resplen = 0;
             } else {
-                gacresp->query_resplen = peer->bufferlen - peer->nextfragment;
+                /*
+                 * we're just fragmenting our response...
+                 *
+                 * fill in the fragment number (+1 because it starts at 1 and nextfrag starts at 0)
+                 * record how big the next chunk will be
+                 */
+                gacresp->comeback_delay = 0;
+                gacresp->fragment_id = peer->nextfragment/peer->mtu;
+                if ((peer->bufferlen - peer->nextfragment) > peer->mtu) {
+                    gacresp->query_resplen = peer->mtu;
+                    gacresp->fragment_id |= 0x80;   // more fragments!
+                    dpp_debug(DPP_DEBUG_TRACE, "\t(next fragment of %d (%d), there are more...\n",
+                              gacresp->query_resplen, gacresp->fragment_id);
+                } else {
+                    gacresp->query_resplen = peer->bufferlen - peer->nextfragment;
+                    dpp_debug(DPP_DEBUG_TRACE, "\t(final fragment of %d (%d)...\n",
+                              gacresp->query_resplen, gacresp->fragment_id);
+		    print_buffer("First 32 octets of message", peer->buffer+peer->nextfragment, 32);
+                }
+                memcpy(gacresp->query_resp, peer->buffer + peer->nextfragment, gacresp->query_resplen);
+                peer->nextfragment += gacresp->query_resplen;
+                peer->field = field;
             }
-            memcpy(gacresp->query_resp, peer->buffer + peer->nextfragment, gacresp->query_resplen);
-            peer->nextfragment += gacresp->query_resplen;
-            peer->field = field;
             peer->framelen = gacresp->query_resplen + sizeof(gas_action_comeback_resp_frame);
             break;
         case GAS_COMEBACK_REQUEST:
@@ -735,11 +810,6 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
         default:
             return  -1;
     }
-    dpp_debug(DPP_DEBUG_TRACE, "sending a %s dpp config frame\n", 
-              field == GAS_INITIAL_REQUEST ? "GAS_INITIAL_REQUEST" : \
-              field == GAS_INITIAL_RESPONSE ? "GAS_INITIAL_RESPONSE" : \
-              field == GAS_COMEBACK_REQUEST ? "GAS_COMEBACK_REQUEST" : \
-              field == GAS_COMEBACK_RESPONSE ? "GAS_COMEBACK_RESPONSE" : "unknown");
     ret = transmit_config_frame(peer->handle, field, peer->frame, peer->framelen);
     return ret;
 }
@@ -785,7 +855,7 @@ send_dpp_discovery_frame (unsigned char frametype, unsigned char status,
 {
     TLV *tlv;
     dpp_action_frame *frame;
-    unsigned char framebuf[WIRELESS_MTU + 40];
+    unsigned char framebuf[1024];  // not gonna fragment a discovery frame
     unsigned char buffer[4096];
     int bufferlen;
 
@@ -1063,7 +1133,1054 @@ process_dpp_discovery_frame (unsigned char *data, int len, unsigned char transac
 }
 
 //----------------------------------------------------------------------
-// DPP configuration exchange routines
+// cert and enterprise credential routines
+//----------------------------------------------------------------------
+
+/*
+ * certificate_verify_callback()
+ *      - explain the status of an X509 verification, we don't overrule the
+ *        result, just report what happened.
+ */
+static int
+certificate_verify_callback (int pre_verify_ok, X509_STORE_CTX *sctx)
+{
+    X509 *x509;
+    char buf[80];
+    
+    if (!pre_verify_ok) {
+        if ((x509 = X509_STORE_CTX_get_current_cert(sctx)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "certificate store verify error %s\n",
+                      X509_verify_cert_error_string(X509_STORE_CTX_get_error(sctx)));
+        } else {
+            dpp_debug(DPP_DEBUG_ERR, "error '%s' with certificate issued to ", 
+                      X509_verify_cert_error_string(X509_STORE_CTX_get_error(sctx)));
+            X509_NAME_oneline(X509_get_subject_name(x509), buf, sizeof(buf));
+            dpp_debug(DPP_DEBUG_ERR, "%s, issued by ", buf);
+            X509_NAME_oneline(X509_get_issuer_name(x509), buf, sizeof(buf));
+            dpp_debug(DPP_DEBUG_ERR, "%s\n", buf);
+        }
+    } else {
+        if ((x509 = X509_STORE_CTX_get_current_cert(sctx)) != NULL) {
+            dpp_debug(DPP_DEBUG_PKI, "successful validation ('%s') of certificate issued to ", 
+                      X509_verify_cert_error_string(X509_STORE_CTX_get_error(sctx)));
+            X509_NAME_oneline(X509_get_subject_name(x509), buf, sizeof(buf));
+            dpp_debug(DPP_DEBUG_PKI, "%s, issued by ", buf);
+            X509_NAME_oneline(X509_get_issuer_name(x509), buf, sizeof(buf));
+            dpp_debug(DPP_DEBUG_PKI, "%s\n", buf);
+        }
+    }
+    return pre_verify_ok;
+}
+
+/*
+ * extract X509 certificates out of a PKCS7 bag o'certs
+ */
+void
+extract_certs (char *bag, int len, char *cacert, int cacert_len)
+{
+    PKCS7 *p7 = NULL, *cap7 = NULL;
+    X509_STORE *store = NULL;
+    X509 *x509 = NULL;
+    STACK_OF(X509) *certs = NULL, *cacerts = NULL;
+    EVP_ENCODE_CTX *ectx = NULL;
+    X509_STORE_CTX *sctx = NULL;
+    BIO *bio = NULL;
+    unsigned char *asn1 = NULL;
+    char fname[20];
+    int i, asn1len, nid;
+
+    if (bag == NULL || len < 1) {
+        return;
+    }
+    if ((ectx = EVP_ENCODE_CTX_new()) == NULL) {
+        return;
+    }
+    /*
+     * if we got a CA cert then decode that
+     */
+    if ((cacert != NULL) && (cacert_len > 0)) {
+        free(asn1);
+        if ((asn1 = (unsigned char *)malloc(cacert_len)) == NULL) {
+            goto fin;
+        }
+        i = cacert_len;
+        EVP_DecodeInit(ectx);
+        (void)EVP_DecodeUpdate(ectx, asn1, &i, (unsigned char *)cacert, cacert_len);
+        asn1len = i;
+        (void)EVP_DecodeFinal(ectx, &(asn1[i]), &i);
+        asn1len += i;
+
+        if ((bio = BIO_new_mem_buf(asn1, asn1len)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot create bio to get X509 from CA cert blob\n");
+            goto fin;
+        }
+        if ((cap7 = d2i_PKCS7_bio(bio, NULL)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot extract X509 from CA cert blob\n");
+            goto fin;
+        }
+        BIO_free(bio); bio = NULL;
+        free(asn1);
+        
+        nid = OBJ_obj2nid(cap7->type);
+        switch (nid) {
+            case NID_pkcs7_signed:
+                cacerts = cap7->d.sign->cert;
+                break;
+            case NID_pkcs7_signedAndEnveloped:
+                cacerts = cap7->d.signed_and_enveloped->cert;
+                break;
+            default:
+                dpp_debug(DPP_DEBUG_ERR, "don't know how to handle this type (%d) of p7!\n", nid);
+                goto fin;
+        }
+        dpp_debug(DPP_DEBUG_PKI, "got a CA certs p7 with %d certs in it\n", sk_X509_num(cacerts));
+    }
+    /*
+     * decode the p7 with our cert in it...
+     */
+    if ((asn1 = (unsigned char *)malloc(len)) == NULL) {
+        goto fin;
+    }
+    i = len;
+    EVP_DecodeInit(ectx);
+    (void)EVP_DecodeUpdate(ectx, asn1, &i, (unsigned char *)bag, len);
+    asn1len = i;
+    (void)EVP_DecodeFinal(ectx, &(asn1[i]), &i);
+    asn1len += i;
+
+    if ((bio = BIO_new_mem_buf(asn1, asn1len)) == NULL) {
+        goto fin;
+    }
+    if ((p7 = d2i_PKCS7_bio(bio, NULL)) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "cannot extract PKCS7 from p7 blob!\n");
+        goto fin;
+    }
+    BIO_free(bio); bio = NULL;
+
+    /*
+     * the location of the certs depends on the type of PKCS7
+     */
+    nid = OBJ_obj2nid(p7->type);
+    switch (nid) {
+        case NID_pkcs7_signed:
+            certs = p7->d.sign->cert;
+            break;
+        case NID_pkcs7_signedAndEnveloped:
+            certs = p7->d.signed_and_enveloped->cert;
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "don't know how to handle this type (%d) of p7!\n", nid);
+            goto fin;
+    }
+    dpp_debug(DPP_DEBUG_PKI, "got a p7 with %d certs in it\n", sk_X509_num(certs));
+    
+    if ((certs != NULL) &&
+        ((store = X509_STORE_new()) != NULL) &&
+        ((sctx = X509_STORE_CTX_new()) != NULL)) {
+
+        /*
+         * insert ourselves into the verification check chain
+         */
+        X509_STORE_set_verify_cb(store, certificate_verify_callback);
+        /*
+         * go through all the certs and find a self-signed one, make it the root
+         * and stick ourselves into the process to get a notice of verification errors
+         */
+        for (i = 0; i < sk_X509_num(certs); i++) {
+            if (X509_check_issued(sk_X509_value(certs, i),
+                                  sk_X509_value(certs, i)) == X509_V_OK) {
+                X509_STORE_add_cert(store, sk_X509_value(certs,i));
+                break;
+            }
+        }
+        if (i == sk_X509_num(certs)) {
+            dpp_debug(DPP_DEBUG_PKI, "no self-signed cert in PKCS7 bag o'certs\n");
+        }
+        /*
+         * be as generous as possible in interpreting what we got...
+         * add self-signed certs from the CA p7 into the store as well in
+         * case that's the trust root needed to validate our received cert
+         */
+        if (cacerts != NULL) {
+            dpp_debug(DPP_DEBUG_PKI, "adding certs from CA p7 to store...\n");
+            for (i = 0; i < sk_X509_num(cacerts); i++) {
+                if (X509_check_issued(sk_X509_value(cacerts, i),
+                                      sk_X509_value(cacerts, i)) == X509_V_OK) {
+                    X509_STORE_add_cert(store, sk_X509_value(cacerts,i));
+                    snprintf(fname, sizeof(fname), "cacert%d.pem", i);
+                    if ((bio = BIO_new_file(fname, "w+")) == NULL) {
+                        dpp_debug(DPP_DEBUG_ERR, "unable to save CA certificate to %s\n", fname);
+                    } else {
+                        PEM_write_bio_X509(bio, sk_X509_value(cacerts,i));
+                    }
+                    BIO_free(bio); bio = NULL;
+                }
+            }
+        }
+        for (i = 0; i < sk_X509_num(certs); i++) {
+            /*
+             * go through each certificate in the chain....
+             */
+            dpp_debug(DPP_DEBUG_TRACE, "checking certificate %d\n", i);
+            if (!X509_STORE_CTX_init(sctx, store, NULL, certs)) {
+                dpp_debug(DPP_DEBUG_ERR, "can't initialize STORE_CTX!\n");
+                break;
+            }
+            x509 = sk_X509_value(certs, i);
+
+//            X509_NAME_oneline(X509_get_subject_name(x509), buf, sizeof(buf));
+//            dpp_debug(DPP_DEBUG_TRACE, "cert %d is for %s, ", i, buf);
+//            X509_NAME_oneline(X509_get_issuer_name(x509), buf, sizeof(buf));
+//            dpp_debug(DPP_DEBUG_TRACE, "issued by %s\n", buf);
+
+            X509_STORE_CTX_set_cert(sctx, x509);
+            /*
+             * if the cert verifies then save it
+             */
+            if (X509_verify_cert(sctx) > 0) {
+                dpp_debug(DPP_DEBUG_PKI, "certificate %d verified!\n", i);
+            } else {
+                dpp_debug(DPP_DEBUG_PKI, "certificate %d did not verify\n", i);
+            }
+            snprintf(fname, sizeof(fname), "mycert%d.pem", i);
+            if ((bio = BIO_new_file(fname, "w+")) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to save certificate to %s\n", fname);
+                break;
+            }
+            PEM_write_bio_X509(bio, x509);
+            BIO_free(bio); bio = NULL;
+            X509_free(x509);
+        }
+    }
+fin:
+    if (p7 != NULL) {
+        PKCS7_free(p7);
+    }
+    if (cap7 != NULL) {
+        PKCS7_free(cap7);
+    }
+    if (asn1 != NULL) {
+        free(asn1);
+    }
+    if (store != NULL) {
+        X509_STORE_free(store);
+    }
+    if (sctx != NULL) {
+        X509_STORE_CTX_free(sctx);
+    }
+    if (bio != NULL) {
+        BIO_free(bio);
+    }
+    if (ectx != NULL) {
+        EVP_ENCODE_CTX_free(ectx);
+    }
+}
+
+/*
+ * send out a base64-encoded DER encoded CSR Attributes SEQUENCE
+ */
+static int
+gen_csrattrs (char *resp)
+{
+    ASN1_TYPE *asn1 = NULL; 
+    CONF *cnf = NULL;
+    long err;
+    ASN1_OBJECT *o = NULL;
+    STACK_OF(ASN1_OBJECT) *sk = NULL;
+    BIO *bio = NULL, *b64 = NULL;
+    unsigned char *buf = NULL, *data;
+    char *str; 
+    unsigned char *p;
+    int i, objlen, totlen = 0, num = -1;
+    
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        goto fail;
+    }
+    if ((b64 = BIO_new((BIO_METHOD *)BIO_f_base64())) == NULL) {
+        goto fail;
+    }
+    bio = BIO_push(b64, bio);
+
+    cnf = NCONF_new(NULL);
+    if ((NCONF_load(cnf, "csrattrs.nconf", &err) != 0) &&
+        ((str = NCONF_get_string(cnf, "default", "asn1")) != NULL) &&
+        ((asn1 = ASN1_generate_nconf(str, cnf)) != NULL)) {
+        totlen = i2d_ASN1_TYPE(asn1, NULL);
+        i2d_ASN1_TYPE(asn1, (unsigned char **)&buf);
+    } else {
+        dpp_debug(DPP_DEBUG_TRACE, "failed to read csrattrs.nconf!\n");
+        /*
+         * if there's no csrattrs.conf or it parse wrongs just throw in the default
+         */
+        if ((sk = sk_ASN1_OBJECT_new_null()) == NULL) {
+            goto fail;
+        }
+        o = (ASN1_OBJECT *)OBJ_nid2obj(NID_pkcs9_challengePassword);
+        sk_ASN1_OBJECT_push(sk, o);
+        o = (ASN1_OBJECT *)OBJ_nid2obj(dpp_instance.nid);
+        sk_ASN1_OBJECT_push(sk, o);
+        objlen = 0;
+        for (i = sk_ASN1_OBJECT_num(sk)-1; i >= 0; i--) {
+            objlen += i2d_ASN1_OBJECT(sk_ASN1_OBJECT_value(sk, i), NULL);
+        }
+        totlen = ASN1_object_size(1, objlen, V_ASN1_SEQUENCE);
+        if ((buf = malloc(totlen + 1)) == NULL) {
+            goto fail;
+        }
+        memset(buf, 0, totlen+1);
+        p = (unsigned char *)buf;
+        ASN1_put_object(&p, 1, objlen, V_ASN1_SEQUENCE, V_ASN1_UNIVERSAL);
+        for (i = 0; i < sk_ASN1_OBJECT_num(sk); i++) {
+            i2d_ASN1_OBJECT(sk_ASN1_OBJECT_value(sk, i), &p);
+        }
+    }
+
+    BIO_write(bio, buf, totlen);
+    (void)BIO_flush(bio);
+    num = BIO_get_mem_data(bio, &data);
+    memcpy(resp, data, num);
+    resp[num] = '\0';
+    dpp_debug(DPP_DEBUG_TRACE, "adding %d byte CSR %s\n", num, resp);
+fail:    
+    if (buf != NULL) {
+        free(buf);
+    }
+    if (asn1 != NULL) {
+        ASN1_TYPE_free(asn1);
+    }
+    if (cnf != NULL) {
+        NCONF_free(cnf);
+    }
+    if (sk != NULL) {
+        sk_ASN1_OBJECT_free(sk);
+    }
+    if (bio != NULL) {
+        BIO_free(bio);          // will free up b64 too
+    }
+
+    return num;
+}
+
+/*
+ * free_setval()
+ *   - free up any memory allocated when parsing an attribute's SET
+ */
+void free_setval (setval *freeme)
+{
+    if (freeme == NULL) {
+        return;
+    }
+    if (freeme->next != NULL) {
+        free_setval(freeme->next);
+    }
+    if (freeme->type == SETVAL_STR) {
+        free(freeme->str);
+    }
+    if (freeme->type == SETVAL_OCTSTR) {
+        free(freeme->octstr);
+    }
+    if (freeme->type == SETVAL_BITSTR) {
+        free(freeme->bitstr);
+    }
+    free(freeme);
+    freeme = NULL;
+    return;
+}
+
+/*
+ * get_set()
+ *   - parse an ASN.1 SET an extract all the values in it
+ */
+static setval*
+get_set (const unsigned char **p, int len)
+{
+    unsigned char *ptr = (unsigned char *)*p, *op;
+    unsigned char *fin = (unsigned char *)(*p + len);
+    int inf, tag, xclass, hl;
+    long l, length;
+    ASN1_OBJECT *ao = NULL;
+    setval *ret = NULL, *next = NULL;
+    ASN1_INTEGER *ai = NULL;
+    ASN1_OCTET_STRING *os = NULL;
+
+    if (ptr == NULL) {
+        return NULL;
+    }
+    /*
+     * this assumes we've already parsed past a V_ASN1_SET
+     */
+    length = len;
+    while (ptr < fin) {
+//        dpp_debug(DPP_DEBUG_TRACE, "looping through SET, %d left\n", length);
+        op = ptr;
+//        debug_buffer(DPP_DEBUG_TRACE, "the SET", ptr, length);
+        inf = ASN1_get_object((const unsigned char **)&ptr, &l, &tag, &xclass, length);
+        if (inf & 0x80) {
+            dpp_debug(DPP_DEBUG_ERR, "bad object for SET!!!\n");
+            free_setval(ret);
+            return NULL;
+        }
+        hl = (ptr - op);
+//        dpp_debug(DPP_DEBUG_TRACE, "got object for SET (hl = %d)\n", hl);
+
+        /*
+         * it's a linked list of setvals...
+         */
+        if (ret == NULL) {
+            if ((ret = (setval *)malloc(sizeof(setval))) == NULL) {
+                return NULL;
+            }
+            ret->type = SETVAL_ERROR;
+            ret->next = NULL;
+            next = ret;
+        } else {
+            if ((next->next = (setval *)malloc(sizeof(setval))) == NULL) {
+                free_setval(ret);
+                return NULL;
+            }
+            next = next->next;
+            next->type = SETVAL_ERROR;
+            next->next = NULL;
+        }
+        /*
+         * ...fill it in according to the tag
+         */
+        if (tag == V_ASN1_OBJECT) {
+            ptr = op;
+//            debug_buffer(DPP_DEBUG_TRACE, "found ASN1_OBJECT", ptr, length);
+            d2i_ASN1_OBJECT(&ao, (const unsigned char **)&ptr, length);
+            next->type = SETVAL_NID;
+            next->nid = OBJ_obj2nid(ao);
+            ASN1_OBJECT_free(ao);
+//            dpp_debug(DPP_DEBUG_TRACE, "found an ASN1 OBJECT, nid = %d\n", next->nid);
+            ao = NULL;
+        } else if ((tag == V_ASN1_PRINTABLESTRING) ||
+                   (tag == V_ASN1_T61STRING) ||
+                   (tag == V_ASN1_IA5STRING) ||
+                   (tag == V_ASN1_VISIBLESTRING) ||
+                   (tag == V_ASN1_NUMERICSTRING) ||
+                   (tag == V_ASN1_UTF8STRING) ||
+                   (tag == V_ASN1_UTCTIME) ||
+                   (tag == V_ASN1_GENERALIZEDTIME)) {
+//            debug_buffer(DPP_DEBUG_TRACE, "found a STRING", ptr, l);
+            next->type = SETVAL_STR;
+            if ((next->str = (unsigned char *)malloc(l + 1)) == NULL) {
+                free_setval(ret);
+                return NULL;
+            }
+            memset(next->str, 0, l+1);
+            memcpy(next->str, ptr, l);
+            ptr += l;
+        } else if (tag == V_ASN1_INTEGER) {
+            ptr = op;
+//            debug_buffer(DPP_DEBUG_TRACE, "found a INTEGER", ptr, length);
+            d2i_ASN1_UINTEGER(&ai, (const unsigned char **)&ptr, length);
+            next->type = SETVAL_INT;
+            next->integer = ASN1_INTEGER_get(ai);
+            ASN1_INTEGER_free(ai);
+            ai = NULL;
+        } else if (tag == V_ASN1_OCTET_STRING) {
+            ptr = op;
+//            debug_buffer(DPP_DEBUG_TRACE, "found a OCTET STRING", ptr, l+hl);
+            os = d2i_ASN1_OCTET_STRING(NULL, (const unsigned char **)&ptr, l+hl);
+            if ((os != NULL) && (os->length > 0)) {
+                next->type = SETVAL_OCTSTR;
+                if ((next->octstr = (unsigned char *)malloc(os->length)) == NULL) {
+                    free_setval(ret);
+                    return NULL;
+                }
+                memset(next->octstr, 0, os->length);
+                memcpy(next->octstr, os->data, os->length);
+            }
+            if (os != NULL) {
+                ASN1_STRING_free(os);
+            }
+            os = NULL;
+            ptr += l;
+        }
+    }
+    if (ret->type == SETVAL_ERROR) {
+        free_setval(ret);
+        ret = NULL;
+    }
+    return ret;
+}
+
+/*
+ * generate a PKCS#10 certificate signing request 
+ */
+static int
+generate_csr (struct candidate *peer, char **csr)
+{
+    int i, challp_len, pkey_id, tag, xclass, inf, asn1len, csrlen = -1;
+    int nid, keylen = 2048, crypto_nid;
+    const EVP_MD *md = EVP_sha256();
+    const unsigned char *tot, *op;
+    unsigned char *savep;
+    unsigned char *p, challp[88], cp[64];       /* 88 is base64 of 64 */
+    char whoami[20];
+    BIO *bio = NULL;
+    ASN1_OBJECT *o = NULL;
+    const EVP_PKEY_ASN1_METHOD *ameth;
+    EVP_PKEY_CTX *pkeyctx = NULL;
+    EVP_PKEY *tmp = NULL, *key = NULL;
+    EC_GROUP *group = NULL;
+    EC_KEY *ec = NULL;
+    X509_NAME *subj = NULL;
+    X509_REQ *req = NULL;
+    long len, length;
+    EVP_ENCODE_CTX *ctx;
+    setval *values, *value;
+    STACK_OF(X509_EXTENSION) *exts = NULL;
+    STACK_OF(ASN1_OBJECT) *sk = NULL;
+    X509_EXTENSION *ex = NULL;
+
+    if (peer->csrattrs == NULL) {
+        *csr = NULL;
+        return -1;
+    }
+
+    /*
+     * start off assuming it's the protocol key
+     */
+    crypto_nid = dpp_instance.nid;
+    md = dpp_instance.hashfcn;
+
+    /*
+     * start constructing the X509_REQ 
+     */
+    if (((req = X509_REQ_new()) == NULL) ||
+        (!X509_REQ_set_version(req, 0L))) {
+        dpp_debug(DPP_DEBUG_ERR, "cannot create a CSR!\n");
+        return -1;
+    }
+    gethostname(whoami, sizeof(whoami));
+    subj = X509_REQ_get_subject_name(req);
+    if (!X509_NAME_add_entry_by_txt(subj, "commonName", MBSTRING_ASC,
+                                    (unsigned char *)whoami, -1, -1, 0)) {
+        dpp_debug(DPP_DEBUG_ERR, "cannot add common name %s\n", whoami);
+        return -1;
+    }
+
+    /*
+     * generate the challengePassword goo
+     */
+    hkdf_expand(dpp_instance.hashfcn,
+                peer->bk, dpp_instance.digestlen,
+                (unsigned char *)"CSR challengePassword", strlen("CSR challengePassword"),
+                cp, 64);
+    challp_len = EVP_EncodeBlock(challp, cp, 64);
+    dpp_debug(DPP_DEBUG_TRACE, "adding %d byte challengePassword\n", challp_len);
+    /*
+     * add the challenge password to the CSR
+     */
+    X509_REQ_add1_attr_by_NID(req, NID_pkcs9_challengePassword,
+                              MBSTRING_UTF8, challp, challp_len);
+
+    length = peer->csrattrs_len;
+    p = (unsigned char *)peer->csrattrs;
+    tot = p + length;
+
+    /*
+     * parse the CSR Attributes we got...
+     */
+    inf = ASN1_get_object((const unsigned char **)&p, &len, &tag, &xclass, length);
+    if (inf & 0x80) {
+        /*
+         * bad ASN.1, at least generate a CSR and see what happens
+         */
+        dpp_debug(DPP_DEBUG_ERR, "ASN.1 of CSR Attributes is not well-formed!\n");
+        goto gen_csr;
+    }
+    if (tag != V_ASN1_SEQUENCE) {
+        /*
+         * ditto
+         */
+        dpp_debug(DPP_DEBUG_ERR, "ASN.1 of CSR Attributes is not a SEQUENCE OF!\n");
+        goto gen_csr;
+    }        
+    while (p < tot) {
+        op = p;
+        savep = p;
+        inf = ASN1_get_object((const unsigned char **)&p, &len, &tag, &xclass, length);
+        if (inf & 0x80) {
+            dpp_debug(DPP_DEBUG_ERR, "ASN.1 in SEQUENCE OF is not well-formed\n");
+            break;
+        }
+        /*
+         * a SEQUENCE here indicates an attribute...
+         */
+        if (inf & V_ASN1_CONSTRUCTED) {
+            /*
+             * parse the attribute, if parsing fails for any reason, skip
+             * this attribute and see what's next, don't give up entirely
+             */
+            op = p + len;   /* mark the end of this attriute */
+            savep = p;
+            if (tag != V_ASN1_SEQUENCE) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: it's not an attribute! Should be a SEQUENCE here\n");
+                goto parse_fail;
+            }
+            values = NULL;
+            inf = ASN1_get_object((const unsigned char **)&p, &len, &tag, &xclass, length);
+            if (inf & 0x80) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: bad asn.1 for attribute\n");
+                goto parse_fail;
+            }
+            /*
+             * an attribute starts out with an object...
+             */
+            if (tag != V_ASN1_OBJECT) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: it's not an attribute! Should be an object here\n");
+                goto parse_fail;
+            }
+            d2i_ASN1_OBJECT(&o, (const unsigned char **)&savep, length);
+            nid = OBJ_obj2nid(o);
+            ASN1_OBJECT_free(o);
+            o = NULL;
+            p = savep;
+            /*
+             * ...and then a SET...
+             */
+            inf = ASN1_get_object((const unsigned char **)&p, &len, &tag, &xclass, length);
+            if (inf & 0x80) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: bad asn.1 for SET in attribute\n");
+                goto parse_fail;
+            }
+            if (!(inf & V_ASN1_CONSTRUCTED) || (tag != V_ASN1_SET)) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: it's not an attribute! Should be a SET here\n");
+                goto parse_fail;
+            }
+            /*
+             * ...and all the values in the SET
+             */
+            if ((values = get_set((const unsigned char **)&p, len)) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "CSR Attr parse: couldn't get values from set!\n");
+                goto parse_fail;
+            }
+            dpp_debug(DPP_DEBUG_TRACE, "CSR Attr parse: got a SET OF attributes...");
+            switch (nid) {
+                /*
+                 * depending on the attribute's object (the nid), parse through
+                 * whatever was in the set looking for something that makes sense
+                 * for this attribute. We'll ignore stuff in the set that doesn't
+                 * make sense instead of rejecting the attribute.
+                 */
+                case NID_rsaEncryption:
+                    /*
+                     * for RSA, look for a key length
+                     */
+                    dpp_debug(DPP_DEBUG_TRACE, " nid for RSA encryption\n");
+                    for (value = values; value != NULL; value = value->next) {
+                        if (value->type == SETVAL_INT) {
+                            crypto_nid = nid;
+                            keylen = value->integer;
+                            dpp_debug(DPP_DEBUG_TRACE, " RSA encryption, key length: %d\n", keylen);
+                            break;
+                        }
+                    }
+                    break;
+                case NID_X9_62_id_ecPublicKey:
+                    /*
+                     * for EC, look for a supported curve
+                     */
+                    dpp_debug(DPP_DEBUG_TRACE, " nid for ecPublicKey\n");
+                    for (value = values; value != NULL; value = value->next) {
+                        if ((value->type == SETVAL_NID) &&
+                            ((value->nid == NID_secp384r1)  ||
+                             (value->nid == NID_secp521r1) ||
+#ifdef HAS_BRAINPOOL
+                             (value->nid == NID_brainpoolP256r1) ||
+                             (value->nid == NID_brainpoolP384r1) ||
+                             (value->nid == NID_brainpoolP512r1) ||
+#endif  /* HAS_BRAINPOOL */
+                             (value->nid == NID_X9_62_prime256v1) ||
+                             (value->nid == NID_secp256k1))) {
+                            crypto_nid = value->nid;
+                            dpp_debug(DPP_DEBUG_TRACE, " an elliptic curve, nid = %d\n", crypto_nid);
+                            break;
+                        }
+                    }
+                    break;
+                case NID_pseudonym:
+                case NID_friendlyName:
+                case NID_pkcs9_unstructuredName:
+                    /*
+                     * add some additional name constructs to the extension
+                     */
+                    if (exts == NULL) {
+                        if ((exts = sk_X509_EXTENSION_new_null()) == NULL) {
+                            break;
+                        }
+                    }
+                    dpp_debug(DPP_DEBUG_TRACE, " nid for additional naming\n");
+                    for (value = values; value != NULL; value = value->next) {
+                        ASN1_OCTET_STRING *os;
+                        
+                        if (value->type == SETVAL_STR) {
+                            if ((os = ASN1_OCTET_STRING_new()) == NULL) {
+                                break;
+                            }
+                            if (!ASN1_OCTET_STRING_set(os, (unsigned char *)whoami, strlen(whoami))) {
+                                break;
+                            }
+                            ex = X509_EXTENSION_create_by_NID(NULL, value->nid, 0, os);
+                            sk_X509_EXTENSION_push(exts, ex);
+                            dpp_debug(DPP_DEBUG_TRACE, " a string for %s: %s\n", 
+                                  nid == NID_pseudonym ? "pseudonym" : 
+                                  nid == NID_friendlyName ? "friendly name" : "unstructuredName", 
+                                  whoami);
+                            break;
+                        }
+                    }
+                    break;
+                case NID_ext_req:
+                    /*
+                     * an explicit extension request...
+                     */
+                    if (exts == NULL) {
+                        if ((exts = sk_X509_EXTENSION_new_null()) == NULL) {
+                            break;
+                        }
+                    }
+                    dpp_debug(DPP_DEBUG_TRACE, " an extension request:\n");
+                    for (value = values; value != NULL; value = value->next) {
+                        ASN1_OCTET_STRING *os;
+                        
+                        if (value->type == SETVAL_NID) {
+                            switch (value->nid) {
+                                /*
+                                 * fill in actual values, don't feel like plumbing options in from
+                                 * the CLI....
+                                 */
+                                case NID_serialNumber:
+                                    if ((os = ASN1_OCTET_STRING_new()) == NULL) {
+                                        break;
+                                    }
+                                    if (!ASN1_OCTET_STRING_set(os, (unsigned char *)"SMERSH-7474", strlen("SMERSH-7474"))) {
+                                        break;
+                                    }
+                                    ex = X509_EXTENSION_create_by_NID(NULL, value->nid, 0, os);
+                                    sk_X509_EXTENSION_push(exts, ex);
+                                    dpp_debug(DPP_DEBUG_TRACE, "\tfor serial number\n");
+                                    ASN1_OCTET_STRING_free(os);
+                                    break;
+                                case NID_favouriteDrink:
+                                    if ((os = ASN1_OCTET_STRING_new()) == NULL) {
+                                        break;
+                                    }
+                                    if (!ASN1_OCTET_STRING_set(os, (unsigned char *)"beer", strlen("beer"))) {
+                                        break;
+                                    }
+                                    ex = X509_EXTENSION_create_by_NID(NULL, value->nid, 0, os);
+                                    sk_X509_EXTENSION_push(exts, ex);
+                                    dpp_debug(DPP_DEBUG_TRACE, "\tfor favorite drink\n");
+                                    ASN1_OCTET_STRING_free(os);
+                                    break;
+                                default:
+                                    dpp_debug(DPP_DEBUG_TRACE, "\tNID = \n", value->nid);
+                                    break;
+                            }
+                        }
+                    }
+                    break;
+                case NID_ext_key_usage:
+                    dpp_debug(DPP_DEBUG_TRACE, " an extended key usage request:\n");
+                    if (exts == NULL) {
+                        if ((exts = sk_X509_EXTENSION_new_null()) == NULL) {
+                            break;
+                        }
+                    }
+                    if ((sk = sk_ASN1_OBJECT_new_null()) == NULL) {
+                        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+                        break;
+                    }
+                    /*
+                     * go through the SET OF and see if there's anything
+                     * we understand. If so, add it to the extensions
+                     */
+                    for (value = values; value != NULL; value = value->next) {
+                        if (value->type == SETVAL_NID) {
+                            switch (value->nid) {
+                                case NID_server_auth:
+                                case NID_client_auth:
+                                case NID_ipsecTunnel:
+                                    if ((o = OBJ_nid2obj(value->nid)) != NULL) {
+                                        sk_ASN1_OBJECT_push(sk, o);
+                                    }
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+                    /*
+                     * don't make these critical
+                     */
+                    if ((ex = X509V3_EXT_i2d(NID_ext_key_usage, 0, sk)) != NULL) {
+                        sk_X509_EXTENSION_push(exts, ex);
+                    }
+                    break;
+                    /*
+                     * add cases here for more NIDs that we understand
+                     */
+                default:
+                    dpp_debug(DPP_DEBUG_TRACE, "unknown attribute...skipping\n");
+                    goto parse_fail;
+            }
+            free_setval(values);
+parse_fail:
+            /*
+             * end of attribute...next!
+             */
+            p = (unsigned char *)op;
+            continue;
+        } else if (tag == V_ASN1_OBJECT) {
+            dpp_debug(DPP_DEBUG_TRACE, "an object, not an attribute\n");
+            /*
+             * not an attribute, just another object in the SEQUENCE, do our best
+             */
+            if (d2i_ASN1_OBJECT(&o, (const unsigned char **)&savep, length) == NULL) {
+                dpp_debug(DPP_DEBUG_TRACE, "failed to get the object goo\n");
+            }
+            nid = OBJ_obj2nid(o);
+            ASN1_OBJECT_free(o);
+            o = NULL;
+            p = savep;
+            switch (nid) {
+                case NID_serialNumber:
+                    /*
+                     * add some printable string to the CSR
+                     */
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for serial number\n");
+                    break;
+                case NID_pkcs9_challengePassword:   /* we always send this */
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for challengePassword\n");
+                    break;
+                case NID_sha256WithRSAEncryption:
+                    crypto_nid = NID_rsaEncryption;
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha256withRSAEncryption\n");
+                    md = EVP_sha256();
+                    break;
+                case NID_sha384WithRSAEncryption:
+                    crypto_nid = NID_rsaEncryption;
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha384withRSAEncryption\n");
+                    md = EVP_sha384();
+                    break;
+                case NID_sha512WithRSAEncryption:
+                    crypto_nid = NID_rsaEncryption;
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha512withRSAEncryption\n");
+                    md = EVP_sha512();
+                    break;
+                case NID_ecdsa_with_SHA256:
+                    /*
+                     * if we get a ecdsa_with_SHAXYZ then set the curve
+                     * to be something appropriate for the hash if it's
+                     * dumb.
+                     */
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for ecdsa with sha256\n");
+                    if (crypto_nid == NID_rsaEncryption) {
+                        crypto_nid = NID_X9_62_prime256v1;
+                    }
+                    md = EVP_sha256();
+                    break;
+                case NID_ecdsa_with_SHA384:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for ecdsa with sha384\n");
+                    if (crypto_nid == NID_rsaEncryption) {
+                        crypto_nid = NID_secp384r1;
+                    }
+                    md = EVP_sha384();
+                    break;
+                case NID_ecdsa_with_SHA512:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for ecdsa with sha512\n");
+                    if (crypto_nid == NID_rsaEncryption) {
+                        crypto_nid = NID_secp521r1;
+                    }
+                    md = EVP_sha512();
+                    break;
+                case NID_secp384r1:
+                case NID_secp521r1:
+                case NID_secp256k1:
+                case NID_X9_62_prime256v1:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for an elliptic curve\n");
+                    crypto_nid = nid;
+                    break;
+                case NID_sha256:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha256\n");
+                    md = EVP_sha256();
+                    break;
+                case NID_sha384:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha384\n");
+                    md = EVP_sha384();
+                    break;
+                case NID_sha512:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for sha512\n");
+                    md = EVP_sha512();
+                    break;
+                default:
+                    dpp_debug(DPP_DEBUG_TRACE, "a nid for something I don't understand %d\n", nid);
+            }
+        } else {
+            dpp_debug(DPP_DEBUG_ERR, "not a SEQUENCE OF objects and attributes!\n");
+            p += len;
+        }
+    }
+gen_csr:
+    /*
+     * if we got extensions, then add them to the CSR and free them up
+     */
+    if (exts != NULL) {
+        X509_REQ_add_extensions(req, exts);
+        if (sk != NULL) {
+            sk_ASN1_OBJECT_pop_free(sk, ASN1_OBJECT_free);
+        }
+        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+        exts = NULL;
+    }
+    /*
+     * if we were told to use a different public key then generate it
+     */
+    if (crypto_nid != dpp_instance.nid) {
+        if (crypto_nid == NID_rsaEncryption) {
+            dpp_debug(DPP_DEBUG_PKI, "generating an RSA key for CSR...\n");
+            /*
+             * rsa of the specified length
+             */
+            ameth = EVP_PKEY_asn1_find_str(NULL, "rsa", -1);
+            EVP_PKEY_asn1_get0_info(&pkey_id, NULL, NULL, NULL, NULL, ameth);
+            pkeyctx = EVP_PKEY_CTX_new_id(pkey_id, NULL);
+            if (EVP_PKEY_keygen_init(pkeyctx) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "can't initialize key generation for RSA\n");
+                return -1;
+            }
+            EVP_PKEY_CTX_set_rsa_keygen_bits(pkeyctx, keylen);
+        } else {
+            dpp_debug(DPP_DEBUG_PKI, "generating an ECC key for CSR...\n");
+            /*
+             * generate an EC keypair for the specified group
+             */
+            if ((group = EC_GROUP_new_by_curve_name(crypto_nid)) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to create curve group!\n");
+                return -1;
+            }
+            EC_GROUP_set_asn1_flag(group, OPENSSL_EC_NAMED_CURVE);
+            EC_GROUP_set_point_conversion_form(group, POINT_CONVERSION_UNCOMPRESSED);
+            if ((ec = EC_KEY_new()) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to create an EC_KEY!\n");
+                return -1;
+            }
+            if (EC_KEY_set_group(ec, group) == 0) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to set group to  PKEY!\n");
+                return -1;
+            }
+            if (!EC_KEY_generate_key(ec)) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to generate PKEY!\n");
+                return -1;
+            }
+            /*
+             * assign EC keypair to an EVP_PKEY and then use that to make
+             * an EVP_PKEY_CTX
+             */
+            if ((tmp = EVP_PKEY_new()) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to create PKEY!\n");
+                return -1;
+            }
+            EVP_PKEY_assign(tmp, EVP_PKEY_EC, ec);
+            pkeyctx = EVP_PKEY_CTX_new(tmp, NULL);
+            EVP_PKEY_free(tmp);
+            EC_GROUP_free(group);
+        }
+        /*
+         * we have an EVP_PKEY_CTX now for our desired public key type, generate!
+         */
+        if (EVP_PKEY_keygen_init(pkeyctx) < 1) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to initiate keygen procedure!\n");
+            goto csr_fail;
+        }
+        if (EVP_PKEY_keygen(pkeyctx, &key) < 1) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to generate keypair!\n");
+            goto csr_fail;
+        }
+        EVP_PKEY_CTX_free(pkeyctx); /* will free ec too, if used */
+        if ((bio = BIO_new_file("key_for_cert.pem", "w")) != NULL) {
+            PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL);
+        }
+        BIO_free(bio);
+        bio = NULL;
+        /*
+         * put the key in the request and sign the request
+         */
+        X509_REQ_set_pubkey(req, key);
+        if (!X509_REQ_sign(req, key, md)) {
+            dpp_debug(DPP_DEBUG_ERR, "can't sign CSR with new key!\n");
+            goto csr_fail;
+        }
+    } else {
+        EC_KEY *protodup;
+        
+        dpp_debug(DPP_DEBUG_PKI, "using bootstrapping key for CSR...\n");
+        /*
+         * need an EVP_PKEY_CTX with our protocol key to do the signing
+         */
+        if ((tmp = EVP_PKEY_new()) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to create PKEY!\n");
+            goto csr_fail;
+        }
+        if ((protodup = EC_KEY_dup(peer->my_proto)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to duplicate protocol key for CSR\n");
+            goto csr_fail;
+        }
+
+        EVP_PKEY_assign(tmp, EVP_PKEY_EC, protodup);
+        X509_REQ_set_pubkey(req, tmp);
+        if (!X509_REQ_sign(req, tmp, md)) {
+            dpp_debug(DPP_DEBUG_ERR, "can't sign CSR with protocol key!\n");
+            goto csr_fail;
+        }
+        EVP_PKEY_free(tmp);     // this will free protodup too
+    }
+
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to create another bio!\n");
+        goto csr_fail;
+    }
+
+    i2d_X509_REQ_bio(bio, req);
+    asn1len = BIO_get_mem_data(bio, &p);
+
+    if ((*csr = malloc(2*asn1len)) == NULL) {
+        goto csr_fail;
+    }
+
+    if ((ctx = EVP_ENCODE_CTX_new()) == NULL) {
+        goto csr_fail;
+    }
+    /*
+     * base64 encode the request
+     */
+    EVP_EncodeInit(ctx);
+    EVP_EncodeUpdate(ctx, (unsigned char *)*csr, &i, p, asn1len);
+    csrlen = i;
+    EVP_EncodeFinal(ctx, (unsigned char *)&((*csr)[i]), &i);
+    csrlen += i;
+    EVP_ENCODE_CTX_free(ctx);
+        
+    (*csr)[csrlen] = '\0';
+    dpp_debug(DPP_DEBUG_TRACE, "CSR is %d chars:\n%s\n", csrlen, *csr);
+csr_fail:
+    X509_REQ_free(req);
+    if (key != NULL) {
+        EVP_PKEY_free(key);
+    }
+    if (bio != NULL) {
+        BIO_free(bio);
+    }
+    return csrlen;
+
+}
+
+//----------------------------------------------------------------------
+// wpa_supplicant support-- write out a .conf file for various AKMs
 //----------------------------------------------------------------------
 
 /*
@@ -1201,6 +2318,51 @@ dump_pwd_con (char *ssid, int ssidlen, char *pwd, int sae)
     return;
 }
 
+static void
+dump_cert_con (char *ssid, int ssidlen, char *p7, int p7len)
+{
+    FILE *fp;
+    char conffile[45], netname[33];
+
+    memset(netname, 0, sizeof(netname));
+    memset(conffile, 0, sizeof(conffile));
+    if (ssid == NULL || ssidlen == 0) {
+        strcpy(netname, "*");
+        snprintf(conffile, sizeof(conffile), "wildcard_dot1x.conf");
+    } else {
+        memcpy(netname, ssid, ssidlen);
+        snprintf(conffile, sizeof(conffile), "%s_dot1x.conf", netname);
+    }
+    if ((fp = fopen(conffile, "w")) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to create wpa_supplicant config file!\n");
+        return;
+    }
+
+    fprintf(fp, "ctrl_interface=/var/run/wpa_supplicant\n");
+    fprintf(fp, "ctrl_interface_group=0\n");
+    fprintf(fp, "update_config=1\n");
+    fprintf(fp, "pmf=2\n");
+    fprintf(fp, "network={\n");
+    fprintf(fp, "\tssid=\"%s\"\n", netname);
+    fprintf(fp, "\tproto=RSN\n");
+    fprintf(fp, "\tkey_mgmt=IEEE8021X\n");
+    fprintf(fp, "\teap=TLS\n");
+    fprintf(fp, "\tclient_cert=\"mycert.pem\"\n");
+    fprintf(fp, "\tprivate_key=\"mypriv.der\"\n");
+    fprintf(fp, "\tpairwise=CCMP\n");
+    fprintf(fp, "\tgroup=CCMP\n");
+    fprintf(fp, "}\n");
+    fclose(fp);
+    dpp_debug(DPP_DEBUG_TRACE, "created %s for wpa_supplicant configuration\n", conffile);
+
+    return;
+}
+
+//----------------------------------------------------------------------
+// DPP configuration exchange routines
+//----------------------------------------------------------------------
+
+
 static int
 send_dpp_config_result (struct candidate *peer, unsigned char status)
 {
@@ -1240,7 +2402,7 @@ send_dpp_config_result (struct candidate *peer, unsigned char status)
     siv_encrypt(&ctx, wraptlv->value + AES_BLOCK_SIZE, wraptlv->value + AES_BLOCK_SIZE,
                 (unsigned char *)tlv - ((unsigned char *)wraptlv->value + AES_BLOCK_SIZE),
                 wraptlv->value,
-                2, &peer->frame, sizeof(dpp_action_frame), peer->buffer, 0);
+                2, peer->frame, sizeof(dpp_action_frame), peer->buffer, 0);
     
     send_dpp_action_frame(peer);
 
@@ -1248,17 +2410,17 @@ send_dpp_config_result (struct candidate *peer, unsigned char status)
 }
         
 static int
-send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
+generate_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
 {
     siv_ctx ctx;
     TLV *tlv, *wraptlv;
-    unsigned char burlx[256], burly[256], kid[SHA512_DIGEST_LENGTH];
+    unsigned char burlx[256], burly[256], kid[KID_LENGTH];
     unsigned char conn[1024], *bn = NULL;
-    char confobj[1536];
+    char confresp[4096];
     int sofar = 0, offset, burllen, nid;
     BIGNUM *x = NULL, *y = NULL, *signprime = NULL;
     const EC_POINT *signpub;
-    const EC_GROUP *signgroup;
+    const EC_GROUP *signgroup = NULL;
     unsigned char *encrypt_ptr = NULL;
     unsigned short wrapped_len = 0;
     time_t t;
@@ -1275,128 +2437,266 @@ send_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     encrypt_ptr = (unsigned char *)tlv;
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
 
-    /*
-     * if we can't generate a connector then indicate configuration failure
-     */
-    if (generate_connector(conn, sizeof(conn), (EC_GROUP *)dpp_instance.group,
-                           peer->peer_proto, peer->enrollee_role,
-                           dpp_instance.signkey, bnctx) < 0) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
+    if (status == STATUS_OK) {
+        /*
+         * if we can't generate a connector then indicate configuration failure
+         */
+        if (generate_connector(conn, sizeof(conn), (EC_GROUP *)dpp_instance.group,
+                               peer->peer_proto, peer->enrollee_role,
+                               dpp_instance.signkey, bnctx) < 0) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        }
+        if (((signpub = EC_KEY_get0_public_key(dpp_instance.signkey)) == NULL) ||
+            ((signgroup = EC_KEY_get0_group(dpp_instance.signkey)) == NULL) ||
+            (get_kid_from_point(kid, signgroup, signpub, bnctx) < 0)) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to get kid of public signing key!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        } 
+        if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
+            ((signprime = BN_new()) == NULL) ||
+            !EC_GROUP_get_curve_GFp(signgroup, signprime, NULL, NULL, bnctx) ||
+            !EC_POINT_get_affine_coordinates_GFp(signgroup, signpub, x, y, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates of public signing key!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        } 
+        if ((bn = (unsigned char *)malloc(BN_num_bytes(signprime))) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to alloc memory for public signing key points!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        }
+        memset(bn, 0, BN_num_bytes(signprime));
+        offset = BN_num_bytes(signprime) - BN_num_bytes(x);
+        BN_bn2bin(x, bn + offset);
+        if ((burllen = base64urlencode(burlx, bn, BN_num_bytes(signprime))) < 0) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to b64url encode x!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        }
+        burlx[burllen] = '\0';
+        memset(bn, 0, BN_num_bytes(signprime));
+        offset = BN_num_bytes(signprime) - BN_num_bytes(y);
+        BN_bn2bin(y, bn + offset);
+        if ((burllen = base64urlencode(burly, bn, BN_num_bytes(signprime))) < 0) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to b64url encode y!\n");
+            status = STATUS_CONFIGURE_FAILURE;
+            goto problemo;
+        }
+        burly[burllen] = '\0';
     }
-    if (((signpub = EC_KEY_get0_public_key(dpp_instance.signkey)) == NULL) ||
-        ((signgroup = EC_KEY_get0_group(dpp_instance.signkey)) == NULL) ||
-        (get_kid_from_point(kid, signgroup, signpub, bnctx) < 0)) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to get kid of public signing key!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
-    } 
-    if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
-        ((signprime = BN_new()) == NULL) ||
-        !EC_GROUP_get_curve_GFp(signgroup, signprime, NULL, NULL, bnctx) ||
-        !EC_POINT_get_affine_coordinates_GFp(signgroup, signpub, x, y, bnctx)) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates of public signing key!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
-    } 
-    if ((bn = (unsigned char *)malloc(BN_num_bytes(signprime))) == NULL) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to alloc memory for public signing key points!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
-    }
-    memset(bn, 0, BN_num_bytes(signprime));
-    offset = BN_num_bytes(signprime) - BN_num_bytes(x);
-    BN_bn2bin(x, bn + offset);
-    if ((burllen = base64urlencode(burlx, bn, BN_num_bytes(signprime))) < 0) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to b64url encode x!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
-    }
-    burlx[burllen] = '\0';
-    memset(bn, 0, BN_num_bytes(signprime));
-    offset = BN_num_bytes(signprime) - BN_num_bytes(y);
-    BN_bn2bin(y, bn + offset);
-    if ((burllen = base64urlencode(burly, bn, BN_num_bytes(signprime))) < 0) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to b64url encode y!\n");
-        status = STATUS_CONFIGURE_FAILURE;
-        goto problemo;
-    }
-    burly[burllen] = '\0';
-
 problemo:
     /*
      * if we're go then cons up a configuration object
      */
     sofar = 0;
-    if (status == STATUS_OK) {
-        /*
-         * make the configuration objects are good for 1 year (tm_year + 1901) from right now
-         */
-        t = time(NULL);
-        bdt = gmtime(&t);
-        TAILQ_FOREACH(cp, &cpolicies, entry) {
-            if (strcmp(cp->akm, "dpp") == 0) {
-                nid = EC_GROUP_get_curve_name(signgroup);
-                sofar = snprintf(confobj, sizeof(confobj),
-                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
-                                 "\"cred\":{\"akm\":\"%s\","
-                                 "\"signedConnector\":"
-                                 "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
-                                 "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
-                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                 cp->ssid, cp->akm, conn,
+    switch (status) {
+        case STATUS_OK:
+            /*
+             * make the configuration objects are good for 1 year (tm_year + 1901) from right now
+             */
+            t = time(NULL);
+            bdt = gmtime(&t);
+            nid = EC_GROUP_get_curve_name(signgroup);
+            TAILQ_FOREACH(cp, &cpolicies, entry) {
+                if (strcmp(cp->akm, "dpp") == 0) {
+                    sofar = snprintf(confresp, sizeof(confresp)-1,
+                                     "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                     "\"cred\":{\"akm\":\"%s\","
+                                     "\"signedConnector\":"
+                                     "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                     "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                     "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                     cp->ssid, cp->akm, conn,
 #ifdef HAS_BRAINPOOL
-                                 nid == NID_X9_62_prime256v1 ? "P-256" : \
-                                 nid == NID_secp384r1 ? "P-384" : \
-                                 nid == NID_secp521r1 ? "P-521" : \
-                                 nid == NID_brainpoolP256r1 ? "BP-256" : \
-                                 nid == NID_brainpoolP384r1 ? "BP-384" : \
-                                 nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+                                     nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                     nid == NID_secp384r1 ? "P-384" : \
+                                     nid == NID_secp521r1 ? "P-521" : \
+                                     nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                     nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                     nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
 #else
-                                 nid == NID_X9_62_prime256v1 ? "P-256" : \
-                                 nid == NID_secp384r1 ? "P-384" : \
-                                 nid == NID_secp521r1 ? "P-521" : "unknown",
+                                     nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                     nid == NID_secp384r1 ? "P-384" : \
+                                     nid == NID_secp521r1 ? "P-521" : "unknown",
 #endif  /* HAS_BRAINPOOL */
-                                 burlx, burly, kid,
-                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
-                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
-            } else if (strcmp(cp->akm, "sae") == 0) {
-                sofar = snprintf(confobj, sizeof(confobj),
-                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
-                                 "\"cred\":{\"akm\":\"%s\","
-                                 "\"pass\":\"%s\","
-                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                 cp->ssid, cp->akm, cp->password,
-                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
-                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
-            } else if (strcmp(cp->akm, "psk") == 0) {
-                sofar = snprintf(confobj, sizeof(confobj),
-                                 "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
-                                 "\"cred\":{\"akm\":\"%s\","
-                                 "\"pass\":\"%s\","
-                                 "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                 cp->ssid, cp->akm, cp->password,
-                                 bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
-                                 bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                                     burlx, burly, kid,
+                                     bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                     bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                } else if (strcmp(cp->akm, "sae") == 0) {
+                    if (peer->version > 1) {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"pass\":\"%s\","
+                                         "\"signedConnector\":"
+                                         "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, cp->password, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                    } else {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"pass\":\"%s\","
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, cp->password,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                    }
+                } else if (strcmp(cp->akm, "psk") == 0) {
+                    if (peer->version > 1) {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"pass\":\"%s\","
+                                         "\"signedConnector\":"
+                                         "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, cp->password, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
                                  
-            } else {
-                dpp_debug(DPP_DEBUG_ERR, "unknown akm for config response: %s\n", cp->akm);
+                    } else {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"pass\":\"%s\","
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, cp->password,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                    }
+                } else if (strcmp(cp->akm, "dot1x") == 0) {
+                    if (peer->p7len == 0) {
+                        dpp_debug(DPP_DEBUG_ERR, "generating a config object for enterprise but no p7!\n");
+                        break;
+                    }
+                    /*
+                     * enterprise credentials are only v2 so no need to check version
+                     */
+                    if (dpp_instance.cacert_len) {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"entCreds\":{\"certBag\":\"%s\","
+                                         "\"caCerts\":\"%s\"},"
+                                         "\"signedConnector\":"
+                                         "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, peer->p7, dpp_instance.cacert, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                    } else {
+                        sofar = snprintf(confresp, sizeof(confresp)-1,
+                                         "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
+                                         "\"cred\":{\"akm\":\"%s\","
+                                         "\"entCreds\":{\"certBag\":\"%s\"},"
+                                         "\"signedConnector\":"
+                                         "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
+                                         cp->ssid, cp->akm, peer->p7, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
+                                         bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
+                                         bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
+                    }
+                } else {
+                    dpp_debug(DPP_DEBUG_ERR, "unknown akm for config response: %s\n", cp->akm);
+                }
+                tlv = TLV_set_tlv(tlv, CONFIGURATION_OBJECT, sofar, (unsigned char *)confresp);
+                dpp_debug(DPP_DEBUG_TRACE, "adding %d byte config object for %s to %s\n",
+                          sofar, cp->akm, cp->ssid);
             }
-            tlv = TLV_set_tlv(tlv, CONFIGURATION_OBJECT, sofar, (unsigned char *)confobj);
-            dpp_debug(DPP_DEBUG_TRACE, "adding config object for %s to %s\n",
-                      cp->akm, cp->ssid);
-        }
+            break;
+        case STATUS_CONFIGURE_FAILURE:
+            dpp_debug(DPP_DEBUG_ERR, "failed to generate configuration object!\n");
+            break;
+        case STATUS_CSR_NEEDED:
+            if ((sofar = gen_csrattrs(confresp)) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "failed to create CSR attrs!\n");
+                status = STATUS_CONFIGURE_FAILURE;
+            } else {
+                tlv = TLV_set_tlv(tlv, CSR_ATTRS_REQUEST, sofar, (unsigned char *)confresp);
+                dpp_debug(DPP_DEBUG_TRACE, "adding CSR attributes request to config response\n");
+            }
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "unknown status %d sent to gen_dpp_config_resp_frame()\n", status);
+            break;
     }
-    
+
     wraptlv->length = (int)((unsigned char *)tlv - (unsigned char *)wraptlv->value);
     wrapped_len = wraptlv->length - AES_BLOCK_SIZE;
     /*
      * ieee-ize the attributes that get encrypted
      */
     ieeeize_hton_attributes(encrypt_ptr, ((unsigned char *)tlv - encrypt_ptr));
+
     /*
-     * ...and the stuff that doesn't
+     * in case something failed and the status got reset, set the status again
+     */
+    (void)TLV_set_tlv((TLV *)peer->buffer, DPP_STATUS, 1, &status);
+    
+    /*
+     * ...and then ieee-ize the attributes that don't get encrypted
      */
     ieeeize_hton_attributes(peer->buffer, ((unsigned char *)tlv - peer->buffer));
 
@@ -1419,8 +2719,6 @@ problemo:
 
     peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
 
-    (void)send_dpp_config_frame(peer, GAS_INITIAL_RESPONSE);
-    
     if (x != NULL) {
         BN_free(x);
     }
@@ -1442,7 +2740,7 @@ send_dpp_config_req_frame (struct candidate *peer)
     siv_ctx ctx;
     TLV *tlv;
     int ret = -1, caolen = 0;
-    char confattsobj[300], whoami[20];
+    char confattsobj[1500], whoami[20], *csr = NULL;
     
     memset(peer->buffer, 0, sizeof(peer->buffer));
     peer->nextfragment = 0;     // so enrollee can reuse the buffer when he's done sending
@@ -1453,30 +2751,37 @@ send_dpp_config_req_frame (struct candidate *peer)
         dpp_debug(DPP_DEBUG_ERR, "unable to determine hostname!\n");
         strcpy(whoami, "dunno");
     }
-    if (!RAND_bytes(peer->enonce, dpp_instance.noncelen)) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to generate nonce for config request!\n");
-        goto fin;
-    }
-
     tlv = (TLV *)peer->buffer;
     tlv->type = ieee_order(WRAPPED_DATA);
     tlv = (TLV *)(tlv->value + AES_BLOCK_SIZE);
 
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
     /*
-     * if we have a MUD URL then send it
+     * standard config object request, plus if we have a MUD URL then send it, if we have
+     * csr attributes then generate a CSR too
      */
-    if (dpp_instance.mudurl[0] == 0) {
-        caolen = snprintf(confattsobj, sizeof(confattsobj),
-                          "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\"}",
-                          whoami, dpp_instance.enrollee_role);
-    } else {
-        caolen = snprintf(confattsobj, sizeof(confattsobj),
-                          "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\", \"mudurl\":\"%s\"}",
-                          whoami, dpp_instance.enrollee_role, dpp_instance.mudurl);
+    caolen = snprintf(confattsobj, sizeof(confattsobj),
+                      "{ \"name\":\"%s\", \"wi-fi_tech\":\"infra\", \"netRole\":\"%s\"",
+                      whoami, dpp_instance.enrollee_role);
+    if (dpp_instance.mudurl[0] != 0) {
+        caolen += snprintf(confattsobj+caolen, sizeof(confattsobj)-caolen,
+                          ",\"mudurl\":\"%s\"", dpp_instance.mudurl);
     }
-    tlv = TLV_set_tlv(tlv, CONFIG_ATTRIBUTES_OBJECT, caolen, (unsigned char *)confattsobj);
+    if (peer->csrattrs != NULL) {
+        if (generate_csr(peer, &csr) < 1) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot generate CSR!\n");
+            return -1;
+        }
+        caolen += snprintf(confattsobj+caolen, sizeof(confattsobj)-caolen,
+                           ",\"pkcs10\":\"%s\"", csr);
+        free(csr);
+        free(peer->csrattrs);
+        peer->csrattrs = NULL;
+        peer->csrattrs_len = 0;
+    }
+    caolen += snprintf(confattsobj+caolen, sizeof(confattsobj)-caolen, "}");
 
+    tlv = TLV_set_tlv(tlv, CONFIG_ATTRIBUTES_OBJECT, caolen, (unsigned char *)confattsobj);
     /*
      * put the attributes into ieee-order
      */
@@ -1515,8 +2820,20 @@ send_dpp_config_req_frame (struct candidate *peer)
         peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
     }
     ret = 1;
-fin:
+
     return ret;
+}
+
+/*
+ * Got a COMEBACK_RESPONSE telling us to comeback later, that time is NOW!
+ */
+static void
+cameback_delayed (timerid id, void *data)
+{
+    struct candidate *peer = (struct candidate *)data;
+
+    send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
 }
 
 static int
@@ -1581,16 +2898,181 @@ fin:
 }
 
 static int
-process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int len)
+check_connector (struct candidate *peer, unsigned char *blob, int len)
 {
-    TLV *tlv;
-    unsigned char *val, unb64url[1024], coordbin[P521_COORD_LEN];
+    unsigned char unb64url[1024], coordbin[P521_COORD_LEN];
     BIGNUM *x = NULL, *y = NULL;
     const EC_POINT *P;
     const EC_GROUP *signgroup;
-    siv_ctx ctx;
     char *sstr, *estr, *dot;
-    int i, wrapdatalen, ntok, ncred, unburllen, cl, coordlen, signnid, ret = -1;
+    int ntok, unburllen, cl, signnid, coordlen, ret = -1;
+
+    if ((ntok = get_json_data((char *)blob, len, &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
+        dpp_debug(DPP_DEBUG_ERR, "No connector found!\n");
+        goto fin;
+    }
+    dot = strstr(sstr, ".");
+    memset(unb64url, 0, sizeof(unb64url));
+    /*
+     * decode the JWS Protected Header
+     */
+    if ((unburllen = base64urldecode(unb64url, (unsigned char *)sstr, dot-sstr)) < 1) {
+        dpp_debug(DPP_DEBUG_ERR, "Cannot base64url decode the JWS Protected Header!\n");
+        goto fin;
+    }
+    if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "alg")) != 1) {
+        dpp_debug(DPP_DEBUG_ERR, "Failed to get 'alg' from JWS Protected Header!\n");
+        goto fin;
+    }
+    dpp_debug(DPP_DEBUG_TRACE, "connector is signed with %.*s, ", (int)(estr - sstr), sstr);
+    if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "kid")) != 1) {
+        dpp_debug(DPP_DEBUG_ERR, "Failed to get 'kid' from JWS Protected Header!\n");
+        goto fin;
+    }
+    dpp_debug(DPP_DEBUG_TRACE, "by key with key id:\n %.*s\n", (int)(estr - sstr), sstr);
+    /*
+     * get the Configurator's signing key from the "csign" portion of the DPP Config Object
+     */
+    if ((ntok = get_json_data((char *)blob, len, &sstr, &estr, 3, "cred", "csign", "crv")) != 1) {
+        dpp_debug(DPP_DEBUG_ERR, "No 'crv' coordinate in 'csign' portion of the response!\n");
+        goto fin;
+    }
+    if ((int)(estr - sstr) > 6) {
+        dpp_debug(DPP_DEBUG_ERR, "malformed 'crv' in 'csign' portion of response (%d chars)\n",
+                  (int)(estr - sstr));
+        goto fin;
+    }
+    
+    if (strncmp(sstr, "P-256", 5) == 0) {
+        signnid = NID_X9_62_prime256v1;
+        coordlen = P256_COORD_LEN;
+    } else if (strncmp(sstr, "P-384", 5) == 0) {
+        signnid = NID_secp384r1;
+        coordlen = P384_COORD_LEN;
+    } else if (strncmp(sstr, "P-521", 5) == 0) {
+        signnid = NID_secp521r1;
+        coordlen = P521_COORD_LEN;
+#ifdef HAS_BRAINPOOL
+    } else if (strncmp(sstr, "BP-256", 6) == 0) {
+        signnid = NID_brainpoolP256r1;
+        coordlen = P256_COORD_LEN;
+    } else if (strncmp(sstr, "BP-384", 6) == 0) {
+        signnid = NID_brainpoolP384r1;
+        coordlen = P384_COORD_LEN;
+    } else if (strncmp(sstr, "BP-512", 6) == 0) {
+        signnid = NID_brainpoolP512r1;
+        coordlen = P512_COORD_LEN;
+#endif  /* HAS_BRAINPOOL */
+    } else {
+        dpp_debug(DPP_DEBUG_ERR, "unknown elliptic curve %.*s!\n", (int)(estr - sstr), sstr);
+        goto fin;
+    }
+
+    if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates to create configurator's signing key\n");
+        goto fin;
+    }
+    /*
+     * get the x-coordinate...
+     */
+    if ((ntok = get_json_data((char *)blob, len, &sstr, &estr, 3, "cred", "csign", "x")) != 1) {
+        dpp_debug(DPP_DEBUG_ERR, "No 'x' coordinate in 'csign' portion of the response!\n");
+        goto fin;
+    }
+    
+    if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
+        dpp_debug(DPP_DEBUG_ERR, "Mal-sized x-coordinate (%d)\n",
+                  (int)(estr - sstr));
+        goto fin;
+    }
+    memset(coordbin, 0, coordlen);
+    if ((cl = base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr)))) != coordlen) {
+        dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate: %d instead of %d\n", cl, coordlen);
+        print_buffer("coord-x", coordbin, cl);
+        goto fin;
+    }
+    BN_bin2bn(coordbin, coordlen, x);
+    /*
+     * get the y-coordinate...
+     */
+    if ((ntok = get_json_data((char *)blob, len, &sstr, &estr, 3, "cred", "csign", "y")) != 1) {
+        dpp_debug(DPP_DEBUG_ERR, "No 'y' coordinate in 'csign' portion of the response!\n");
+        goto fin;
+    }
+    if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
+        dpp_debug(DPP_DEBUG_ERR, "Mal-sized y-coordinate (%d)\n",
+                  (int)(estr - sstr));
+        goto fin;
+    }
+    memset(coordbin, 0, coordlen);
+    if (base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr))) != coordlen) {
+        dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate\n");
+        goto fin;
+    }
+    BN_bin2bn(coordbin, coordlen, y);
+
+    /*
+     * create an EC_KEY out of "crv", "x", and "y"
+     */
+    configurator_signkey = EC_KEY_new_by_curve_name(signnid);
+    EC_KEY_set_public_key_affine_coordinates(configurator_signkey, x, y);
+    EC_KEY_set_conv_form(configurator_signkey, POINT_CONVERSION_COMPRESSED);
+    EC_KEY_set_asn1_flag(configurator_signkey, OPENSSL_EC_NAMED_CURVE);
+    if (((signgroup = EC_KEY_get0_group(configurator_signkey)) == NULL) ||
+        ((P = EC_KEY_get0_public_key(configurator_signkey)) == NULL) ||
+        !EC_POINT_is_on_curve(signgroup, P, bnctx)) {
+        dpp_debug(DPP_DEBUG_ERR, "configurator's signing key is not valid!\n");
+        goto fin;
+    }
+    dpp_debug(DPP_DEBUG_TRACE, "configurator's signing key is valid!!!\n");
+
+    if (get_kid_from_point(csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
+        dpp_debug(DPP_DEBUG_ERR, "can't get key id for configurator's sign key!\n");
+        goto fin;
+    }
+        
+    /*
+     * validate the connector
+     */
+    if ((ntok = get_json_data((char *)blob, len, &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
+        dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
+        goto fin;
+    }
+    if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), configurator_signkey, bnctx) < 0) {
+        dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
+        goto fin;
+    }
+    connector_len = (int)(estr - sstr);
+    if ((connector = malloc(connector_len)) == NULL) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to allocate a connector!\n");
+        goto fin;
+    }
+    memcpy(connector, sstr, connector_len);
+    ret = 1;
+fin:
+    if (ret < 1) {
+        if (configurator_signkey != NULL) {
+            EC_KEY_free(configurator_signkey);
+        }
+    }
+    if (x != NULL) {
+        BN_free(x);
+    }
+    if (y != NULL) {
+        BN_free(y);
+    }
+    return ret;
+}
+
+static int
+process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int len)
+{
+    TLV *tlv;
+    unsigned char *val;
+    EVP_ENCODE_CTX *ectx = NULL;
+    siv_ctx ctx;
+    char *sstr, *estr;
+    int i, wrapdatalen, ntok, ncred, ret = -1;
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config response!\n");
 
@@ -1643,21 +3125,52 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
      * keep track of how much wrapped data we have left
      */
     wrapdatalen -= TLV_length(tlv);
-    
-    if (*val != STATUS_OK) {
-        dpp_debug(DPP_DEBUG_ERR, "Configurator returned %d as status in DPP Config Response: FAIL!\n",
-                  *val);
-        goto fin;
+
+    switch (*val) {
+        case STATUS_OK:
+            break;
+        case STATUS_CONFIGURE_PENDING:
+            dpp_debug(DPP_DEBUG_TRACE, "Configurator said configuration is pending...\n");
+            break;
+        case STATUS_CSR_NEEDED:
+            dpp_debug(DPP_DEBUG_TRACE, "Configurator said we need a CSR to continue...\n");
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "Configurator returned %d as status in DPP Config Response: FAIL!\n",
+                      *val);
+            goto fin;
     }
     tlv = TLV_next(tlv);
     /*
      * we should have one or more configuration objects now, scroll through them
      */
     TLV_foreach(tlv, i, wrapdatalen) {
+        if (TLV_type(tlv) == CSR_ATTRS_REQUEST) {
+            /*
+             * OK, gotta start over and supply a CSR...
+             */
+            debug_buffer(DPP_DEBUG_TRACE, "CSR Attributes", TLV_value(tlv), TLV_length(tlv));
+            if ((peer->csrattrs = (char *)malloc(2*TLV_length(tlv))) == NULL) {
+                goto fin;
+            }
+            if ((ectx = EVP_ENCODE_CTX_new()) == NULL) {
+                goto fin;
+            }
+            /*
+             * base64 decode the CSR Attrs to get an ASN.1 SEQUENCE OF...
+             */
+            EVP_DecodeInit(ectx);
+            (void)EVP_DecodeUpdate(ectx, (unsigned char *)peer->csrattrs, &i, TLV_value(tlv), TLV_length(tlv));
+            peer->csrattrs_len = i;
+            (void)EVP_DecodeFinal(ectx, (unsigned char *)&(peer->csrattrs[i]), &i);
+            peer->csrattrs_len += i;
+            EVP_ENCODE_CTX_free(ectx);
+            send_dpp_config_req_frame(peer);
+            return 0;
+        }
         if (TLV_type(tlv) != CONFIGURATION_OBJECT) {
             dpp_debug(DPP_DEBUG_ERR, "Other than Configuration Object in the DPP Config response: %s!\n",
                       TLV_type_string(tlv));
-            printf("we're at %d and need to get to %d\n", i, wrapdatalen);
             /*
              * be liberal in what we accept...
              */
@@ -1679,153 +3192,10 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
              * we got a connector!
              */
             dpp_debug(DPP_DEBUG_TRACE, "A DPP AKM Configuration Object!\n");
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
-                dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
+            if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "Bad connector in DPP AKM of Config response!\n");
                 goto fin;
             }
-            dot = strstr(sstr, ".");
-            memset(unb64url, 0, sizeof(unb64url));
-            /*
-             * decode the JWS Protected Header
-             */
-            if ((unburllen = base64urldecode(unb64url, (unsigned char *)sstr, dot-sstr)) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "Cannot base64url decode the JWS Protected Header!\n");
-                goto fin;
-            }
-            if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "alg")) != 1) {
-                dpp_debug(DPP_DEBUG_ERR, "Failed to get 'alg' from JWS Protected Header!\n");
-                goto fin;
-            }
-            dpp_debug(DPP_DEBUG_TRACE, "connector is signed with %.*s, ", (int)(estr - sstr), sstr);
-            if ((ntok = get_json_data((char *)unb64url, unburllen, &sstr, &estr, 1, "kid")) != 1) {
-                dpp_debug(DPP_DEBUG_ERR, "Failed to get 'kid' from JWS Protected Header!\n");
-                goto fin;
-            }
-            dpp_debug(DPP_DEBUG_TRACE, "by key with key id:\n %.*s\n", (int)(estr - sstr), sstr);
-            /*
-             * get the Configurator's signing key from the "csign" portion of the DPP Config Object
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "csign", "crv")) != 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No 'crv' coordinate in 'csign' portion of the response!\n");
-                goto fin;
-            }
-            if ((int)(estr - sstr) > 6) {
-                dpp_debug(DPP_DEBUG_ERR, "malformed 'crv' in 'csign' portion of response (%d chars)\n",
-                          (int)(estr - sstr));
-                goto fin;
-            }
-    
-            if (strncmp(sstr, "P-256", 5) == 0) {
-                signnid = NID_X9_62_prime256v1;
-                coordlen = P256_COORD_LEN;
-            } else if (strncmp(sstr, "P-384", 5) == 0) {
-                signnid = NID_secp384r1;
-                coordlen = P384_COORD_LEN;
-            } else if (strncmp(sstr, "P-521", 5) == 0) {
-                signnid = NID_secp521r1;
-                coordlen = P521_COORD_LEN;
-#ifdef HAS_BRAINPOOL
-            } else if (strncmp(sstr, "BP-256", 6) == 0) {
-                signnid = NID_brainpoolP256r1;
-                coordlen = P256_COORD_LEN;
-            } else if (strncmp(sstr, "BP-384", 6) == 0) {
-                signnid = NID_brainpoolP384r1;
-                coordlen = P384_COORD_LEN;
-            } else if (strncmp(sstr, "BP-512", 6) == 0) {
-                signnid = NID_brainpoolP512r1;
-                coordlen = P512_COORD_LEN;
-#endif  /* HAS_BRAINPOOL */
-            } else {
-                dpp_debug(DPP_DEBUG_ERR, "unknown elliptic curve %.*s!\n", (int)(estr - sstr), sstr);
-                goto fin;
-            }
-
-            if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
-                dpp_debug(DPP_DEBUG_ERR, "unable to get coordinates to create configurator's signing key\n");
-                goto fin;
-            }
-            /*
-             * get the x-coordinate...
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "csign", "x")) != 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No 'x' coordinate in 'csign' portion of the response!\n");
-                goto fin;
-            }
-    
-            if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
-                dpp_debug(DPP_DEBUG_ERR, "Mal-sized x-coordinate (%d)\n",
-                          (int)(estr - sstr));
-                goto fin;
-            }
-            memset(coordbin, 0, coordlen);
-            if ((cl = base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr)))) != coordlen) {
-                dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate: %d instead of %d\n", cl, coordlen);
-                print_buffer("coord-x", coordbin, cl);
-                goto fin;
-            }
-            BN_bin2bn(coordbin, coordlen, x);
-            /*
-             * get the y-coordinate...
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "csign", "y")) != 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No 'y' coordinate in 'csign' portion of the response!\n");
-                goto fin;
-            }
-            if ((int)(estr - sstr) > (((coordlen+2)/3) * 4)) {
-                dpp_debug(DPP_DEBUG_ERR, "Mal-sized y-coordinate (%d)\n",
-                          (int)(estr - sstr));
-                goto fin;
-            }
-            memset(coordbin, 0, coordlen);
-            if (base64urldecode(coordbin, (unsigned char *)sstr, ((int)(estr - sstr))) != coordlen) {
-                dpp_debug(DPP_DEBUG_ERR, "b64url-decoded wrong-sized coordinate\n");
-                goto fin;
-            }
-            BN_bin2bn(coordbin, coordlen, y);
-
-            /*
-             * create an EC_KEY out of "crv", "x", and "y"
-             */
-            configurator_signkey = EC_KEY_new_by_curve_name(signnid);
-            EC_KEY_set_public_key_affine_coordinates(configurator_signkey, x, y);
-            EC_KEY_set_conv_form(configurator_signkey, POINT_CONVERSION_COMPRESSED);
-            EC_KEY_set_asn1_flag(configurator_signkey, OPENSSL_EC_NAMED_CURVE);
-            if (((signgroup = EC_KEY_get0_group(configurator_signkey)) == NULL) ||
-                ((P = EC_KEY_get0_public_key(configurator_signkey)) == NULL) ||
-                !EC_POINT_is_on_curve(signgroup, P, bnctx)) {
-                dpp_debug(DPP_DEBUG_ERR, "configurator's signing key is not valid!\n");
-                goto fin;
-            }
-            dpp_debug(DPP_DEBUG_TRACE, "configurator's signing key is valid!!!\n");
-
-            if (get_kid_from_point(csign_kid, signgroup, P, bnctx) < KID_LENGTH) {
-                dpp_debug(DPP_DEBUG_ERR, "can't get key id for configurator's sign key!\n");
-                goto fin;
-            }
-        
-            /*
-             * validate the connector
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "cred", "signedConnector")) == 0) {
-                dpp_debug(DPP_DEBUG_ERR, "No connector in DPP Config response!\n");
-                goto fin;
-            }
-            if (validate_connector((unsigned char *)sstr, (int)(estr - sstr), configurator_signkey, bnctx) < 0) {
-                dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
-                goto fin;
-            }
-            connector_len = (int)(estr - sstr);
-            if ((connector = malloc(connector_len)) == NULL) {
-                connector_len = 0;
-                dpp_debug(DPP_DEBUG_ERR, "Unable to allocate a connector!!\n");
-                goto fin;
-            }
-            memcpy(connector, sstr, connector_len);
             if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
                 dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
                 goto fin;
@@ -1851,7 +3221,7 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
              */
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 2, "cred", "pass")) != 0) {
-                printf("use password '%.*s' ", (int)(estr - sstr), sstr);
+                dpp_debug(DPP_DEBUG_TRACE, "use password '%.*s' ", (int)(estr - sstr), sstr);
                 strncpy(pwd, sstr, (int)(estr - sstr));
             } else {
                 dpp_debug(DPP_DEBUG_ERR, "Unknown type of sae, not 'pass'\n");
@@ -1859,9 +3229,21 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             }
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                printf("with an any SSID I guess\n");
+                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
             } else {
-                printf("with SSID %.*s\n", (int)(estr - sstr), sstr);
+                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+            }
+            if (peer->version > 1) {
+                /*
+                 * connector is v2 only
+                 */
+                if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                    dpp_debug(DPP_DEBUG_ERR, "Bad connector in SAE AKM of Config response!\n");
+                    goto fin;
+                }
+                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                    connector, connector_len, peer->handle);
+                dpp_debug(DPP_DEBUG_TRACE, "got valid connector with SAE config\n");
             }
             dump_pwd_con(sstr, (int)(estr - sstr), pwd, 1);
         } else if (strncmp(sstr, "psk", 3) == 0) {
@@ -1874,11 +3256,11 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
              */
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 2, "cred", "pass")) != 0) {
-                printf("use passphrase '%.*s' ", (int)(estr - sstr), sstr);
+                dpp_debug(DPP_DEBUG_TRACE, "use passphrase '%.*s' ", (int)(estr - sstr), sstr);
                 strncpy(pwd, sstr, (int)(estr - sstr));
             } else if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                              &sstr, &estr, 2, "cred", "psk_hex")) != 0) {
-                printf("use hexstring '%.*s' ", (int)(estr - sstr), sstr);
+                dpp_debug(DPP_DEBUG_TRACE, "use hexstring '%.*s' ", (int)(estr - sstr), sstr);
                 strncpy(pwd, sstr, (int)(estr - sstr));
             } else {
                 dpp_debug(DPP_DEBUG_ERR, "Unknown type of psk, not 'pass' and not 'psk_hex'\n");
@@ -1886,11 +3268,63 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             }
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                printf("with an any SSID I guess\n");
+                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
             } else {
-                printf("with SSID %.*s\n", (int)(estr - sstr), sstr);
+                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+            }
+            if (peer->version > 1) {
+                /*
+                 * connector is v2 only
+                 */
+                if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                    dpp_debug(DPP_DEBUG_ERR, "Bad connector in PSK AKM of Config response!\n");
+                    goto fin;
+                }
+                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                    connector, connector_len, peer->handle);
+                dpp_debug(DPP_DEBUG_TRACE, "got valid connector with PSK config\n");
             }
             dump_pwd_con(sstr, (int)(estr - sstr), pwd, 0);
+        } else if (strncmp(sstr, "dot1x", 4) == 0) {
+            char *p7, *ca;
+            int p7len, calen;
+            
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "entCreds", "certBag")) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No certBag in DPP Config response for dot1x!\n");
+                goto fin;
+            }
+            dpp_debug(DPP_DEBUG_PKI, "got PKCS#7:\n %.*s\n", (int)(estr - sstr), sstr);
+            p7 = sstr;
+            p7len = (int)(estr - sstr);
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "entCreds", "caCert")) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No caCert in DPP Config response for dot1x!\n");
+                ca = NULL;
+                calen = 0;
+            } else {
+                ca = sstr;
+                calen = (int)(estr - sstr);
+                dpp_debug(DPP_DEBUG_PKI, "got CA cert:\n %.*s\n", calen, ca);
+            }
+            extract_certs(p7, p7len, ca, calen);
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
+            } else {
+                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+            }
+            dump_cert_con(sstr, (int)(estr - sstr), p7, p7len);
+            /*
+             * dot1x credentials are v2 only so there'll always be a connector
+             */
+            if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "Bad connector in dot1x AKM of Config response!\n");
+                goto fin;
+            }
+            provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                connector, connector_len, peer->handle);
+            dpp_debug(DPP_DEBUG_TRACE, "got valid connector with dot1x config\n");
         } else {
             dpp_debug(DPP_DEBUG_ERR, "Unknown credential type %.*s!\n", (int)(estr - sstr), sstr);
             goto fin;
@@ -1898,18 +3332,44 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
     }
     ret = 1;
 fin:
-    if (ret < 1) {
-        if (configurator_signkey != NULL) {
-            EC_KEY_free(configurator_signkey);
-        }
-    }
-    if (x != NULL) {
-        BN_free(x);
-    }
-    if (y != NULL) {
-        BN_free(y);
+    if (ectx != NULL) {
+        EVP_ENCODE_CTX_free(ectx);
     }
     return ret;
+}
+
+static void
+p7fromca (int s, void *data)
+{
+    struct candidate *peer = (struct candidate *)data;
+
+    peer->p7 = NULL;
+    if ((peer->p7len = get_pkcs7(s, &peer->p7)) < 1) {
+        dpp_debug(DPP_DEBUG_ERR, "cannot obtain p7 from CA!\n");
+        generate_dpp_config_resp_frame(peer, STATUS_CONFIGURE_FAILURE);
+    } else {
+        dpp_debug(DPP_DEBUG_PKI, "got a %d byte PKCS7 from CA!\n", peer->p7len);
+        generate_dpp_config_resp_frame(peer, STATUS_OK);
+    }
+    /*
+     * generate a config response frame in the peer buffer and wait for
+     * the next COMEBACK_REQUEST...
+     */
+    peer->state = DPP_PROVISIONING;     // put back into PROVISIONING state
+    peer->nextfragment = 0;             // we start fragmenting at the beginning
+
+    return;
+}
+
+static void
+p10toca (struct candidate *peer, char *p10, int p10len)
+{
+    if (send_pkcs10(p10, p10len, dpp_instance.caip, peer, p7fromca) < 0) {
+        dpp_debug(DPP_DEBUG_ERR, "unable to send PKCS10 to CA!\n");
+        return;
+    }
+    dpp_debug(DPP_DEBUG_PKI, "send %d byte PKCS10 to CA!\n", p10len);
+    return;
 }
 
 static int
@@ -1970,7 +3430,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
      * parse the config attributes object for some interesting info
      */
     if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                              &sstr, &estr, 1, "name")) == 0) {
+                              &sstr, &estr, 1, "name")) < 1) {
         return -1;
     }
     dpp_debug(DPP_DEBUG_ANY, "there are %d result(s) for 'name': %.*s\n",
@@ -1982,7 +3442,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     }
 
     if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                              &sstr, &estr, 1, "netRole")) == 0) {
+                              &sstr, &estr, 1, "netRole")) < 1) {
         return -1;
     }
     dpp_debug(DPP_DEBUG_ANY, "there are %d result(s) for 'netRole': %.*s\n",
@@ -1993,14 +3453,29 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         strncpy(peer->enrollee_role, sstr, estr - sstr);
     }
 
+    if (dpp_instance.enterprise) {
+        if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                  &sstr, &estr, 1, "pkcs10")) < 1) {
+            dpp_debug(DPP_DEBUG_TRACE, "provisioning enterprise credentials but no CSR\n");
+            return 0;
+        }
+        dpp_debug(DPP_DEBUG_PKI, "there's %d result(s) of a CSR:\n %.*s\n",
+                  ntok, estr - sstr, sstr);
+        p10toca(peer, sstr, (int)(estr - sstr));
+        // send the CSR off to the CA here!
+        // when we get the cert back we set the status back to authenticated
+        return 1;
+    }
+
     if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                               &sstr, &estr, 1, "mudurl")) > 0) {
-        dpp_debug(DPP_DEBUG_ANY, "got a MUD URL of %.*s\n",
+        dpp_debug(DPP_DEBUG_TRACE, "got a MUD URL of %.*s\n",
                   estr - sstr, sstr);
 // TODO: when we handle pending responses do this
-//        return 0;
+//        return SOMETHING
     }
-    return 1;
+
+    return 2;
 }
 
 int
@@ -2010,7 +3485,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
     gas_action_resp_frame *garp;
     gas_action_comeback_resp_frame *gacrp;
     struct candidate *peer = NULL;
-    int ret = -1, ready_to_send;
+    int ret = -1;
     
     TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
         if (peer->handle == handle) {
@@ -2027,128 +3502,207 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
      */
     srv_rem_timeout(srvctx, peer->t0);
 
-    switch (field) {
-        case BAD_DPP_SPEC_MESSAGE:
-            /*
-             * this is not a GAS frame. Unfortunately the spec uses GAS for the
-             * request and response but a regular DPP action frame for the confirm.
-             * So overload the "field" (it's just a uchar) and special case it here
-             */
-            process_dpp_config_result(peer, data, len);
-            break;
-        case GAS_INITIAL_REQUEST:
-            dpp_debug(DPP_DEBUG_TRACE, "got a GAS_INITIAL_REQUEST...\n");
-            if (peer->core != DPP_CONFIGURATOR) {
-                return ret;
-            }
-            garq = (gas_action_req_frame *)data;
-            if (memcmp(garq->ad_proto_elem, dpp_proto_elem_req, 2) ||
-                memcmp(garq->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
-                dpp_debug(DPP_DEBUG_ERR, "got an gas action frame, not a dpp config frame\n");
-                return ret;
-            }
-            peer->dialog_token = garq->dialog_token;
-            ready_to_send = process_dpp_config_request(peer, garq->query_req, len - sizeof(gas_action_req_frame));
-            switch (ready_to_send) {
-                case 1:
-                    send_dpp_config_resp_frame(peer, STATUS_OK);
+    if (peer->core == DPP_CONFIGURATOR) {
+        switch (peer->state) {
+            case DPP_AUTHENTICATED:
+                if (field != GAS_INITIAL_REQUEST) {
+                    dpp_debug(DPP_DEBUG_ERR, "Authenticated peer but peer didn't send INITIAL REQUEST\n");
                     break;
-                case 0:
-                    send_dpp_config_resp_frame(peer, STATUS_CONFIGURE_PENDING);
-                    break;
-                default:
-                    dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config request!\n");
-                    send_dpp_config_resp_frame(peer, STATUS_CONFIGURE_FAILURE);
-            }
-            break;
-        case GAS_INITIAL_RESPONSE:
-            dpp_debug(DPP_DEBUG_TRACE, "got a GAS_INITIAL_RESPONSE...\n");
-            if (peer->core != DPP_ENROLLEE) {
-                return ret;
-            }
-            garp = (gas_action_resp_frame *)data;
-            if (memcmp(garp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
-                memcmp(garp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
-                dpp_debug(DPP_DEBUG_ERR, "got a gas action frame, not a dpp config frame\n");
-                return ret;
-            }
-            dpp_debug(DPP_DEBUG_TRACE, "response len is %d, comeback delay is %d\n",
-                      garp->query_resplen, garp->comeback_delay);
-            if (garp->query_resplen) {
-                /*
-                 * if we got the query response then process it
-                 */
-                if (process_dpp_config_response(peer, garp->query_resp, len - sizeof(gas_action_resp_frame)) < 1) {
-                    dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
-                    return -1;
                 }
-                if (peer->version > 1) {
-                    send_dpp_config_result(peer, STATUS_OK);
+                dpp_debug(DPP_DEBUG_TRACE, "got a GAS_INITIAL_REQUEST...\n");
+                garq = (gas_action_req_frame *)data;
+                if (memcmp(garq->ad_proto_elem, dpp_proto_elem_req, 2) ||
+                    memcmp(garq->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
+                    dpp_debug(DPP_DEBUG_ERR, "got an gas action frame, not a dpp config frame\n");
+                    return ret;
                 }
-            } else if (garp->comeback_delay == 1) {
-                /*
-                 * otherwise the response is going to be fragmented, ask for 1st fragment
-                 */
-                send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
-            }
-            break;
-        case GAS_COMEBACK_REQUEST:
-            dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_REQUEST...\n");
-            if (peer->core != DPP_CONFIGURATOR) {
-                return ret;
-            }
-            /*
-             * this frame is not secured in any way, all we can do is send next fragment...
-             * ...check whether we've sent everything so we don't just continue to respond
-             * to these things ad infinitum
-             */
-            if (peer->nextfragment < peer->bufferlen) {
+                peer->dialog_token = garq->dialog_token;
+                ret = process_dpp_config_request(peer, garq->query_req, len - sizeof(gas_action_req_frame));
+                switch (ret) {
+                    case 0:
+                        /* don't advance the state, we're starting over */
+                        generate_dpp_config_resp_frame(peer, STATUS_CSR_NEEDED);
+                        break;
+                    case 1:
+                        peer->state = DPP_CA_RESP_PENDING;
+                        break;
+                    case 2:
+                        generate_dpp_config_resp_frame(peer, STATUS_OK);
+                        peer->state = DPP_PROVISIONING;
+                        break;
+                    default:
+                        dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config request!\n");
+                        return ret;
+                }
+                (void)send_dpp_config_frame(peer, GAS_INITIAL_RESPONSE);
+                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
+                break;
+            case DPP_PROVISIONING:
+                switch (field) {
+                    case GAS_COMEBACK_REQUEST:
+                        dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_REQUEST...\n");
+                        /*
+                         * this frame is not secured in any way, all we can do is send next fragment...
+                         * ...check whether we've sent everything so we don't just continue to respond
+                         * to these things ad infinitum
+                         *
+                         * set the timer so in case the client disappears we don't just sit here
+                         * with a zombie peer, kill it after enough retransmissions
+                         */
+                        if (peer->nextfragment < peer->bufferlen) {
+                            send_dpp_config_frame(peer, GAS_COMEBACK_RESPONSE);
+                            /*
+                             * if there's still more fragments we're telling the enrollee to come
+                             * back immediately so set a shorter timeout. If we're done (and v2+)
+                             * let the enrollee provision things and scan etc before coming back
+                             * with the CONFIG RESULT
+                             */
+                            if (peer->nextfragment < peer->bufferlen) {
+                                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                            } else if (peer->version > 1) {
+                                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(10), retransmit_config, peer);
+                            }
+                        }
+                        break;
+                    case BAD_DPP_SPEC_MESSAGE:
+                        dpp_debug(DPP_DEBUG_TRACE, "got a CONFIG_RESULT...\n");
+                        /*
+                         * this is not a GAS frame. Unfortunately the spec uses GAS for the
+                         * request and response but a regular DPP action frame for the confirm.
+                         * So overload the "field" (it's just a uchar) and special case it here
+                         */
+                        process_dpp_config_result(peer, data, len);
+                        peer->state = DPP_PROVISIONED;
+                        break;
+                    default:
+                        dpp_debug(DPP_DEBUG_ERR, "configurator in PROVISIONING but got a %d frame\n", field);
+                        return ret;
+                }
+                break;
+            case DPP_CA_RESP_PENDING:
+                if (field != GAS_COMEBACK_REQUEST) {
+                    dpp_debug(DPP_DEBUG_ERR, "waiting for CA response but got %d, not a COMEBACK REQUEST\n", field);
+                    return ret;
+                }
+                dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_REQUEST (we're still pending)...\n");
                 send_dpp_config_frame(peer, GAS_COMEBACK_RESPONSE);
-            }
-            break;
-        case GAS_COMEBACK_RESPONSE:
-            dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_RESPONSE...\n");
-            if (peer->core != DPP_ENROLLEE) {
-                return ret;
-            }
-            gacrp = (gas_action_comeback_resp_frame *)data;
-            if (memcmp(gacrp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
-                memcmp(gacrp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
-                dpp_debug(DPP_DEBUG_ERR, "got an gas action frame, not a dpp config frame\n");
-                return ret;
-            }
-            if (gacrp->status_code) {
-                dpp_debug(DPP_DEBUG_ERR, "got a gas comeback response with status %d\n",
-                          gacrp->status_code);
-                return ret;
-            }
-            if ((peer->nextfragment + gacrp->query_resplen) > sizeof(peer->buffer)) {
-                dpp_debug(DPP_DEBUG_ERR, "a bit too many fragments\n");
-            }
-            /*
-             * use the buffer and next fragment field since the enrollee is not using it
-             */
-            memcpy(peer->buffer + peer->nextfragment, gacrp->query_resp, gacrp->query_resplen);
-            peer->nextfragment += gacrp->query_resplen;
-            /*
-             * if there's more fragments then ask for them, otherwise process the frame
-             */
-            if (gacrp->fragment_id & 0x80) {
-                send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
-            } else {
-                if (process_dpp_config_response(peer, peer->buffer, peer->nextfragment) < 1) {
-                    dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
-                    return -1;
+                /*
+                 * set a timer here for the same reason we did it above, prevent zombies
+                 */
+                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                break;
+            case DPP_PROVISIONED:
+                dpp_debug(DPP_DEBUG_ERR, "already provisioned!\n");
+                break;
+            default:
+                dpp_debug(DPP_DEBUG_ERR, "unknown state for DPP Config exchange: %s\n", peer->state);
+        }
+    } else {    /* enrollee */
+        switch (peer->state) {
+            case DPP_PROVISIONING:
+                switch (field) {
+                    case GAS_INITIAL_RESPONSE:
+                        dpp_debug(DPP_DEBUG_TRACE, "got a GAS_INITIAL_RESPONSE...\n");
+                        garp = (gas_action_resp_frame *)data;
+                        if (memcmp(garp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
+                            memcmp(garp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
+                            dpp_debug(DPP_DEBUG_ERR, "got a gas action frame, not a dpp config frame\n");
+                            return ret;
+                        }
+                        dpp_debug(DPP_DEBUG_TRACE, "response len is %d, comeback delay is %d\n",
+                                  garp->query_resplen, garp->comeback_delay);
+                        if (garp->comeback_delay) {
+                            srv_add_timeout(srvctx, SRV_MSEC(garp->comeback_delay), cameback_delayed, peer);
+                            return 1;
+                        }
+                        if (garp->query_resplen) {
+                            /*
+                             * if we got the query response then process it
+                             */
+                            if ((ret = process_dpp_config_response(peer, garp->query_resp,
+                                                                   len - sizeof(gas_action_resp_frame))) < 0) {
+                                dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
+                                return -1;
+                            }
+                            /*
+                             * a ret of 0 means we already responded with a CSR, don't want to send a 
+                             * config result in this case
+                             */
+                            if ((ret > 0) && (peer->version > 1)) {
+                                send_dpp_config_result(peer, STATUS_OK);
+                                peer->state = DPP_PROVISIONED;
+                            }
+                        } else if (garp->comeback_delay == 1) {
+                            /*
+                             * otherwise the response is going to be fragmented, ask for 1st fragment
+                             */
+                            send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
+                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                        }
+                        break;
+                    case GAS_COMEBACK_RESPONSE:
+                        dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_RESPONSE...\n");
+                        gacrp = (gas_action_comeback_resp_frame *)data;
+                        if (memcmp(gacrp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
+                            memcmp(gacrp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
+                            dpp_debug(DPP_DEBUG_ERR, "got an gas action frame, not a dpp config frame\n");
+                            return -1;
+                        }
+                        if (gacrp->status_code) {
+                            dpp_debug(DPP_DEBUG_ERR, "got a gas comeback response with status %d\n",
+                                      gacrp->status_code);
+                            return -1;
+                        }
+                        /*
+                         * if we're being told to comeback later then come back later...
+                         */
+                        if (gacrp->comeback_delay) {
+                            dpp_debug(DPP_DEBUG_TRACE, "told to come back in %d TUs\n", gacrp->comeback_delay);
+                            srv_add_timeout(srvctx, SRV_MSEC(gacrp->comeback_delay), cameback_delayed, peer);
+                            return 1;
+                        }
+                        if ((peer->nextfragment + gacrp->query_resplen) > sizeof(peer->buffer)) {
+                            dpp_debug(DPP_DEBUG_ERR, "a bit too many fragments\n");
+                        }
+                        /*
+                         * use the buffer and next fragment field since the enrollee is not using it
+                         */
+                        memcpy(peer->buffer + peer->nextfragment, gacrp->query_resp, gacrp->query_resplen);
+                        peer->nextfragment += gacrp->query_resplen;
+                        dpp_debug(DPP_DEBUG_TRACE, "getting another %d fragment, total so far is %d\n",
+                                  gacrp->query_resplen, peer->nextfragment);
+                        /*
+                         * if there's more fragments then ask for them, otherwise process the frame
+                         */
+                        if (gacrp->fragment_id & 0x80) {
+                            dpp_debug(DPP_DEBUG_TRACE, "ask for next fragment\n");
+                            send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
+                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                        } else {
+                            dpp_debug(DPP_DEBUG_TRACE, "final fragment, %d total\n", peer->nextfragment);
+                            if (process_dpp_config_response(peer, peer->buffer, peer->nextfragment) < 1) {
+                                dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config response!\n");
+                                return -1;
+                            }
+                            if (peer->version > 1) {
+                                send_dpp_config_result(peer, STATUS_OK);
+                            }
+                        }
+                        break;
                 }
-                if (peer->version > 1) {
-                    send_dpp_config_result(peer, STATUS_OK);
-                }
-            }
-            break;
-        default:
-            break;
+                break;
+            case DPP_PROVISIONED:
+                dpp_debug(DPP_DEBUG_ERR, "Already provisioned, got a %d frame...\n", field);
+                send_dpp_config_result(peer, STATUS_OK);
+                break;
+            case DPP_CA_RESP_PENDING:
+            case DPP_AUTHENTICATED:
+                break;
+            default:
+                dpp_debug(DPP_DEBUG_ERR, "unknown state for DPP Config exchange: %s\n", peer->state);
+        }
     }
-            
+
     return 1;
 }
 
@@ -2166,8 +3720,10 @@ no_peer (timerid id, void *data)
 static void
 start_config_protocol (timerid id, void *data)
 {
+    struct candidate *peer = (struct candidate *)data;
     dpp_debug(DPP_DEBUG_TRACE, "beginning DPP Config protocol\n");
-    send_dpp_config_req_frame ((struct candidate *)data);
+    send_dpp_config_req_frame(peer);
+    peer->state = DPP_PROVISIONING;
 }
 
 //----------------------------------------------------------------------
@@ -2383,20 +3939,26 @@ compute_ke (struct candidate *peer, BIGNUM *n, BIGNUM *l)
         memcpy(salt+dpp_instance.noncelen, peer->mynonce, dpp_instance.noncelen);
     }
     /*
-     * and compute ke from ikm
+     * and compute bk and ke from ikm
      */
     if (peer->mauth && l != NULL) {
-        hkdf(dpp_instance.hashfcn, 0,
-             ikm, 3 * dpp_instance.primelen,
-             salt, 2*dpp_instance.noncelen,
-             (unsigned char *)"DPP Key", strlen("DPP Key"),
-             peer->ke, dpp_instance.digestlen);
+        hkdf_extract(dpp_instance.hashfcn,
+                     salt, 2*dpp_instance.noncelen,
+                     ikm, 3*dpp_instance.primelen,
+                     peer->bk);
+        hkdf_expand(dpp_instance.hashfcn,
+                    peer->bk, dpp_instance.digestlen,
+                    (unsigned char *)"DPP Key", strlen("DPP Key"),
+                    peer->ke, dpp_instance.digestlen);
     } else {
-        hkdf(dpp_instance.hashfcn, 0,
-             ikm, 2 * dpp_instance.primelen,
-             salt, 2*dpp_instance.noncelen,
-             (unsigned char *)"DPP Key", strlen("DPP Key"),
-             peer->ke, dpp_instance.digestlen);
+        hkdf_extract(dpp_instance.hashfcn,
+                     salt, 2*dpp_instance.noncelen,
+                     ikm, 2*dpp_instance.primelen,
+                     peer->bk);
+        hkdf_expand(dpp_instance.hashfcn,
+                    peer->bk, dpp_instance.digestlen,
+                    (unsigned char *)"DPP Key", strlen("DPP Key"),
+                    peer->ke, dpp_instance.digestlen);
     }
     if (ikm != NULL) {
         free(ikm);
@@ -3948,7 +5510,7 @@ init_dpp_auth (timerid id, void *data)
 }
 
 dpp_handle
-dpp_create_peer (char *keyb64, int initiator, int mutualauth)
+dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
 {
     struct candidate *peer;
     const BIGNUM *priv;
@@ -3975,6 +5537,23 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth)
     peer->t0 = 0;
     peer->my_proto = NULL;
     peer->mauth = initiator ? 1 : mutualauth;   /* initiator changes, responder set */
+    peer->csrattrs = NULL;
+    peer->csrattrs_len = 0;
+
+    if (mtu) {
+        if (mtu > 8192) {
+            dpp_debug(DPP_DEBUG_ANY, "cannot have an MTU of %d\n", mtu);
+            free(peer);
+            return -1;
+        }
+        peer->mtu = mtu;
+    } else {
+        peer->mtu = 8192;
+    }
+    if ((peer->frame = malloc(peer->mtu)) == NULL) {
+        free(peer);
+        return -1;
+    }
 
     peer->is_initiator = initiator;
     if (peer->is_initiator) {
@@ -4028,11 +5607,11 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth)
     } else if (do_chirp) {
         struct chirpdest *chirpto;
 
-        printf("chirp list:\n");
+        dpp_debug(DPP_DEBUG_TRACE, "chirp list:\n");
         TAILQ_FOREACH(chirpto, &chirpdests, entry) {
-            printf("\t%ld\n", chirpto->freq);
+            dpp_debug(DPP_DEBUG_TRACE, "\t%ld\n", chirpto->freq);
         }
-        printf("start chirping...\n");
+        dpp_debug(DPP_DEBUG_TRACE, "start chirping...\n");
         peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(500), start_dpp_chirp, peer);
     }
     
@@ -4096,12 +5675,12 @@ addpolicy (char *akm, char *password, char *ssid)
 
 int
 dpp_initialize (int core, char *keyfile, char *signkeyfile,
-                char *enrolleerole, char *mudurl, int chirp,
+                char *enrolleerole, char *mudurl, int chirp, char *caip,
                 int opclass, int channel, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;
-    int ret = 0, ndppakm;
+    int ret = 0;
     BIGNUM *prime = NULL;
     struct cpolicy cp, *pol;
 
@@ -4173,28 +5752,30 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
         if (TAILQ_EMPTY(&cpolicies)) {
             addpolicy("dpp", "<none>", "goaway");
         }
-        ndppakm = 0;
         TAILQ_FOREACH(pol, &cpolicies, entry) {
-            if (strstr(pol->akm, "dpp") != NULL) {
-                ndppakm++;
+            if (strstr(pol->akm, "dot1x") != NULL) {
+                dpp_instance.enterprise = 1;
             }
-        }
-        /*
-         * DPPv2 requires a connector, if only PSK or SAE AKMs have been
-         * specified, clone the first with DPP to include a connector.
-         */
-        if (ndppakm == 0) {
-            pol = TAILQ_FIRST(&cpolicies);
-            addpolicy("dpp", "<none>", pol->ssid);
-        }
-        TAILQ_FOREACH(pol, &cpolicies, entry) {
-            printf("AKM: %s, password: %s, SSID: %s\n",
+            dpp_debug(DPP_DEBUG_TRACE, "AKM: %s, password: %s, SSID: %s\n",
                    pol->akm, pol->password, pol->ssid);
         }
     } else {
         strcpy(dpp_instance.enrollee_role, enrolleerole);
         if (mudurl) {
             strcpy(dpp_instance.mudurl, mudurl);
+        }
+    }
+
+    dpp_instance.cacert = NULL;
+    if (dpp_instance.enterprise) {
+        if ((dpp_instance.cacert_len = get_cacerts(&dpp_instance.cacert, caip)) < 0) {
+            dpp_debug(DPP_DEBUG_ERR, "can't talk to CA!\n");
+            dpp_debug(DPP_DEBUG_ERR, "turning off enterprise for DPP\n");
+            dpp_instance.enterprise = 0;
+        } else {
+            strcpy(dpp_instance.caip, caip);
+            dpp_debug(DPP_DEBUG_TRACE, "got a %d byte cert from CA at %s\n",
+                      dpp_instance.cacert_len, caip);
         }
     }
 

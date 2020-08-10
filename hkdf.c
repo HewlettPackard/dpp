@@ -38,6 +38,94 @@
 #include <openssl/sha.h>
 
 int
+hkdf_extract (const EVP_MD *h,
+              unsigned char *salt, int saltlen,
+              unsigned char *ikm, int ikmlen,
+              unsigned char *prk)               // prklen depnds on h
+{
+    unsigned char *tweak;
+    int prklen, tweaklen;
+    HMAC_CTX *ctx;
+
+    prklen = EVP_MD_size(h);
+    if ((ctx = HMAC_CTX_new()) == NULL) {
+        perror("HMAC_CTX_new()");
+        return -1;
+    }
+
+    if (!salt || (saltlen == 0)) {
+        if ((tweak = (unsigned char *)malloc(prklen)) == NULL) {
+            perror("malloc");
+            HMAC_CTX_free(ctx);
+            return 0;
+        }
+        memset(tweak, 0, prklen);
+        tweaklen = prklen;
+    } else {
+        tweak = salt;
+        tweaklen = saltlen;
+    }
+    (void)HMAC(h, tweak, tweaklen, ikm, ikmlen, prk, &prklen);
+    if (!salt || (saltlen == 0)) {
+        free(tweak);
+    }
+    HMAC_CTX_free(ctx);
+    return prklen;
+}
+
+int
+hkdf_expand (const EVP_MD *h,
+             unsigned char *prk, int prklen,    // "at least HashLen octets"
+             unsigned char *info, int infolen,
+             unsigned char *okm, int okmlen)
+{
+    HMAC_CTX *ctx;
+    unsigned char ctr, *digest;
+    int len, digestlen;
+
+    digestlen = EVP_MD_size(h);
+    if ((digest = (unsigned char *)malloc(digestlen)) == NULL) {
+        perror("malloc");
+        return -1;
+    }
+    if ((ctx = HMAC_CTX_new()) == NULL) {
+        perror("HMAC_CTX_new()");
+        return -1;
+    }
+
+    memset(digest, 0, digestlen);
+    digestlen = 0;
+    ctr = 0;
+    len = 0;
+    while (len < okmlen) {
+        /*
+         * T(0) = all zeros
+         * T(n) = HMAC(prk, T(n-1) | info | counter)
+         * okm = T(0) | ... | T(n)
+         */
+        ctr++;
+        HMAC_Init_ex(ctx, prk, prklen, h, NULL);
+        HMAC_Update(ctx, digest, digestlen);
+        if (info && (infolen != 0)) {
+            HMAC_Update(ctx, info, infolen);
+        }
+        HMAC_Update(ctx, &ctr, sizeof(unsigned char));
+        HMAC_Final(ctx, digest, &digestlen);
+        if ((len + digestlen) > okmlen) {
+            memcpy(okm + len, digest, okmlen - len);
+        } else {
+            memcpy(okm + len, digest, digestlen);
+        }
+        HMAC_CTX_reset(ctx);
+        len += digestlen;
+    }
+    free(digest);
+    HMAC_CTX_free(ctx);
+
+    return okmlen;
+}
+
+int
 hkdf (const EVP_MD *h, int skip,
       unsigned char *ikm, int ikmlen,
       unsigned char *salt, int saltlen,
@@ -57,6 +145,7 @@ hkdf (const EVP_MD *h, int skip,
     if ((ctx = HMAC_CTX_new()) == NULL) {
         perror("HMAC_CTX_new()");
         free(digest);
+        return 0;
     }
     if (!skip) {
         /*

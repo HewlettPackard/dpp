@@ -29,24 +29,13 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+#ifndef _TALK2CA_H_
+#include "service.h"
 
-#ifndef _DPP_H_
-#define _DPP_H_
+#define CAPORT 8888
 
-typedef unsigned int dpp_handle;
+int get_cacerts(char **cap7, char *caip);
+int send_pkcs10(char *p10, int p10len, char *caip, void *data, fdcb cb);
+int get_pkcs7 (int s, char **p7);
 
-/*
- * exported APIs to interact with the DPP module
- */
-int dpp_initialize(int, char *, char *, char *, char *, int, char *, int, int, int);
-void dpp_add_chirp_freq(unsigned char *, unsigned long);
-dpp_handle dpp_create_peer(unsigned char *, int, int, int);
-void dpp_free_peer(dpp_handle);
-int process_dpp_auth_frame(unsigned char *, int, dpp_handle);
-int process_dpp_config_frame(unsigned char, unsigned char *, int, dpp_handle);
-int process_dpp_discovery_frame(unsigned char *, int, unsigned char, 
-                                unsigned char *, unsigned char *);
-unsigned char get_dpp_discovery_tid(void);
-int dpp_begin_discovery(unsigned char);
-
-#endif  /* _DPP_H_ */
+#endif  /* _TALK2CA_H_ */

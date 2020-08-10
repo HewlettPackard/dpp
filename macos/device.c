@@ -259,6 +259,11 @@ change_dpp_channel (dpp_handle unused, unsigned char foo, unsigned char bar)
     return 1;
 }
 
+int change_dpp_freq (dpp_handle handle, unsigned char foo)
+{
+    return 1;
+}
+
 int
 provision_connector (char *role, unsigned char *ssid, int ssidlen,
                      unsigned char *connector, int connlen, dpp_handle handle)
@@ -353,7 +358,7 @@ bootstrap_peer (int keyidx, int is_initiator, int mauth)
     ptr = &mac[0];
     sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth)) < 1) {
+    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
         fprintf(stderr, "unable to create peer!\n");
         return -1;
     }
@@ -491,7 +496,7 @@ main (int argc, char **argv)
     }
     if (dpp_initialize(config_or_enroll, keyfile,
                        signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
-                       NULL, 0, 0, 0, debug) < 0) {
+                       NULL, 0, NULL, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);
     }

@@ -31,7 +31,7 @@
  */
 #ifndef _UTILS_H_
 
-#define KID_LENGTH      43      // ceil((SHA256_DIGEST_LENGTH*4)/3) in bytes
+#define KID_LENGTH      43      // ceil((SHA256_DIGEST_LENGTH*4)/3)+1 in bytes
 
 int base64urlencode (unsigned char *burl, unsigned char *data, int len);
 int base64urldecode (unsigned char *data, unsigned char *burl, int len);

@@ -1,0 +1,37 @@
+#!/bin/sh
+#
+SEDCMD='s:FIXME:'`pwd`':'
+#
+cat conf/dummy.cnf | sed -e ${SEDCMD} > conf/openssl.cnf
+#
+CATOP=`pwd`
+#
+rm -rf ${CATOP}/certs
+rm -rf ${CATOP}/crl
+rm -rf ${CATOP}/newcerts
+rm -rf ${CATOP}/private
+rm ${CATOP}/serial*
+rm ${CATOP}/index*
+#
+mkdir ${CATOP}/certs
+mkdir ${CATOP}/crl
+mkdir ${CATOP}/newcerts
+mkdir ${CATOP}/private
+echo "01" > ${CATOP}/serial
+touch ${CATOP}/index.txt
+#
+echo "Generating a new EC CA..."
+#
+openssl ecparam -name ${1} -out ${CATOP}/curveparam.pem
+#
+openssl req -config ${CATOP}/conf/openssl.cnf $SSLEAY_CONFIG \
+    -newkey ec:${CATOP}/curveparam.pem -x509 \
+    -nodes -sha384 -keyout ${CATOP}/private/cakey.pem \
+    -out ${CATOP}/cacert.pem -days 3650
+#
+# make a non-PEM baset64 encoded version of the cert to 
+# send in response to enrollment requests
+#
+openssl x509 -in ${CATOP}/cacert.pem -outform DER -out ${CATOP}/cacert.der
+
+echo "...finished!"
