@@ -33,8 +33,13 @@
 #ifndef _PKEX_H_
 #define _PKEX_H_
 
-int pkex_initialize(int, char *, char *, char *, char *, char *, int, int, int);
-int pkex_initiate(unsigned char *, unsigned char *);
-int process_pkex_frame(unsigned char *, int, unsigned char *, unsigned char *);
+typedef unsigned int pkex_handle;
+
+int pkex_initialize(int, char *, char *, char *, char *, int);
+void pkex_initiate(pkex_handle);
+pkex_handle pkex_create_peer(int);
+void pkex_destroy_peer(pkex_handle);
+void pkex_update_macs(pkex_handle, unsigned char *, unsigned char *);
+int process_pkex_frame(unsigned char *, int, pkex_handle);
 
 #endif  /* _DPP_H_ */

@@ -153,13 +153,14 @@ typedef struct _dpp_action_frame {
 #define DPP_SUB_AUTH_CONFIRM        2
 #define DPP_SUB_PEER_DISCOVER_REQ   5
 #define DPP_SUB_PEER_DISCOVER_RESP  6
-#define PKEX_SUB_EXCH_REQ           7
+#define PKEX_SUB_EXCH_V1REQ         7
 #define PKEX_SUB_EXCH_RESP          8
 #define PKEX_SUB_COM_REV_REQ        9
 #define PKEX_SUB_COM_REV_RESP       10
 #define DPP_CONFIG_RESULT           11
 #define CONNECTION_STATUS_RESULT    12
 #define DPP_CHIRP                   13
+#define PKEX_SUB_EXCH_REQ           14
     unsigned char attributes[0];
 } __attribute__ ((packed)) dpp_action_frame;
 

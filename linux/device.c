@@ -59,9 +59,8 @@ service_context srvctx;
 unsigned int opclass = 81, channel = 6;
 char controller[30], bootstrapfile[80];
 int fd;
-unsigned char myfakemac[ETH_ALEN] = { 0xde, 0xad, 0xbe, 0xef, 0xf0, 0x00 };
-unsigned char peerfakemac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
-dpp_handle handle;
+dpp_handle dhandle = -1;
+pkex_handle phandle = -1;
 
 /*
  * cons up the body of an action frame and send it out to the controller
@@ -113,12 +112,9 @@ transmit_discovery_frame (unsigned char unused, char *data, int len)
 }
 
 int
-transmit_pkex_frame (unsigned char *mymac, unsigned char *peermac, char *data, int len)
+transmit_pkex_frame (pkex_handle unused, char *data, int len)
 {
-/* don't do PKEX yet
-    return cons_action_frame(PUB_ACTION_VENDOR, mymac, peermac, data, len);
-*/
-    return 1;
+    return cons_action_frame(PUB_ACTION_VENDOR, data, len);
 }
 
 static int
@@ -141,7 +137,11 @@ process_incoming_mgmt_frame (unsigned char type, unsigned char *msg, int len)
                 case DPP_SUB_AUTH_RESPONSE:
                 case DPP_SUB_AUTH_CONFIRM:
                     printf("DPP Authentication frame...\n");
-                    if (process_dpp_auth_frame(msg, len, handle) < 0) {
+                    if (dhandle < 1) {
+                        printf("...but DPP hasn't started yet!\n");
+                        return -1;
+                    }
+                    if (process_dpp_auth_frame(msg, len, dhandle) < 0) {
                         fprintf(stderr, "error processing DPP Auth frame!\n");
                         return -1;
                     }
@@ -157,12 +157,13 @@ process_incoming_mgmt_frame (unsigned char type, unsigned char *msg, int len)
                 case PKEX_SUB_COM_REV_RESP:
                 case PKEX_SUB_EXCH_RESP:
                     printf("PKEX frame...\n");
-/* don't do PKEX yet
-                    if (process_pkex_frame(msg, len, mymac, peermac) < 0) {
+                    if (phandle < 1) {
+                        printf("...but PKEX hasn't started yet!\n");
+                    }
+                    if (process_pkex_frame(msg, len, phandle) < 0) {
                         fprintf(stderr, "error processing PKEX frame!\n");
                         return -1;
                     }
-*/
                     break;
                 default:
                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -177,7 +178,11 @@ process_incoming_mgmt_frame (unsigned char type, unsigned char *msg, int len)
         case GAS_COMEBACK_REQUEST:
         case GAS_COMEBACK_RESPONSE:
             printf("GAS frame...\n");
-            if (process_dpp_config_frame(type, msg, len, handle) < 0) {
+            if (dhandle < 1) {
+                printf("...but DPP hasn't started yet!\n");
+                return -1;
+            }
+            if (process_dpp_config_frame(type, msg, len, dhandle) < 0) {
                 fprintf(stderr, "error processing DPP Config frame!\n");
                 return -1;
             }
@@ -235,14 +240,9 @@ message_from_controller (int ifd, void *data)
  *      is because it was successful, there will be a key (PMK) to plumb
  */
 void
-fin (unsigned short reason, unsigned char *mac, unsigned char *key, int keylen)
+fin (unsigned short reason, unsigned char *key, int keylen)
 {
-    printf("status of " MACSTR " is %d, ", MAC2STR(mac), reason);
-    if ((reason == 0) && (key != NULL) && (keylen > 0)) {
-        printf("plumb the %d byte key into the kernel now!\n", keylen);
-    } else {
-        printf("(an error)\n");
-    }
+    printf("fin");
 }
 
 int
@@ -270,54 +270,71 @@ provision_connector (char *role, unsigned char *ssid, int ssidlen,
     return 1;
 }
 
-#if 0
 int
-save_bootstrap_key (unsigned char *b64key, unsigned char *peermac)
+save_bootstrap_key (pkex_handle handle, void *param)
 {
+    EC_KEY *peerbskey = (EC_KEY *)param;
+    BIO *bio = NULL;
     FILE *fp = NULL;
-    unsigned char mac[20], existing[1024];
-    int ret = -1, oc, ch;
+    unsigned char mac[20], *ptr;
+    char existing[1024], newone[1024], b64bskey[1024];
+    int ret = -1, oc, ch, len, octets;
     
+    /*
+     * get the base64 encoded EC_KEY as onerow[1]
+     */
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        fprintf(stderr, "unable to create bio!\n");
+        goto fin;
+    }
+    (void)i2d_EC_PUBKEY_bio(bio, peerbskey);
+    (void)BIO_flush(bio);
+    len = BIO_get_mem_data(bio, &ptr);
+    octets = EVP_EncodeBlock((unsigned char *)newone, ptr, len);
+    BIO_free(bio);
+
+    memset(b64bskey, 0, 1024);
+    strncpy(b64bskey, newone, octets);
+
     if ((fp = fopen(bootstrapfile, "r+")) == NULL) {
         fprintf(stderr, "SSS: unable to open %s as bootstrapping file\n", bootstrapfile);
         goto fin;
     }
     ret = 0;
-    printf("peer's bootstrapping key (b64 encoded)\n%s\n", b64key);
+    printf("peer's bootstrapping key (b64 encoded)\n%s\n", b64bskey);
     while (!feof(fp)) {
         memset(existing, 0, 1024);
         if (fscanf(fp, "%d %d %d %s %s", &ret, &oc, &ch, mac, existing) < 1) {
             break;
         }
-        if (strcmp((char *)existing, (char *)b64key) == 0) {
+        if (strcmp((char *)existing, (char *)b64bskey) == 0) {
             fprintf(stderr, "SSS: bootstrapping key is trusted already\n");
-            goto fin;
         }
     }
     ret++;
     /*
      * bootstrapping file is index opclass channel macaddr key
      */
-    fprintf(fp, "%d 81 6 %02x%02x%02x%02x%02x%02x %s\n", ret, 
-            peermac[0], peermac[1], peermac[2], peermac[3], peermac[4], peermac[5], 
-            b64key);
+    fprintf(fp, "%d 0 0 ffffffffffff %s\n", ret, b64bskey);
   fin:
     if (fp != NULL) {
         fclose(fp);
     }
     return ret;
 }
-#endif
 
 int
-bootstrap_peer (int keyidx, int is_initiator, int mauth)
+bootstrap_peer (pkex_handle handle, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
     int n, opclass, channel;
-    unsigned char peermac[ETH_ALEN]; 
     unsigned char keyb64[1024];
-    char mac[20], *ptr;
+    char mac[20];
 
+    if (phandle == handle) {
+        pkex_destroy_peer(handle);
+        phandle = -1;
+    }
     printf("looking for bootstrap key index %d in %s\n", keyidx, bootstrapfile);
     if ((fp = fopen(bootstrapfile, "r")) == NULL) {
         fprintf(stderr, "failed to open %s to read\n", bootstrapfile);
@@ -340,26 +357,12 @@ bootstrap_peer (int keyidx, int is_initiator, int mauth)
         return -1;
     }
     fclose(fp);
-    printf("peer is on operating class %d and channel %d, checking...\n", opclass, channel);
     printf("peer's bootstrapping key is %s\n", keyb64);
-    ptr = &mac[10];
-    sscanf(ptr, "%hhx", &peermac[5]); mac[10] = '\0';
-    ptr = &mac[8];
-    sscanf(ptr, "%hhx", &peermac[4]); mac[8] = '\0';
-    ptr = &mac[6];
-    sscanf(ptr, "%hhx", &peermac[3]); mac[6] = '\0';
-    ptr = &mac[4];
-    sscanf(ptr, "%hhx", &peermac[2]); mac[4] = '\0';
-    ptr = &mac[2];
-    sscanf(ptr, "%hhx", &peermac[1]); mac[2] = '\0';
-    ptr = &mac[0];
-    sscanf(ptr, "%hhx", &peermac[0]); 
 
-    if ((handle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
+    if ((dhandle = dpp_create_peer(keyb64, is_initiator, mauth, 0)) < 1) {
         fprintf(stderr, "unable to create peer!\n");
         return -1;
     }
-    
     return 1;
 }
 
@@ -473,7 +476,7 @@ main (int argc, char **argv)
 
     memset((char *)&clnt, 0, sizeof(struct sockaddr_in));
     clnt.sin_family = AF_INET;
-    clnt.sin_port = htons(7871);
+    clnt.sin_port = htons(DPP_PORT);
     if (inet_pton(AF_INET, controller, &clnt.sin_addr) < 0) {
         fprintf(stderr, "%s: unable to set address using inet_pton\n", argv[0]);
         exit(1);
@@ -490,8 +493,7 @@ main (int argc, char **argv)
     if (do_pkex) {
         if (pkex_initialize(1, password, 
                             identifier[0] == 0 ? NULL : identifier,
-                            pkexinfo[0] == 0 ? NULL : pkexinfo, keyfile,
-                            bootstrapfile[0] == 0 ? NULL : bootstrapfile, 0, 0, debug) < 0) {
+                            pkexinfo[0] == 0 ? NULL : pkexinfo, keyfile, debug) < 0) {
             fprintf(stderr, "%s: cannot configure PKEX/DPP, check config file!\n", argv[0]);
             exit(1);
         }
@@ -505,10 +507,11 @@ main (int argc, char **argv)
 
     if (!do_pkex) {
         printf("not doing pkex, just DPP...\n");
-        bootstrap_peer(keyidx, 1, mutual);
+        bootstrap_peer(0, keyidx, 1, mutual);
     } else {
         printf("PKEX, then DPP...\n");
-        pkex_initiate(myfakemac, peerfakemac);
+        phandle = pkex_create_peer(2);
+        pkex_initiate(phandle);
     }
 
     srv_main_loop(srvctx);

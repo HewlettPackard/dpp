@@ -471,7 +471,7 @@ main (int argc, char **argv)
 
     memset((char *)&clnt, 0, sizeof(struct sockaddr_in));
     clnt.sin_family = AF_INET;
-    clnt.sin_port = htons(7871);
+    clnt.sin_port = htons(DPP_PORT);
     if (inet_pton(AF_INET, controller, &clnt.sin_addr) < 0) {
         fprintf(stderr, "%s: unable to set address using inet_pton\n", argv[0]);
         exit(1);

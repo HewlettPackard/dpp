@@ -1478,7 +1478,7 @@ main (int argc, char **argv)
     TAILQ_INIT(&interfaces);
     TAILQ_INIT(&cstates);
     portin = 8741;
-    portout = 7871;
+    portout = DPP_PORT;
     for (;;) {
         c = getopt(argc, argv, "hI:d:f:g:C:k:i:o:");
         if (c < 0) {
@@ -1523,7 +1523,7 @@ main (int argc, char **argv)
                         "\t-f <channel> to use with DPP\n"
                         "\t-g <opclass> operating class to use with DPP\n"
                         "\t-i <num> port number for inbound (default 8741)\n"
-                        "\t-o <num> port number for outbound (default 7871)\n"
+                        "\t-o <num> port number for outbound (default 8908)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);

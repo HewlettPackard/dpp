@@ -33,15 +33,17 @@
 #ifndef _OS_GLUE_H_
 #define _OS_GLUE_H_
 typedef unsigned int dpp_handle;
+typedef unsigned int pkex_handle;
 
-int transmit_pkex_frame(unsigned char *, unsigned char *, unsigned char *, int);
+int transmit_pkex_frame(pkex_handle, unsigned char *, int);
 int transmit_auth_frame(dpp_handle, unsigned char *, int);
 int transmit_config_frame(dpp_handle, unsigned char, unsigned char *, int);
 int transmit_discovery_frame(unsigned char, unsigned char *, int);
+int save_bootstrap_key(pkex_handle, void *);
 int provision_connector(char *, char *, int, char *, int, dpp_handle); 
 int change_dpp_channel(dpp_handle, unsigned char, unsigned char);
 int change_dpp_freq(dpp_handle, unsigned long freq);
-int bootstrap_peer(unsigned char *, int, int, int);
+int bootstrap_peer(pkex_handle, int, int, int);
 void fin(unsigned short reason, unsigned char *peer_mac, 
          unsigned char *key, int keylen);
 

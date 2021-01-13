@@ -818,7 +818,7 @@ main (int argc, char **argv)
     memset((char *)&serv, 0, sizeof(struct sockaddr_in));
     serv.sin_family = AF_INET;
     serv.sin_addr.s_addr = INADDR_ANY;
-    serv.sin_port = htons(7871);
+    serv.sin_port = htons(DPP_PORT);
     if ((bind(infd, (struct sockaddr *)&serv, sizeof(struct sockaddr_in)) < 0) ||
         (listen(infd, 0) < 0)) {
         fprintf(stderr, "%s: unable to bind/listen TCP socket!\n", argv[0]);

@@ -125,7 +125,7 @@ TAILQ_HEAD(fubar, chirpdest) chirpdests;
 struct cpolicy {
     TAILQ_ENTRY(cpolicy) entry;
     char akm[10];        // "psk" or "sae" or "dpp"
-    char password[80];  // no hex, password only
+    char auxdata[80];    // password or san
     char ssid[33];
 };
 TAILQ_HEAD(frobnitz, cpolicy) cpolicies;
@@ -2132,6 +2132,11 @@ gen_csr:
         }
 
         EVP_PKEY_assign(tmp, EVP_PKEY_EC, protodup);
+        if ((bio = BIO_new_file("key_for_cert.pem", "w")) != NULL) {
+            PEM_write_bio_PrivateKey(bio, tmp, NULL, NULL, 0, NULL, NULL);
+        }
+        BIO_free(bio);
+        bio = NULL;
         X509_REQ_set_pubkey(req, tmp);
         if (!X509_REQ_sign(req, tmp, md)) {
             dpp_debug(DPP_DEBUG_ERR, "can't sign CSR with protocol key!\n");
@@ -2319,7 +2324,7 @@ dump_pwd_con (char *ssid, int ssidlen, char *pwd, int sae)
 }
 
 static void
-dump_cert_con (char *ssid, int ssidlen, char *p7, int p7len)
+dump_cert_con (char *ssid, int ssidlen, char *p7, int p7len, char *san, int sanlen)
 {
     FILE *fp;
     char conffile[45], netname[33];
@@ -2347,8 +2352,9 @@ dump_cert_con (char *ssid, int ssidlen, char *p7, int p7len)
     fprintf(fp, "\tproto=RSN\n");
     fprintf(fp, "\tkey_mgmt=IEEE8021X\n");
     fprintf(fp, "\teap=TLS\n");
-    fprintf(fp, "\tclient_cert=\"mycert.pem\"\n");
-    fprintf(fp, "\tprivate_key=\"mypriv.der\"\n");
+    fprintf(fp, "\tclient_cert=\"mycert0.pem\"\n");
+    fprintf(fp, "\tprivate_key=\"key_for_cert.pem\"\n");
+    fprintf(fp, "\tca_cert=\"cacert0.pem\"\n");
     fprintf(fp, "\tpairwise=CCMP\n");
     fprintf(fp, "\tgroup=CCMP\n");
     fprintf(fp, "}\n");
@@ -2535,7 +2541,7 @@ problemo:
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                         cp->ssid, cp->akm, cp->password, conn,
+                                         cp->ssid, cp->akm, cp->auxdata, conn,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2557,7 +2563,7 @@ problemo:
                                          "\"cred\":{\"akm\":\"%s\","
                                          "\"pass\":\"%s\","
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                         cp->ssid, cp->akm, cp->password,
+                                         cp->ssid, cp->akm, cp->auxdata,
                                          bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
                                          bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
                     }
@@ -2571,7 +2577,7 @@ problemo:
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                         cp->ssid, cp->akm, cp->password, conn,
+                                         cp->ssid, cp->akm, cp->auxdata, conn,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2594,7 +2600,7 @@ problemo:
                                          "\"cred\":{\"akm\":\"%s\","
                                          "\"pass\":\"%s\","
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                         cp->ssid, cp->akm, cp->password,
+                                         cp->ssid, cp->akm, cp->auxdata,
                                          bdt->tm_year+1901, bdt->tm_mon, bdt->tm_mday,
                                          bdt->tm_hour, bdt->tm_min, bdt->tm_sec);
                     }
@@ -2611,12 +2617,12 @@ problemo:
                                          "{\"wi-fi_tech\":\"infra\",\"discovery\":{\"ssid\":\"%s\"},"
                                          "\"cred\":{\"akm\":\"%s\","
                                          "\"entCreds\":{\"certBag\":\"%s\","
-                                         "\"caCerts\":\"%s\"},"
+                                         "\"caCerts\":\"%s\",\"trustedEapServerName\":\"%s\"},"
                                          "\"signedConnector\":"
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
-                                         cp->ssid, cp->akm, peer->p7, dpp_instance.cacert, conn,
+                                         cp->ssid, cp->akm, peer->p7, dpp_instance.cacert, cp->auxdata, conn,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -3286,8 +3292,8 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             }
             dump_pwd_con(sstr, (int)(estr - sstr), pwd, 0);
         } else if (strncmp(sstr, "dot1x", 4) == 0) {
-            char *p7, *ca;
-            int p7len, calen;
+            char *p7, *ca, *san;
+            int p7len, calen, sanlen;
             
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 3, "cred", "entCreds", "certBag")) < 1) {
@@ -3307,6 +3313,16 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
                 calen = (int)(estr - sstr);
                 dpp_debug(DPP_DEBUG_PKI, "got CA cert:\n %.*s\n", calen, ca);
             }
+            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                      &sstr, &estr, 3, "cred", "entCreds", "trustedEapServerName")) < 1) {
+                dpp_debug(DPP_DEBUG_ERR, "No SAN to match in server cert!\n");
+                san = NULL;
+                sanlen = 0;
+            } else {
+                dpp_debug(DPP_DEBUG_ERR, "Got a SAN to match in server cert!\n");
+                san = sstr;
+                sanlen = (int)(estr - sstr);
+            }
             extract_certs(p7, p7len, ca, calen);
             if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                       &sstr, &estr, 2, "discovery", "ssid")) == 0) {
@@ -3314,7 +3330,7 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             } else {
                 dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
             }
-            dump_cert_con(sstr, (int)(estr - sstr), p7, p7len);
+            dump_cert_con(sstr, (int)(estr - sstr), p7, p7len, san, sanlen);
             /*
              * dot1x credentials are v2 only so there'll always be a connector
              */
@@ -5659,7 +5675,7 @@ dpp_add_chirp_freq (unsigned char *bssid, unsigned long freq)
 }
 
 static void
-addpolicy (char *akm, char *password, char *ssid)
+addpolicy (char *akm, char *auxdata, char *ssid)
 {
     struct cpolicy *cp;
 
@@ -5667,7 +5683,7 @@ addpolicy (char *akm, char *password, char *ssid)
         return;
     }
     strcpy(cp->akm, akm);
-    strcpy(cp->password, password);
+    strcpy(cp->auxdata, auxdata);
     strcpy(cp->ssid, ssid);
     TAILQ_INSERT_TAIL(&cpolicies, cp, entry);
     return;
@@ -5739,11 +5755,11 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
 
         if ((fp = fopen("configakm", "r")) != NULL) {
             while (!feof(fp)) {
-                if (fscanf(fp, "%s %s %s", cp.akm, cp.password, cp.ssid) < 1) {
+                if (fscanf(fp, "%s %s %s", cp.akm, cp.auxdata, cp.ssid) < 1) {
                     fclose(fp);
                     break;
                 }
-                addpolicy(cp.akm, cp.password, cp.ssid);
+                addpolicy(cp.akm, cp.auxdata, cp.ssid);
             }
         }
         /*
@@ -5756,8 +5772,8 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
             if (strstr(pol->akm, "dot1x") != NULL) {
                 dpp_instance.enterprise = 1;
             }
-            dpp_debug(DPP_DEBUG_TRACE, "AKM: %s, password: %s, SSID: %s\n",
-                   pol->akm, pol->password, pol->ssid);
+            dpp_debug(DPP_DEBUG_TRACE, "AKM: %s, auxdata: %s, SSID: %s\n",
+                   pol->akm, pol->auxdata, pol->ssid);
         }
     } else {
         strcpy(dpp_instance.enrollee_role, enrolleerole);

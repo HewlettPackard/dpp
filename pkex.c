@@ -80,13 +80,23 @@
 
 typedef dpp_action_frame pkex_frame;
 
+static pkex_handle next_handle = 0;
 extern service_context srvctx;
 
 struct pkex_peer {
     TAILQ_ENTRY(pkex_peer) entry;
+    pkex_handle handle;
+    int initiator;
+    /*
+     * versioning is used in key derivation for v2+...
+     */
+    unsigned char version;
+    unsigned char peerversion;
+    /*
+     * ...and MACs are used for v1
+     */
     unsigned char mymac[ETH_ALEN];
     unsigned char peermac[ETH_ALEN];
-    unsigned char initiator;
     /*
      * PKEX stuff
      */
@@ -114,7 +124,8 @@ struct pkex_peer {
                            (x) == PKEX_FINISHED ? "PKEX FINISHED" : \
                            "unknown"
 
-#define frame_to_string(x) (x) == PKEX_SUB_EXCH_REQ ? "PKEX Exchange Request" : \
+#define frame_to_string(x) (x) == PKEX_SUB_EXCH_V1REQ ? "PKEX v1 Exchange Request" : \
+                           (x) == PKEX_SUB_EXCH_RESP ? "PKEX Exchange Request" : \
                            (x) == PKEX_SUB_EXCH_RESP ? "PKEX Exchange Response" : \
                            (x) == PKEX_SUB_COM_REV_REQ ? "PKEX Commit/Reveal Request" : \
                            (x) == PKEX_SUB_COM_REV_RESP ? "PKEX Commit/Reveal Response" : \
@@ -130,12 +141,9 @@ struct _pkex_instance {
     const EVP_MD *hashfcn;
     EC_POINT *Pme;
     EC_POINT *Ppeer;
-    char bsfile[80];
     char password[80];
     char identifier[80];
     int adds_identifier;
-    int opclass;                /* operating class running PKEX on*/
-    int channel;                /* channel running PKEX on */
     int group_num;              /* these are handy to keep around */
     int primelen;               /* and not have to continually */
     int digestlen;              /* compute them from "bootstrap" */
@@ -670,58 +678,6 @@ fail:
 // common routines for initiator and responder
 //----------------------------------------------------------------------
 
-static int
-save_bootstrap_key (struct pkex_peer *peer)
-{
-    BIO *bio = NULL;
-    FILE *fp = NULL;
-    unsigned char *ptr, mac[2*ETH_ALEN];
-    char newone[1024], existing[1024];
-    int ret = -1, len, octets, opclass, channel;
-    
-    /*
-     * get the base64 encoded EC_KEY as onerow[1]
-     */
-    if (((fp = fopen(pkex_instance.bsfile, "r+")) == NULL) ||
-        ((bio = BIO_new(BIO_s_mem())) == NULL)) {
-        fprintf(stderr, "PKEX: unable to create BIOs to store %s as bootstrapping file\n", pkex_instance.bsfile);
-        goto fin;
-    }
-    (void)i2d_EC_PUBKEY_bio(bio, peer->peer_bootstrap);
-    (void)BIO_flush(bio);
-    len = BIO_get_mem_data(bio, &ptr);
-    octets = EVP_EncodeBlock((unsigned char *)newone, ptr, len);
-    newone[octets] = '\0';
-    ret = 0;
-    print_buffer(DPP_DEBUG_TRACE, "peer's bootstrap key", (unsigned char *)newone, octets);
-    while (!feof(fp)) {
-        if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, existing) < 0) {
-            continue;
-        }
-//        if (strcmp(existing, newone) == 0) {
-//            fprintf(stderr, "PKEX: bootstrapping key is trusted already\n");
-//            goto fin;
-//        }
-    }
-    ret++;
-    /*
-     * bootstrapping file is index opclass channel macaddr key
-     */
-    fprintf(fp, "%d %d %d %02x%02x%02x%02x%02x%02x %s\n", ret,
-            pkex_instance.opclass, pkex_instance.channel,
-            peer->peermac[0], peer->peermac[1], peer->peermac[2], 
-            peer->peermac[3], peer->peermac[4], peer->peermac[5], 
-            newone);
-  fin:
-    if (bio != NULL) {
-        BIO_free(bio);
-    }
-    if (fp != NULL) {
-        fclose(fp);
-    }
-    return ret;
-}
-
 static void
 ieee_ize_attributes (unsigned char *attributes, int len)
 {
@@ -746,11 +702,11 @@ construct_pkex_frame (pkex_frame *frame, struct pkex_peer *peer, unsigned char m
 }
 
 static int
-send_pkex_frame (unsigned char *mymac, unsigned char *peermac, unsigned char *buf, int len)
+send_pkex_frame (pkex_handle handle, unsigned char *buf, int len)
 {
 //    dpp_debug(DPP_DEBUG_ANY, "sending a %d byte frame, and the attributes are %d bytes (%04x)\n",
 //              len, attrlen, frame->dpp_attribute_len);
-    return transmit_pkex_frame(mymac, peermac, buf, len);
+    return transmit_pkex_frame(handle, buf, len);
 }
 
 static int
@@ -936,22 +892,42 @@ compute_z (struct pkex_peer *peer)
      * the context is the initiator mac address followed by the responder mac address...
      */
     dpp_debug(DPP_DEBUG_TRACE, "context to create z\n");
-    if (peer->initiator) {
-        print_buffer(DPP_DEBUG_TRACE, "MAC-Initiator", peer->mymac, ETH_ALEN);
-        memcpy(ptr, peer->mymac, ETH_ALEN);
-        ptr += ETH_ALEN;
+    if (peer->version == 1) {
+        if (peer->initiator) {
+            print_buffer(DPP_DEBUG_TRACE, "MAC-Initiator", peer->mymac, ETH_ALEN);
+            memcpy(ptr, peer->mymac, ETH_ALEN);
+            ptr += ETH_ALEN;
         
-        print_buffer(DPP_DEBUG_TRACE, "MAC-Responder", peer->peermac, ETH_ALEN);
-        memcpy(ptr, peer->peermac, ETH_ALEN);
-        ptr += ETH_ALEN;
+            print_buffer(DPP_DEBUG_TRACE, "MAC-Responder", peer->peermac, ETH_ALEN);
+            memcpy(ptr, peer->peermac, ETH_ALEN);
+            ptr += ETH_ALEN;
+        } else {
+            print_buffer(DPP_DEBUG_TRACE, "MAC-Initiator", peer->peermac, ETH_ALEN);
+            memcpy(ptr, peer->peermac, ETH_ALEN);
+            ptr += ETH_ALEN;
+        
+            print_buffer(DPP_DEBUG_TRACE, "MAC-Responder", peer->mymac, ETH_ALEN);
+            memcpy(ptr, peer->mymac, ETH_ALEN);
+            ptr += ETH_ALEN;
+        }
     } else {
-        print_buffer(DPP_DEBUG_TRACE, "MAC-Initiator", peer->peermac, ETH_ALEN);
-        memcpy(ptr, peer->peermac, ETH_ALEN);
-        ptr += ETH_ALEN;
+        if (peer->initiator) {
+            dpp_debug(DPP_DEBUG_TRACE, "Initiator version %x\n", peer->version);
+            memcpy(ptr, &peer->version, sizeof(unsigned char));
+            ptr += sizeof(unsigned char);
         
-        print_buffer(DPP_DEBUG_TRACE, "MAC-Responder", peer->mymac, ETH_ALEN);
-        memcpy(ptr, peer->mymac, ETH_ALEN);
-        ptr += ETH_ALEN;
+            dpp_debug(DPP_DEBUG_TRACE, "Responder version %x\n", peer->peerversion);
+            memcpy(ptr, &peer->peerversion, sizeof(unsigned char));
+            ptr += sizeof(unsigned char);
+        } else {
+            dpp_debug(DPP_DEBUG_TRACE, "Initiator version %x\n", peer->peerversion);
+            memcpy(ptr, &peer->peerversion, sizeof(unsigned char));
+            ptr += sizeof(unsigned char);
+        
+            dpp_debug(DPP_DEBUG_TRACE, "Responder version %x\n", peer->version);
+            memcpy(ptr, &peer->version, sizeof(unsigned char));
+            ptr += sizeof(unsigned char);
+        }
     }
     /*
      * ...concatenated with M.x (or when viewed as responder N.x)
@@ -985,11 +961,17 @@ compute_z (struct pkex_peer *peer)
     memcpy(ptr, pkex_instance.password, strlen(pkex_instance.password));
     print_buffer(DPP_DEBUG_TRACE, "password", (unsigned char *)pkex_instance.password, strlen(pkex_instance.password));
 
-    hkdf(pkex_instance.hashfcn, 0, ikm, pkex_instance.primelen,
-         NULL, 0,
-         context, (2 * pkex_instance.primelen + 2 * ETH_ALEN + strlen(pkex_instance.password)),
-         peer->z, pkex_instance.digestlen);
-
+    if (peer->version == 1) {
+        hkdf(pkex_instance.hashfcn, 0, ikm, pkex_instance.primelen,
+             NULL, 0,
+             context, (2 * pkex_instance.primelen + 2 * ETH_ALEN + strlen(pkex_instance.password)),
+             peer->z, pkex_instance.digestlen);
+    } else {
+        hkdf(pkex_instance.hashfcn, 0, ikm, pkex_instance.primelen,
+             NULL, 0,
+             context, (2 * pkex_instance.primelen + 2 * sizeof(unsigned char) + strlen(pkex_instance.password)),
+             peer->z, pkex_instance.digestlen);
+    }
     ret = 1;
     print_buffer(DPP_DEBUG_TRACE, "z", peer->z, pkex_instance.digestlen);
     
@@ -1108,16 +1090,17 @@ pkex_reveal_to_peer (struct pkex_peer *peer)
      * "sign" our binding context using the input-keying-material, ikm
      */
     HMAC_Init_ex(hctx, ikm, pkex_instance.primelen, pkex_instance.hashfcn, NULL);
-    /*
-     * ...first it's my MAC address
-     */
     dpp_debug(DPP_DEBUG_TRACE, peer->initiator ? "context for u\n" : "context for v\n");
-    print_buffer(DPP_DEBUG_TRACE, peer->initiator ? "MAC-Initiator" : "MAC-Responder",
-                 peer->mymac, ETH_ALEN);
-    HMAC_Update(hctx, peer->mymac, ETH_ALEN);
-    
     /*
-     * followed by my bootstrapping key 
+     * ...first it's my MAC address, if version 1
+     */
+    if (peer->version == 1) {
+        print_buffer(DPP_DEBUG_TRACE, peer->initiator ? "MAC-Initiator" : "MAC-Responder",
+                     peer->mymac, ETH_ALEN);
+        HMAC_Update(hctx, peer->mymac, ETH_ALEN);
+    }    
+    /*
+     * ...my bootstrapping key 
      */
     if (!EC_POINT_get_affine_coordinates_GFp(pkex_instance.group, Pub, x, NULL, bnctx)) {
         dpp_debug(DPP_DEBUG_ERR, "can't get shared PKEX secret, s\n");
@@ -1187,7 +1170,7 @@ pkex_reveal_to_peer (struct pkex_peer *peer)
 
     dpp_debug(DPP_DEBUG_PROTOCOL_MSG,
               peer->initiator ? "sending PKEX Commit/Reveal Request\n" : "sending PKEX Commit/Reveal Response\n");
-    ret = send_pkex_frame(peer->mymac, peer->peermac, buf,
+    ret = send_pkex_frame(peer->handle, buf,
                           sizeof(pkex_frame) + sizeof(TLV) + datalen + AES_BLOCK_SIZE);
     peer->state = PKEX_SEND_COMREV;
     ret = sizeof(pkex_frame) + datalen + AES_BLOCK_SIZE;
@@ -1231,7 +1214,11 @@ pkex_exchange_to_peer (struct pkex_peer *peer, unsigned char status)
     int offset, framelen, ret = -1;
 
     memset(buf, 0, sizeof(buf));
-    construct_pkex_frame(frame, peer, peer->initiator ? PKEX_SUB_EXCH_REQ : PKEX_SUB_EXCH_RESP);
+    if (peer->initiator) {
+        construct_pkex_frame(frame, peer, peer->version == 1 ? PKEX_SUB_EXCH_V1REQ : PKEX_SUB_EXCH_REQ);
+    } else {
+        construct_pkex_frame(frame, peer, PKEX_SUB_EXCH_RESP);
+    }
     tlv = (TLV *)frame->attributes;
 
     if ((pkex_instance.bootstrap == NULL) || (pkex_instance.group == NULL) || (pkex_instance.group_num == 0)) {
@@ -1265,28 +1252,29 @@ pkex_exchange_to_peer (struct pkex_peer *peer, unsigned char status)
      * Q = H(me | [identifier |] pw) * P
      */
     EVP_DigestInit(mdctx, pkex_instance.hashfcn);
-    EVP_DigestUpdate(mdctx, peer->mymac, ETH_ALEN);
+    if (peer->version == 1) {
+        print_buffer(DPP_DEBUG_TRACE, "adding mymac", peer->mymac, ETH_ALEN);
+        EVP_DigestUpdate(mdctx, peer->mymac, ETH_ALEN);
+    }
     if (pkex_instance.adds_identifier) {
+        print_buffer(DPP_DEBUG_TRACE, "identifier", (unsigned char *)pkex_instance.identifier,
+                     strlen(pkex_instance.identifier));
         EVP_DigestUpdate(mdctx, pkex_instance.identifier, strlen(pkex_instance.identifier));
     }
+    print_buffer(DPP_DEBUG_TRACE, "password", (unsigned char *)pkex_instance.password, strlen(pkex_instance.password));
     EVP_DigestUpdate(mdctx, pkex_instance.password, strlen(pkex_instance.password));
     EVP_DigestFinal(mdctx, machash, &mdlen);
     BN_bin2bn(machash, mdlen, hmul);
     BN_mod(hmul, hmul, order, bnctx);
+    pp_a_bignum(DPP_DEBUG_TRACE, "H([mymac |] [identifier | ] password)", hmul);
 
-    if (pkex_instance.adds_identifier) {
-        print_buffer(DPP_DEBUG_TRACE, "identifier", (unsigned char *)pkex_instance.identifier,
-                     strlen(pkex_instance.identifier));
-    }
-    print_buffer(DPP_DEBUG_TRACE, "password", (unsigned char *)pkex_instance.password, strlen(pkex_instance.password));
-    pp_a_bignum(DPP_DEBUG_TRACE, "H(mymac | [identifier | ] password)", hmul);
     pp_a_point(DPP_DEBUG_TRACE, 1, peer->initiator ? "Pinit.x" : "Presp.x", pkex_instance.Pme);
     
     if (!EC_POINT_mul(pkex_instance.group, Q, NULL, pkex_instance.Pme, hmul, bnctx)) {
         dpp_debug(DPP_DEBUG_ERR, "unable to create Q for PKEX!\n");
         goto fin;
     }
-    pp_a_point(DPP_DEBUG_TRACE, 1, peer->initiator ? "Qi.x" : "Qr.x", Q);
+//    pp_a_point(DPP_DEBUG_TRACE, 1, peer->initiator ? "Qi.x" : "Qr.x", Q);
 
     /*
      * reuse Q so the encrypted point is now Q = X + Q
@@ -1317,6 +1305,10 @@ pkex_exchange_to_peer (struct pkex_peer *peer, unsigned char status)
      * and start filling in the frame
      */
     framelen = sizeof(pkex_frame);
+    if (peer->version > 1) {
+        tlv = TLV_set_tlv(tlv, PROTOCOL_VERSION, 1, &peer->version);
+        framelen += (sizeof(unsigned char) + sizeof(TLV));
+    }
     if (peer->initiator) {
         /*
          * if the initiator, first add the group...
@@ -1360,7 +1352,7 @@ pkex_exchange_to_peer (struct pkex_peer *peer, unsigned char status)
     ieee_ize_attributes(frame->attributes, framelen);
     dpp_debug(DPP_DEBUG_PROTOCOL_MSG,
               peer->initiator ? "sending PKEX Exchange Request\n" : "sending PKEX Exchange Response\n");
-    ret = send_pkex_frame(peer->mymac, peer->peermac, buf, framelen);
+    ret = send_pkex_frame(peer->handle, buf, framelen);
     peer->state = PKEX_SEND_EXCHANGE;
     ret = 1;
 fin:
@@ -1394,6 +1386,14 @@ retransmit_pkex (timerid id, void *data)
     }
     switch (peer->state) {
         case PKEX_SEND_EXCHANGE:
+            /*
+             * if the peer isn't responding to our v2 attempts, try v1
+             * a few times before giving up
+             */
+            if ((peer->version > 1) && (peer->retrans > 2)) {
+                dpp_debug(DPP_DEBUG_TRACE, "No answer with V2, trying V1\n");
+                peer->version = 1;
+            }
             pkex_exchange_to_peer(peer, STATUS_OK);
             peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_pkex, peer);
             peer->retrans++;
@@ -1526,10 +1526,11 @@ process_pkex_reveal (pkex_frame *frame, int len, struct pkex_peer *peer)
      * ...first is the peer's mac address
      */
     dpp_debug(DPP_DEBUG_TRACE, peer->initiator? "context for v'\n" : "context for u'\n");
-    print_buffer(DPP_DEBUG_TRACE, peer->initiator ? "MAC-Responder" : "MAC-Initiator",
-                 peer->peermac, ETH_ALEN);
-    HMAC_Update(hctx, peer->peermac, ETH_ALEN);
-
+    if (peer->version == 1) {
+        print_buffer(DPP_DEBUG_TRACE, peer->initiator ? "MAC-Responder" : "MAC-Initiator",
+                     peer->peermac, ETH_ALEN);
+        HMAC_Update(hctx, peer->peermac, ETH_ALEN);
+    }
     /*
      * followed by the peer's bootstrapping key
      */
@@ -1587,7 +1588,7 @@ process_pkex_reveal (pkex_frame *frame, int len, struct pkex_peer *peer)
     }
     if (memcmp(tag, TLV_value(tlv), mdlen) == 0) {
         dpp_debug(DPP_DEBUG_ANY, "AUTHENTICATED PEER! Bootstrapping key is trusted!\n\n");
-        if ((ret = save_bootstrap_key(peer)) < 1) {
+        if ((ret = save_bootstrap_key(peer->handle, peer->peer_bootstrap)) < 1) {
             dpp_debug(DPP_DEBUG_ERR, "error saving trusted bootstrapping key!\n");
             goto fin;
         }
@@ -1639,6 +1640,16 @@ process_pkex_exchange (pkex_frame *frame, int len, struct pkex_peer *peer)
         EC_POINT_free(peer->Y);
     }
     tlv = (TLV *)frame->attributes;
+
+    /*
+     * we only support v2 so if there was a PROTOCOL_VERSION TLV then set the
+     * version to 2, record what the peer's version was but we're gonna say 2
+     * no matter what
+     */
+    if ((tlv = find_tlv(PROTOCOL_VERSION, frame->attributes, len)) != NULL) {
+        peer->peerversion = *(TLV_value(tlv));
+        peer->version = 2;
+    }
     if (!peer->initiator) {
         /*
          * if we're the responder then first get the group
@@ -1743,17 +1754,22 @@ process_pkex_exchange (pkex_frame *frame, int len, struct pkex_peer *peer)
      * next decrypt the point
      */
     EVP_DigestInit(mdctx, pkex_instance.hashfcn);
-    EVP_DigestUpdate(mdctx, peer->peermac, ETH_ALEN);
+    if (peer->version == 1) {
+        print_buffer(DPP_DEBUG_TRACE, "adding peermac", peer->peermac, ETH_ALEN);
+        EVP_DigestUpdate(mdctx, peer->peermac, ETH_ALEN);
+    }
     if (pkex_instance.adds_identifier) {
         print_buffer(DPP_DEBUG_TRACE, "adding identifier", (unsigned char *)pkex_instance.identifier,
                      strlen(pkex_instance.identifier));
         EVP_DigestUpdate(mdctx, pkex_instance.identifier, strlen(pkex_instance.identifier));
     }
     EVP_DigestUpdate(mdctx, pkex_instance.password, strlen(pkex_instance.password));
+    print_buffer(DPP_DEBUG_TRACE, "password", (unsigned char *)pkex_instance.password, strlen(pkex_instance.password));
     EVP_DigestFinal(mdctx, machash, &mdlen);
     BN_bin2bn(machash, mdlen, hmul);
     BN_mod(hmul, hmul, order, bnctx);
-    pp_a_bignum(DPP_DEBUG_TRACE, "H(peermac | [identifier | ] password)", hmul);
+    pp_a_bignum(DPP_DEBUG_TRACE, "H([peermac |] [identifier | ] password)", hmul);
+
     pp_a_point(DPP_DEBUG_TRACE, 1, peer->initiator ? "Presp.x" : "Pinit.x", pkex_instance.Ppeer);
 
     if (!EC_POINT_mul(pkex_instance.group, Q, NULL, pkex_instance.Ppeer, hmul, bnctx) ||
@@ -1798,55 +1814,26 @@ fin:
 }
 
 int 
-process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned char *peermac)
+process_pkex_frame (unsigned char *data, int len, pkex_handle handle)
 {
     pkex_frame *frame = (pkex_frame *)data;
-    unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     struct pkex_peer *peer = NULL;
     int keyidx;
 
-    dpp_debug(DPP_DEBUG_STATE_MACHINE, "received %s from " MACSTR " to " MACSTR "\n", 
-              frame_to_string(frame->frame_type), MAC2STR(peermac), MAC2STR(mymac));
 
     TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
-        if ((memcmp(peer->mymac, mymac, ETH_ALEN) == 0) &&
-            ((memcmp(peer->peermac, peermac, ETH_ALEN) == 0) ||
-             (memcmp(peer->peermac, broadcast, ETH_ALEN) == 0))) {
-            /*
-             * if it's to us and from a known MAC it's a known entity, if it's
-             * to us and to broadcast, let's record the sender and respond
-             */
-            memcpy(peer->peermac, peermac, ETH_ALEN);
+        if (peer->handle == handle) {
             break;
         }
     }
     if (peer == NULL) {
-        if (frame->frame_type != PKEX_SUB_EXCH_REQ) {
-            dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "gratuitous receipt of PKEX frame but not Exchange Request!\n");
-            return -1;
-        }
-        /*
-         * we are a gratuitous responder, this was picked up by us, so it 
-         * is for us, it's a COMMIT, so let's respond!
-         */
-        if ((peer = (struct pkex_peer *)malloc(sizeof(struct pkex_peer))) == NULL) {
-            dpp_debug(DPP_DEBUG_ERR, "unable to allocate peer to do PKEX!\n");
-            return -1;
-        }
-        memcpy(peer->mymac, mymac, ETH_ALEN);
-        memcpy(peer->peermac, peermac, ETH_ALEN);
-        peer->state = PKEX_NOTHING;
-        peer->X = NULL;
-        peer->Y = NULL;
-        peer->initiator = 0;
-        peer->retrans = 0;
-        TAILQ_INSERT_HEAD(&pkex_instance.peers, peer, entry);
-    } else {
-        /*
-         * otherwise there's a retransmission timer set...
-         */
-        srv_rem_timeout(srvctx, peer->t0);
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "gratuitous receipt of PKEX frame but not Exchange Request!\n");
+        return -1;
     }
+    /*
+     * clear the retransmission timer (if set)...
+     */
+    srv_rem_timeout(srvctx, peer->t0);
 
     /*
      * fix up the lengths of the TLVs...
@@ -1858,7 +1845,7 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
                 dpp_debug(DPP_DEBUG_ERR, "initiator received a PKEX frame in NOTHING state\n");
                 break;
             } else {
-                if (frame->frame_type != PKEX_SUB_EXCH_REQ) {
+                if ((frame->frame_type != PKEX_SUB_EXCH_V1REQ) && (frame->frame_type != PKEX_SUB_EXCH_REQ)) {
                     dpp_debug(DPP_DEBUG_ERR, "responder did not receive PKEX exchange request in NOTHING\n");
                     break;
                 }
@@ -1895,8 +1882,11 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
                 /*
                  * kick off DPP!
                  */
-                bootstrap_peer(peer->mymac, keyidx, peer->initiator, 1);
                 peer->state = PKEX_FINISHED;
+                bootstrap_peer(peer->handle, keyidx, peer->initiator, 1);
+                /*
+                 * the peer will be destroyed at this point, nothing should follow!
+                 */
             }
             break;
         case PKEX_SEND_COMREV:
@@ -1916,8 +1906,11 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
             /*
              * kick off DPP!
              */
-            bootstrap_peer(peer->mymac, keyidx, peer->initiator, 1);
             peer->state = PKEX_FINISHED;
+            bootstrap_peer(peer->handle, keyidx, peer->initiator, 1);
+            /*
+             * the peer will be destroyed at this point, nothing should follow!
+             */
             break;
         case PKEX_FINISHED:
         default:
@@ -1931,31 +1924,110 @@ process_pkex_frame (unsigned char *data, int len, unsigned char *mymac, unsigned
     return 1;
 }
 
-int
-pkex_initiate(unsigned char *mymac, unsigned char *targetmac)
+void
+pkex_update_macs (pkex_handle handle, unsigned char *mymac, unsigned char *peermac)
+{
+    struct pkex_peer *peer = NULL;
+    
+    TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
+        if (peer->handle == handle) {
+            break;
+        }
+    }
+    if (peer == NULL) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "PKEX peer with handle %d not found!\n", handle);
+        return;
+    }
+    memcpy(peer->mymac, mymac, ETH_ALEN);
+    memcpy(peer->peermac, peermac, ETH_ALEN);
+    return;
+}
+
+void
+pkex_initiate(pkex_handle handle) 
 {
     struct pkex_peer *peer;
-    int ret;
+
+    TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
+        if (peer->handle == handle) {
+            break;
+        }
+    }
+    if (peer == NULL) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "can't find PKEX peer with handle %x to initiate!\n",
+                  handle);
+        return;
+    }
+    peer->initiator = 1;
+    (void)pkex_exchange_to_peer(peer, STATUS_OK);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_pkex, peer);
+    return;
+}
+
+void
+pkex_destroy_peer (pkex_handle handle)
+{
+    struct pkex_peer *peer;
+
+    TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
+        if (peer->handle == handle) {
+            break;
+        }
+    }
+    if (peer == NULL) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "can't find PKEX peer with handle %x to initiate!\n",
+                  handle);
+        return;
+    }
+    srv_rem_timeout(srvctx, peer->t0);  // just in case...
+    /*
+     * cleanliness and order!
+     */
+    if (peer->X != NULL) {
+        EC_KEY_free(peer->X);
+    }
+    if (peer->Y != NULL) {
+        EC_POINT_free(peer->Y);
+    }
+    if (peer->peer_bootstrap != NULL) {
+        EC_KEY_free(peer->peer_bootstrap);
+    }
+    if (peer->m != NULL) {
+        BN_free(peer->m);
+    }
+    if (peer->n != NULL) {
+        BN_free(peer->n);
+    }
+    TAILQ_REMOVE(&pkex_instance.peers, peer, entry);
+    free(peer);
+    return;
+}
+
+pkex_handle 
+pkex_create_peer (int version) 
+{
+    struct pkex_peer *peer;
 
     if ((peer = (struct pkex_peer *)malloc(sizeof(struct pkex_peer))) == NULL) {
         return -1;
     }
-    memcpy(peer->mymac, mymac, ETH_ALEN);
-    memcpy(peer->peermac, targetmac, ETH_ALEN);
+    peer->handle = ++next_handle;
+    peer->version = version;
     peer->X = NULL;
     peer->Y = NULL;
+    peer->m = NULL;
+    peer->n = NULL;
+    peer->peer_bootstrap = NULL;
     peer->state = PKEX_NOTHING;
-    peer->initiator = 1;
+    peer->initiator = 0;
     peer->retrans = 0;
     TAILQ_INSERT_HEAD(&pkex_instance.peers, peer, entry);
-    ret = pkex_exchange_to_peer(peer, STATUS_OK);
-    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_pkex, peer);
-    return ret;
+
+    return peer->handle;
 }
 
 int
-pkex_initialize (int whatkind, char *password, char *id, char *info, char *keyfile, char *bsfile,
-                 int opclass, int channel, int verbosity)
+pkex_initialize (int whatkind, char *password, char *id, char *info, char *keyfile, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;
@@ -1973,10 +2045,7 @@ pkex_initialize (int whatkind, char *password, char *id, char *info, char *keyfi
     }
     init_or_resp = whatkind;
     pkex_instance.group_num = 0;
-    pkex_instance.opclass = opclass;
-    pkex_instance.channel = channel;
     debug = verbosity;
-    strcpy(pkex_instance.bsfile, bsfile);
     strcpy(pkex_instance.password, password);
     if (id != NULL) {
         strcpy(pkex_instance.identifier, id);
