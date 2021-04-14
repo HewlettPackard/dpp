@@ -1960,7 +1960,7 @@ main (int argc, char **argv)
                         "\t-i  run DPP as the initiator\n"
                         "\t-r  run DPP as the responder\n"
                         "\t-a  do not perform mutual authentication in DPP\n"
-                        "\t-I <interface> to add to DPP\n"
+                        "\t-I <interface> to add to DPP (max %d characters)\n"
                         "\t-B <filename> of peer bootstrappign keys\n"
                         "\t-p <password> to use for PKEX\n"
                         "\t-f <channel> to use with DPP\n"
@@ -1976,7 +1976,7 @@ main (int argc, char **argv)
                         "\t-t  send DPP chirps (responder only)\n"
                         "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
                         "\t-d <debug> set debugging mask\n",
-                        argv[0]);
+                        argv[0], IFNAMSIZ);
                 exit(1);
                 
         }

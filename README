@@ -314,3 +314,13 @@ More, or different ones, can be made with openssl.
   There is a QR code for the controller-- controller.png contains the
 public key found in controller.pem. 
 
+FAQ
+
+  1) segfault due to long wifi interface (longer than IFNAMSIZ) name in linux
+
+    # just change interface name
+
+    sudo ifconfig wlxc4e9841c6a82 down
+    sudo ip link set wlxc4e9841c6a82 name wlan0
+    sudo ifconfig wlan0 up
+    ./sss -I wlan0 -i -p fubar -n blah -k initp256.pem -B initbkeys.txt -b -d 63
