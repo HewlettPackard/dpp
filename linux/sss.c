@@ -39,7 +39,6 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/queue.h>
 #include <netinet/in.h>
 #include <net/if.h>
@@ -1838,7 +1837,7 @@ main (int argc, char **argv)
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
     int chchandpp = 0, chirp = 0, ver = 2;
     struct interface *inf;
-    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
+    char interface[IFNAMSIZ], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     struct nl_msg *msg;
@@ -1866,6 +1865,10 @@ main (int argc, char **argv)
         }
         switch (c) {
             case 'I':           /* interface */
+                if (strlen(optarg) > IFNAMSIZ) {
+                    fprintf(stderr, "%s: interface name %s is 'too large'\n", argv[0], optarg);
+                    exit(1);
+                }
                 strcpy(interface, optarg);
                 printf("adding interface %s...\n", interface);
                 add_interface(interface);

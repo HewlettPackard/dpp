@@ -52,6 +52,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
+#include <openssl/x509.h>
 #include "ieee802_11.h"
 #include "service.h"
 #include "dpp.h"
@@ -68,6 +69,14 @@ struct interface {
 };
 TAILQ_HEAD(bar, interface) interfaces;
 
+struct pkex_instance {
+    TAILQ_ENTRY(pkex_instance) entry;
+    pkex_handle handle;
+    unsigned char mymac[ETH_ALEN];
+    unsigned char peermac[ETH_ALEN];
+};
+TAILQ_HEAD(blah, pkex_instance) pkex_instances;
+
 struct dpp_instance {
     TAILQ_ENTRY(dpp_instance) entry;
     dpp_handle handle;
@@ -82,6 +91,7 @@ TAILQ_HEAD(foo, dpp_instance) dpp_instances;
 service_context srvctx;
 static int discovered = -1;
 unsigned char our_ssid[33];
+unsigned int opclass = 81, channel = 6;
 char bootstrapfile[80];
 
 static void
@@ -204,6 +214,66 @@ create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
     return instance;
 }
 
+struct pkex_instance *
+find_pkex_instance_by_mac (unsigned char *me)
+{
+    struct pkex_instance *found;
+    
+    TAILQ_FOREACH(found, &pkex_instances, entry) {
+        if (memcmp(found->mymac, me, ETH_ALEN) == 0) {
+            break;
+        }
+    }
+    if (found == NULL) {
+        fprintf(stderr, "unable to find pkex peer with " MACSTR "\n",
+                MAC2STR(me));
+    }
+    return found;
+}
+
+struct pkex_instance *
+find_pkex_instance_by_handle (pkex_handle handle)
+{
+    struct pkex_instance *found;
+    
+    TAILQ_FOREACH(found, &pkex_instances, entry) {
+        if (found->handle == handle) {
+            break;
+        }
+    }
+    if (found == NULL) {
+        fprintf(stderr, "unable to find pkex peer, handle = %d\n", handle);
+    }
+    return found;
+}
+
+static struct pkex_instance *
+create_pkex_instance (unsigned char *mymac, unsigned char *peermac, int version) 
+{
+    struct pkex_instance *instance;
+    
+    if ((instance = (struct pkex_instance *)malloc(sizeof(struct pkex_instance))) == NULL) {
+        return NULL;
+    }
+    memcpy(instance->mymac, mymac, ETH_ALEN);
+    memcpy(instance->peermac, peermac, ETH_ALEN);
+    /*
+     * no version won't create pkex state, it will just create this
+     * state in sss that can be used to bootstrap a peer on these MAC
+     * addresses
+     */
+    if (version) {
+        if ((instance->handle = pkex_create_peer(version)) < 1) {
+            free(instance);
+            return NULL;
+        }
+    } else {
+        instance->handle = 0;
+    }
+    TAILQ_INSERT_HEAD(&pkex_instances, instance, entry);
+    return instance;
+}
+
 static void
 bpf_in (int fd, void *data)
 {
@@ -211,13 +281,14 @@ bpf_in (int fd, void *data)
     dpp_action_frame *dpp;
     struct dpp_instance *instance;
     char el_id, el_len, ssid[33];
+    struct pkex_instance *pinst;
     unsigned char buf[2048], *ptr, *els, pmk[PMK_LEN], pmkid[PMKID_LEN];
     unsigned char mac[20], keyasn1[1024], keyhash[SHA256_DIGEST_LENGTH];
     unsigned int mdlen = SHA256_DIGEST_LENGTH;
     struct bpf_hdr *hdr;
     struct ieee80211_mgmt_frame *frame;
     unsigned short frame_control;
-    int type, stype, len, framesize, left, ret, opclass, channel, asn1len;
+    int type, stype, len, framesize, left, ret, oc, chan, asn1len;
     char pkey[200];
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     TLV *rhash;
@@ -347,11 +418,31 @@ bpf_in (int fd, void *data)
                                 /*
                                  * PKEX
                                  */
+                                case PKEX_SUB_EXCH_V1REQ:
                                 case PKEX_SUB_EXCH_REQ:
                                 case PKEX_SUB_EXCH_RESP:
                                 case PKEX_SUB_COM_REV_REQ:
                                 case PKEX_SUB_COM_REV_RESP:
-                                    if (process_pkex_frame(frame->action.variable, left, inf->bssid, frame->sa) < 0) {
+                                    if ((pinst = find_pkex_instance_by_mac(inf->bssid)) == NULL) {
+                                        if (dpp->frame_type == PKEX_SUB_EXCH_V1REQ) {
+                                            pinst = create_pkex_instance(inf->bssid, frame->sa, 1);
+                                            pkex_update_macs(pinst->handle, inf->bssid, frame->sa);
+                                        } else if (dpp->frame_type == PKEX_SUB_EXCH_REQ) {
+                                            pinst = create_pkex_instance(inf->bssid, frame->sa, 2);
+                                        } else {
+                                            fprintf(stderr, "cannot find instance from " MACSTR "\n",
+                                                    MAC2STR(frame->sa));
+                                        }
+                                    }
+                                    if (memcmp(pinst->peermac, broadcast, ETH_ALEN) == 0) {
+                                        /*
+                                         * if we started out broadcasting, we now got a response so
+                                         * update MACs
+                                         */
+                                        memcpy(pinst->peermac, frame->sa, ETH_ALEN);
+                                        pkex_update_macs(pinst->handle, inf->bssid, frame->sa);
+                                    }
+                                    if (process_pkex_frame(frame->action.variable, left, pinst->handle) < 0) {
                                         fprintf(stderr, "error processing PKEX frame from " MACSTR "\n",
                                                 MAC2STR(frame->sa));
                                     }
@@ -383,7 +474,7 @@ bpf_in (int fd, void *data)
                                     }
                                     while (!feof(fp)) {
                                         memset(pkey, 0, sizeof(pkey));
-                                        if (fscanf(fp, "%d %d %d %s %s", &ret, &opclass, &channel, mac, pkey) < 0) {
+                                        if (fscanf(fp, "%d %d %d %s %s", &ret, &oc, &chan, mac, pkey) < 0) {
                                             continue;
                                         }
                                         if ((asn1len = EVP_DecodeBlock(keyasn1, (unsigned char *)pkey, strlen(pkey))) < 0) {
@@ -596,9 +687,14 @@ transmit_discovery_frame (unsigned char tid, char *data, int len)
 }
 
 int
-transmit_pkex_frame (unsigned char *mymac, unsigned char *peermac, char *data, int len)
+transmit_pkex_frame (pkex_handle handle, char *data, int len)
 {
-    return cons_action_frame(PUB_ACTION_VENDOR, mymac, peermac, data, len);
+    struct pkex_instance *instance;
+
+    if ((instance = find_pkex_instance_by_handle(handle)) == NULL) {
+        return -1;
+    }
+    return cons_action_frame(PUB_ACTION_VENDOR, instance->mymac, instance->peermac, data, len);
 }
 
 /*
@@ -844,6 +940,67 @@ provision_connector (char *role, unsigned char *ssid, int ssidlen,
     return 1;
 }
     
+int
+save_bootstrap_key (pkex_handle handle, void *param)
+{
+    EC_KEY *peerbskey = (EC_KEY *)param;
+    BIO *bio = NULL;
+    FILE *fp = NULL;
+    char newone[1024], existing[1024], b64bskey[1024];
+    unsigned char *ptr, mac[2*ETH_ALEN];
+    int ret = -1, len, octets, opc, chan;
+    struct pkex_instance *instance;
+    
+    if ((instance = find_pkex_instance_by_handle(handle)) == NULL) {
+        goto fin;
+    }
+    /*
+     * get the base64 encoded EC_KEY as onerow[1]
+     */
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        fprintf(stderr, "unable to create bio!\n");
+        goto fin;
+    }
+    (void)i2d_EC_PUBKEY_bio(bio, peerbskey);
+    (void)BIO_flush(bio);
+    len = BIO_get_mem_data(bio, &ptr);
+    octets = EVP_EncodeBlock((unsigned char *)newone, ptr, len);
+    BIO_free(bio);
+
+    memset(b64bskey, 0, 1024);
+    strncpy(b64bskey, newone, octets);
+
+    if ((fp = fopen(bootstrapfile, "r+")) == NULL) {
+        fprintf(stderr, "unable to open %s as bootstrapping file\n", bootstrapfile);
+        goto fin;
+    }
+    ret = 0;
+    while (!feof(fp)) {
+        if (fscanf(fp, "%d %d %d %s %s", &ret, &opc, &chan, mac, existing) < 0) {
+            continue;
+        }
+// TODO: stop appending everything!
+        if (strcmp(existing, newone) == 0) {
+            fprintf(stderr, "bootstrapping key is trusted already\n");
+        }
+    }
+    ret++;
+    /*
+     * bootstrapping file is index opclass channel macaddr key
+     */
+    printf("it'll be %d, oc %d, chan %d, and it's %d long and it's %s\n", ret, 
+           opclass, channel, octets, b64bskey);
+    fprintf(fp, "%d %d %d %02x%02x%02x%02x%02x%02x %s\n", ret, opclass, channel,
+            instance->peermac[0], instance->peermac[1], instance->peermac[2], 
+            instance->peermac[3], instance->peermac[4], instance->peermac[5], 
+            b64bskey);
+  fin:
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    return ret;
+}
+
 static void
 add_interface (unsigned char *ptr)
 {
@@ -1200,22 +1357,34 @@ change_dpp_channel (dpp_handle handle, unsigned char class, unsigned char channe
  * Initiates DPP to peer whose DPP URI is at "keyidx".
  */
 int
-bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
+bootstrap_peer (pkex_handle handle, int keyidx, int is_initiator, int mauth)
 {
     FILE *fp;
-    int n, opclass, channel;
+    struct pkex_instance *instance;
+    int n, oc, chan;
     unsigned char peermac[ETH_ALEN]; 
     unsigned char keyb64[1024];
     char mac[20], *ptr;
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
+    if ((instance = find_pkex_instance_by_handle(handle)) == NULL) {
+        fprintf(stderr, "cannot find PKEX instance with handle %x\n", handle);
+        return -1;
+    }
+    /*
+     * if this instance created pkex state, clean it up now
+     */
+    if (instance->handle) {
+        pkex_destroy_peer(instance->handle);
+    }
+
     printf("looking for bootstrap key index %d\n", keyidx);
     if ((fp = fopen(bootstrapfile, "r")) == NULL) {
-        return -1;
+        goto fin;
     }
     while (!feof(fp)) {
         memset(keyb64, 0, sizeof(keyb64));
-        fscanf(fp, "%d %d %d %s %s", &n, &opclass, &channel, mac, keyb64);
+        fscanf(fp, "%d %d %d %s %s", &n, &oc, &chan, mac, keyb64);
         if (n == keyidx) {
             break;
         }
@@ -1223,14 +1392,14 @@ bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
     if (feof(fp)) {
         fprintf(stderr, "unable to find bootstrap key with index %d\n", keyidx);
         fclose(fp);
-        return -1;
+        goto fin;
     }
     fclose(fp);
-    printf("peer is on operating class %d and channel %d, checking...\n", opclass, channel);
+    printf("peer is on operating class %d and channel %d, checking...\n", oc, chan);
     printf("peer's bootstrapping key is %s\n", keyb64);
-    if (change_channel(mymac, opclass, channel) < 0) {
+    if (change_channel(instance->mymac, oc, chan) < 0) {
         fprintf(stderr, "peer's channel and operating class is not supported!\n");
-        return -1;
+        goto fin;
     }
     ptr = &mac[10];
     sscanf(ptr, "%hhx", &peermac[5]); mac[10] = '\0';
@@ -1250,12 +1419,18 @@ bootstrap_peer (unsigned char *mymac, int keyidx, int is_initiator, int mauth)
         memcpy(peermac, broadcast, ETH_ALEN);
     }
 
-    if (create_dpp_instance(mymac, peermac, keyb64, is_initiator, mauth) == NULL) {
+    if (create_dpp_instance(instance->mymac, peermac, keyb64, is_initiator, mauth) == NULL) {
         fprintf(stderr, "unable to create peer!\n");
     } else {
         printf("new peer is at " MACSTR "\n", MAC2STR(peermac));
     }
-    
+fin:    
+    /*
+     * clean up this state regardless of whether we successfully bootstrapped
+     */
+    TAILQ_REMOVE(&pkex_instances, instance, entry);
+    free(instance);
+
     return 1;
 }
 
@@ -1263,13 +1438,12 @@ int
 main (int argc, char **argv)
 {
     int s, c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
-    unsigned char opclass = 81, channel = 6;
-    int mediaopt, chchan = 0, chirp = 0;
+    int mediaopt, chchan = 0, chirp = 0, ver = 2;
     struct interface *inf;
     struct ifreq ifr;
     struct ieee80211req ireq;
     struct ifmediareq ifmreq;
-    char interface[10], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
+    char interface[IFNAMSIZ], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *cruft, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     char *ptr, *endptr;
@@ -1298,12 +1472,16 @@ main (int argc, char **argv)
     memset(mudurl, 0, 80);
     memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:v:");
         if (c < 0) {
             break;
         }
         switch (c) {
             case 'I':           /* interface */
+                if (strlen(optarg) > IFNAMSIZ) {
+                    fprintf(stderr, "%s: interface name %s is 'too large'\n", argv[0], optarg);
+                    exit(1);
+                }
                 strcpy(interface, optarg);
                 printf("adding interface %s...\n", interface);
                 add_interface(interface);
@@ -1380,6 +1558,13 @@ main (int argc, char **argv)
                 break;
             case 'u':
                 strcpy(mudurl, optarg);
+            case 'v':
+                ver = atoi(optarg);
+                if (ver < 1 || ver > 2) {
+                    fprintf(stderr, "%s: unknown version, %d\n", argv[0], ver);
+                    exit(1);
+                }
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -1585,20 +1770,12 @@ main (int argc, char **argv)
      * initialize data structures...
      */
     if (do_pkex) {
-        if (pkex_initialize(is_initiator, password, identifier, pkexinfo, keyfile, bootstrapfile,
-                            opclass, channel, debug) < 0) {
+        if (pkex_initialize(is_initiator, password, identifier, pkexinfo, keyfile, debug) < 0) {
             fprintf(stderr, "%s: cannot configure PKEX, check config file!\n", argv[0]);
             exit(1);
         }
     }
     if (do_dpp) {
-        /*
-         * we've already changed channels, if needed. If 
-         */
-        if (chchan == 0) {
-            channel = 0;
-            opclass = 0;
-        }
         if (dpp_initialize(config_or_enroll, keyfile, 
                            signkeyfile, enrollee_role, mudurl, chirp, caip,
                            opclass, channel, debug) < 0) {
@@ -1620,10 +1797,19 @@ main (int argc, char **argv)
          * otherwise create a DPP peer and wait.
          */
         if (is_initiator) {
-            if (!do_pkex) {
-                bootstrap_peer(inf->bssid, keyidx, is_initiator, mutual);
+            struct pkex_instance *instance;
+
+            if (!do_pkex) {     /* 0 means don't create pkex state */
+                instance = create_pkex_instance(inf->bssid, targetmac, 0);
+                bootstrap_peer(instance->handle, keyidx, is_initiator, mutual);
             } else {
-                pkex_initiate(inf->bssid, targetmac);
+                /*
+                 * always update the macs in case there's no v2 answer we can
+                 * switch back to v1
+                 */
+                instance = create_pkex_instance(inf->bssid, targetmac, ver);
+                pkex_update_macs(instance->handle, inf->bssid, targetmac);
+                pkex_initiate(instance->handle);
             }
         } else {
             if (!do_pkex) {

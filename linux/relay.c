@@ -39,7 +39,6 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/queue.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -524,7 +523,7 @@ message_from_controller (int fd, void *data)
         printf("need to fragment message that is %d, buffer is %d\n",
                cb_resp->query_resplen, len);
         memcpy(cs->buf, cb_resp->query_resp, len);
-        print_buffer("First 32 octets that I'm gonna fragment", cs->buf, 32); 
+        print_buffer("First 32 octets that I'm gonna fragment", (unsigned char *)cs->buf, 32); 
         cs->sofar = 0;
         cs->left = len;
         cons_next_fragment(cs);
@@ -1468,7 +1467,7 @@ main (int argc, char **argv)
 {
     int c, got_controller = 0, infd, opt;
     struct interface *inf;
-    char interface[10], bkfile[30];
+    char interface[IFNAMSIZ], bkfile[30];
     struct sockaddr_in serv;
 
     if ((srvctx = srv_create_context()) == NULL) {
@@ -1486,6 +1485,10 @@ main (int argc, char **argv)
         }
         switch (c) {
             case 'I':           /* interface */
+                if (strlen(optarg) > IFNAMSIZ) {
+                    fprintf(stderr, "%s: interface name %s is 'too large'\n", argv[0], optarg);
+                    exit(1);
+                }
                 strcpy(interface, optarg);
                 printf("adding interface %s...\n", interface);
                 add_interface(interface);
