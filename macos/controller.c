@@ -672,6 +672,15 @@ fail:
     return 1;
 }
 
+void
+term (unsigned short reason)
+{
+    /*
+     * not used by controller
+     */
+    return;
+}
+
 int
 main (int argc, char **argv)
 {

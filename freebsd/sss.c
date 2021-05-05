@@ -91,7 +91,7 @@ TAILQ_HEAD(foo, dpp_instance) dpp_instances;
 service_context srvctx;
 static int discovered = -1;
 unsigned char our_ssid[33];
-unsigned int opclass = 81, channel = 6;
+unsigned int opclass = 81, channel = 6, quit_at_term = 0;
 char bootstrapfile[80];
 
 static void
@@ -698,18 +698,15 @@ transmit_pkex_frame (pkex_handle handle, char *data, int len)
 }
 
 /*
- * fin()
- *      sae has finished for the specified MAC address. If the reason
- *      is because it was successful, there will be a key (PMK) to plumb
+ * term()
+ *      DPP is done (for an enrollee)
  */
 void
-fin (unsigned short reason, unsigned char *mac, unsigned char *key, int keylen)
+term (unsigned short reason)
 {
-    printf("status of " MACSTR " is %d, ", MAC2STR(mac), reason);
-    if ((reason == 0) && (key != NULL) && (keylen > 0)) {
-        printf("plumb the %d byte key into the kernel now!\n", keylen);
-    } else {
-        printf("(an error)\n");
+    printf("DPP has ended\n");
+    if (quit_at_term) {
+        exit(reason);
     }
 }
 
@@ -1472,7 +1469,7 @@ main (int argc, char **argv)
     memset(mudurl, 0, 80);
     memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:v:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:qn:z:f:g:u:tw:v:");
         if (c < 0) {
             break;
         }
@@ -1565,6 +1562,9 @@ main (int argc, char **argv)
                     exit(1);
                 }
                 break;
+            case 'q':
+                quit_at_term = 1;
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -1590,6 +1590,7 @@ main (int argc, char **argv)
                         "\t-s  change opclass/channel to what was set with -f and -g\n"
                         "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-t  send DPP chirps (responder only)\n"
+                        "\t-q  terminate the process upon completion (enrollee only)\n"
                         "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);

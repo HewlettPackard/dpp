@@ -366,6 +366,16 @@ bootstrap_peer (int keyidx, int is_initiator, int mauth)
     return 1;
 }
 
+/*
+ * called by enrollees when they finish DPP
+ */
+void
+term (unsigned short reason)
+{
+    printf("DPP is terminating...\n");
+    exit(reason);
+}
+
 int
 main (int argc, char **argv)
 {

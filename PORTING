@@ -44,9 +44,9 @@ to allow DPP to use to send frames over the air. These are:
 	Parse credential and output netaccesskey and connector for
 	use by the DPP peer.
 	
-  - void fin()
+  - void term()
 
-	To obtain notification of termination of DPP. 
+	To obtain notification of termination of DPP. Called by Enrollees.
 
 To port this code to another OS it is necessary to provide these APIs
 and perform the necessary function. dpp.h and pkex.h define the routines

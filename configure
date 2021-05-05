@@ -4889,7 +4889,6 @@ else
 
 fi
 
-	LIBS="$LIBS -lc_r"
 	ac_config_files="$ac_config_files freebsd/Makefile"
 
 	;;

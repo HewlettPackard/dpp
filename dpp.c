@@ -600,6 +600,12 @@ fin:
 }
 
 static void
+send_term_notice (timerid id, void *unused)
+{
+    term(0);
+}
+
+static void
 destroy_peer (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
@@ -3644,9 +3650,12 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                              * a ret of 0 means we already responded with a CSR, don't want to send a 
                              * config result in this case
                              */
-                            if ((ret > 0) && (peer->version > 1)) {
-                                send_dpp_config_result(peer, STATUS_OK);
-                                peer->state = DPP_PROVISIONED;
+                            if (ret > 0) {
+                                if (peer->version > 1) {
+                                    send_dpp_config_result(peer, STATUS_OK);
+                                    peer->state = DPP_PROVISIONED;
+                                }
+                                (void)srv_add_timeout(srvctx, SRV_SEC(1), send_term_notice, peer);
                             }
                         } else if (garp->comeback_delay == 1) {
                             /*
@@ -3703,6 +3712,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                             if (peer->version > 1) {
                                 send_dpp_config_result(peer, STATUS_OK);
                             }
+                            (void)srv_add_timeout(srvctx, SRV_SEC(1), send_term_notice, peer);
                         }
                         break;
                 }

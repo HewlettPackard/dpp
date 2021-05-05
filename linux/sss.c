@@ -112,6 +112,7 @@ static int discovered = -1;
 char our_ssid[33];
 unsigned int opclass = 81, channel = 6;
 char bootstrapfile[80];
+int quit_at_fin = 0;
 
 extern int nl_debug;
 
@@ -1201,6 +1202,7 @@ find_dpp_conie (unsigned char *ie, int ielen) {
         ielen -= ie[1] + 2;
         ie += ie[1] + 2;
     }
+    printf("didn't find the DPP Configurator connectivity IE on %s\n", blah);
     return 0;
 }
 
@@ -1831,6 +1833,20 @@ fin:
     return ret;
 }
 
+/*
+ * called by enrollees when they finish DPP
+ */
+void
+term (unsigned short reason)
+{
+    if (quit_at_fin) {
+        printf("DPP is terminating...\n");
+        exit(reason);
+    } else {
+        printf("DPP has ended...\n");
+    }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1856,9 +1872,9 @@ main (int argc, char **argv)
     memset(pkexinfo, 0, 80);
     memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:f:g:u:tw:v:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:qf:g:u:tw:v:");
         /*
-         * left: j, l, o, q, v, y
+         * left: j, l, o, v, y
          */
         if (c < 0) {
             break;
@@ -1953,6 +1969,9 @@ main (int argc, char **argv)
                     exit(1);
                 }
                 break;
+            case 'q':
+                quit_at_fin = 1;
+                break;
             default:
             case 'h':
                 fprintf(stderr, 
@@ -1977,6 +1996,7 @@ main (int argc, char **argv)
                         "\t-s  change opclass/channel to what was set with -f and -g during DPP\n"
                         "\t-u <url> to find a MUD file (enrollee only)\n"
                         "\t-t  send DPP chirps (responder only)\n"
+                        "\t-q  terminate the process upon completion (enrollee only)\n"
                         "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0], IFNAMSIZ);
@@ -2035,21 +2055,23 @@ main (int argc, char **argv)
     TAILQ_FOREACH(inf, &interfaces, entry) {
         printf("\t%s: " MACSTR "\n", inf->ifname, MAC2STR(inf->bssid));
         if (chirp) {
-            /*
-             * first add channel 6 since we support 2.4GHz
-             */
-            dpp_add_chirp_freq(inf->bssid, 2437);
-            /*
-             * then add all the APs that are beaconing out a DPP ConfigConn IE
-             */
-            printf("chirping, so scan for APs\n");
-            if (trigger_scan(inf, NULL) == 0) {
-                msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
-                if (send_nl_msg(msg, inf, callback_dump, inf)) {
-                    printf("can't get scan info from kernel!\n");
+            if (!inf->is_loopback) {
+                /*
+                 * first add channel 6 since we support 2.4GHz
+                 */
+                dpp_add_chirp_freq(inf->bssid, 2437);
+                /*
+                 * then add all the APs that are beaconing out a DPP ConfigConn IE
+                 */
+                printf("chirping, so scan for APs\n");
+                if (trigger_scan(inf, NULL) == 0) {
+                    msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
+                    if (send_nl_msg(msg, inf, callback_dump, inf)) {
+                        printf("can't get scan info from kernel!\n");
+                    }
+                } else {
+                    printf("can't scan to find chirping channel :-(\n");
                 }
-            } else {
-                printf("can't scan to find chirping channel :-(\n");
             }
             /*
              * then add the configured channel if it's not on the list already
