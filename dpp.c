@@ -97,6 +97,7 @@
 #define STATUS_CONFIGURE_PENDING        11
 #define STATUS_CSR_NEEDED               12
 #define STATUS_CSR_BAD                  13
+#define STATUS_NEW_KEY_NEEDED           14
 
 /*
  * DPP roles
@@ -173,6 +174,9 @@ struct candidate {
     /*
      * dpp config stuff
      */
+    EC_POINT *peernewproto;             /* if Configurator asks for a new protocol key */
+    EC_KEY *mynewproto;
+    int newprimelen;                    /* size of new group */
     int nextfragment;
     char enrollee_name[80];
     char enrollee_role[10];
@@ -212,6 +216,8 @@ struct _dpp_instance {
     int group_num;              /* these are handy to keep around */
     int primelen;               /* and not have to continually */
     int digestlen;              /* compute them from "bootstrap" */
+    unsigned short newgroup;    /* 0 if not needed, NID of curve otherwise */
+    EC_KEY *Pc;                 /* configurator's new protocol key (reused) */
     int noncelen;
     int nid;                    /* ditto */
     char caip[40];
@@ -425,6 +431,82 @@ dump_tlvs (unsigned char *attributes, int len)
 // routines common between initiator and responder
 //----------------------------------------------------------------------
 
+static int
+prime_len_by_curve (int groupnum)
+{
+    int len = 0;
+
+    switch (groupnum) {
+        case 19:                /* NIST p256 */
+        case 28:                /* brainpool p256 */
+            len = 32;
+            break;
+        case 20:                /* NIST p384 */
+        case 29:                /* brainpool p384 */
+            len = 48;
+            break;
+        case 30:                /* brainpool p512 */
+            len = 64;
+            break;
+        case 21:                /* NIST p521 */
+            len = 66;
+            break;
+        case 25:                /* SEC p192 */
+            len = 24;
+            break;
+        case 26:                /* SEC p224 */
+            len = 28;
+            break;
+        default:
+            break;
+    }
+    return len;
+}
+
+EC_KEY *generate_new_protocol_key (unsigned short group)
+{
+    EC_KEY *newkey = NULL;
+
+    switch (group) {
+        case 19:
+            newkey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+            break;
+        case 20:
+            newkey = EC_KEY_new_by_curve_name(NID_secp384r1);
+            break;
+        case 21:
+            newkey = EC_KEY_new_by_curve_name(NID_secp521r1);
+            break;
+        case 25:
+            newkey = EC_KEY_new_by_curve_name(NID_X9_62_prime192v1);
+            break;
+        case 26:
+            newkey = EC_KEY_new_by_curve_name(NID_secp224r1);
+            break;
+#ifdef HAS_BRAINPOOL
+        case 28:
+            newkey = EC_KEY_new_by_curve_name(NID_brainpoolP256r1);
+            break;
+        case 29:
+            newkey = EC_KEY_new_by_curve_name(NID_brainpoolP384r1);
+            break;
+        case 30:
+            newkey = EC_KEY_new_by_curve_name(NID_brainpoolP512r1);
+            break;
+#endif  /* HAS_BRAINPOOL */
+        default:
+            break;
+    }
+    if (newkey != NULL) {
+        if (!EC_KEY_generate_key(newkey)) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot create new protocol key\n");
+            EC_KEY_free(newkey);
+            newkey = NULL;
+        }
+    }
+    return newkey;
+}
+
 static void
 setup_dpp_action_frame (struct candidate *peer, unsigned char frametype)
 {
@@ -613,6 +695,12 @@ destroy_peer (timerid id, void *data)
     srv_rem_timeout(srvctx, peer->t0);
     if (peer->my_proto != NULL) {
         EC_KEY_free(peer->my_proto);
+    }
+    if (peer->mynewproto != NULL) {
+        EC_KEY_free(peer->mynewproto);
+    }
+    if (peer->peernewproto != NULL) {
+        EC_POINT_clear_free(peer->peernewproto);
     }
     EC_POINT_clear_free(peer->peer_proto);
     EC_KEY_free(peer->peer_bootstrap);
@@ -1205,7 +1293,6 @@ extract_certs (char *bag, int len, char *cacert, int cacert_len)
      * if we got a CA cert then decode that
      */
     if ((cacert != NULL) && (cacert_len > 0)) {
-        free(asn1);
         if ((asn1 = (unsigned char *)malloc(cacert_len)) == NULL) {
             goto fin;
         }
@@ -1225,7 +1312,7 @@ extract_certs (char *bag, int len, char *cacert, int cacert_len)
             goto fin;
         }
         BIO_free(bio); bio = NULL;
-        free(asn1);
+        free(asn1); asn1 = NULL;
         
         nid = OBJ_obj2nid(cap7->type);
         switch (nid) {
@@ -2241,9 +2328,18 @@ dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
     fflush(fp);
     BIO_free(bio);
 
+    /*
+     * if we're just provisioning the connector for configuration issues and
+     * not for network access then we're done here.
+     */
+    if ((ssid == NULL) || (ssidlen == 0)) {
+        free(buf);
+        return;
+    }
+
     memset(netname, 0, sizeof(netname));
     memset(conffile, 0, sizeof(conffile));
-    if (ssid == NULL || ssidlen == 0) {
+    if (ssid[0] == '*' || ssidlen == 1) {
         strcpy(netname, "*");
         strcpy(conffile, "wildcard_dpp.conf");
     } else {
@@ -2427,14 +2523,14 @@ generate_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
     siv_ctx ctx;
     TLV *tlv, *wraptlv;
     unsigned char burlx[256], burly[256], kid[KID_LENGTH];
-    unsigned char conn[1024], *bn = NULL;
+    unsigned char conn[1024], *bn = NULL, *ptr;
     char confresp[4096];
     int sofar = 0, offset, burllen, nid;
     BIGNUM *x = NULL, *y = NULL, *signprime = NULL;
-    const EC_POINT *signpub;
+    const EC_POINT *signpub, *newpub;
     const EC_GROUP *signgroup = NULL;
     unsigned char *encrypt_ptr = NULL;
-    unsigned short wrapped_len = 0;
+    unsigned short wrapped_len = 0, grp;
     time_t t;
     struct tm *bdt;
     struct cpolicy *cp;
@@ -2453,12 +2549,24 @@ generate_dpp_config_resp_frame (struct candidate *peer, unsigned char status)
         /*
          * if we can't generate a connector then indicate configuration failure
          */
-        if (generate_connector(conn, sizeof(conn), (EC_GROUP *)dpp_instance.group,
-                               peer->peer_proto, peer->enrollee_role,
-                               dpp_instance.signkey, bnctx) < 0) {
-            dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
-            status = STATUS_CONFIGURE_FAILURE;
-            goto problemo;
+        if (dpp_instance.newgroup) {
+            if ((peer->peernewproto == NULL) ||
+                generate_connector(conn, sizeof(conn),
+                                   (EC_GROUP *)EC_KEY_get0_group(peer->mynewproto),
+                                   peer->peernewproto, peer->enrollee_role,
+                                   dpp_instance.signkey, bnctx) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
+                status = STATUS_CONFIGURE_FAILURE;
+                goto problemo;
+            }
+        } else {
+            if (generate_connector(conn, sizeof(conn), (EC_GROUP *)dpp_instance.group,
+                                   peer->peer_proto, peer->enrollee_role,
+                                   dpp_instance.signkey, bnctx) < 0) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to create a connector!\n");
+                status = STATUS_CONFIGURE_FAILURE;
+                goto problemo;
+            }
         }
         if (((signpub = EC_KEY_get0_public_key(dpp_instance.signkey)) == NULL) ||
             ((signgroup = EC_KEY_get0_group(dpp_instance.signkey)) == NULL) ||
@@ -2690,6 +2798,32 @@ problemo:
                 dpp_debug(DPP_DEBUG_TRACE, "adding CSR attributes request to config response\n");
             }
             break;
+        case STATUS_NEW_KEY_NEEDED:
+            dpp_debug(DPP_DEBUG_TRACE, "asking enrollee to generate a new protocol key in %d!\n",
+                      dpp_instance.newgroup);
+            if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
+                ((newpub = EC_KEY_get0_public_key(peer->mynewproto)) == NULL) ||
+                !EC_POINT_get_affine_coordinates_GFp((EC_GROUP *)EC_KEY_get0_group(peer->mynewproto),
+                                                     newpub, x, y, bnctx)) {
+                dpp_debug(DPP_DEBUG_ERR, "failed to get new public key!\n");
+                status = STATUS_CONFIGURE_FAILURE;
+                break;
+            }
+            /*
+             * add the new finite cyclic group and our new protocol key from it
+             */
+            grp = ieee_order(dpp_instance.newgroup);
+            tlv = TLV_set_tlv(tlv, FINITE_CYCLIC_GROUP, sizeof(unsigned short), (unsigned char *)&grp);
+            tlv->type = RESPONDER_PROTOCOL_KEY;
+            tlv->length = 2 * peer->newprimelen;
+            ptr = tlv->value;
+            offset = peer->newprimelen - BN_num_bytes(x);
+            BN_bn2bin(x, ptr + offset);
+            ptr += peer->newprimelen;
+            offset = peer->newprimelen - BN_num_bytes(y);
+            BN_bn2bin(y, ptr + offset);
+            tlv = TLV_next(tlv);
+            break;
         default:
             dpp_debug(DPP_DEBUG_ERR, "unknown status %d sent to gen_dpp_config_resp_frame()\n", status);
             break;
@@ -2751,8 +2885,15 @@ send_dpp_config_req_frame (struct candidate *peer)
 {
     siv_ctx ctx;
     TLV *tlv;
-    int ret = -1, caolen = 0;
+    int ret = -1, caolen = 0, offset;
     char confattsobj[1500], whoami[20], *csr = NULL;
+    unsigned char *ptr, *xoctets = NULL;
+    unsigned int mdlen = 0;
+    EVP_MD_CTX *mdctx = NULL;
+    BIGNUM *x = NULL, *y = NULL, *Sx = NULL;
+    const BIGNUM *pc;
+    EC_POINT *S;
+    unsigned char sx[SHA512_DIGEST_LENGTH], auth[SHA512_DIGEST_LENGTH], k[SHA512_DIGEST_LENGTH];
     
     memset(peer->buffer, 0, sizeof(peer->buffer));
     peer->nextfragment = 0;     // so enrollee can reuse the buffer when he's done sending
@@ -2768,6 +2909,113 @@ send_dpp_config_req_frame (struct candidate *peer)
     tlv = (TLV *)(tlv->value + AES_BLOCK_SIZE);
 
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
+    /*
+     * if we generated a new key pair then communicate that back
+     */
+    if (peer->mynewproto != NULL) {
+        dpp_debug(DPP_DEBUG_TRACE, "adding new protocol key...\n");
+        if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
+            !EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 EC_KEY_get0_public_key(peer->mynewproto),
+                                                 x, y, bnctx)) {
+            return ret;
+        }
+        /*
+         * x- and y-coordinates of new protocol key...
+         */
+        tlv->type = INITIATOR_PROTOCOL_KEY;
+        tlv->length = 2 * peer->newprimelen;
+        ptr = tlv->value;
+        offset = peer->newprimelen - BN_num_bytes(x);
+        BN_bn2bin(x, ptr + offset);
+        ptr += peer->newprimelen;
+        offset = peer->newprimelen - BN_num_bytes(y);
+        BN_bn2bin(y, ptr + offset);
+        BN_free(x);
+        BN_free(y);
+
+        if (((Sx = BN_new()) == NULL) ||
+            (S = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot create POP secret!\n");
+            return ret;
+        }
+        if (((pc = EC_KEY_get0_private_key(peer->mynewproto)) == NULL) ||
+            !EC_POINT_mul(EC_KEY_get0_group(peer->mynewproto), S, NULL, peer->peernewproto, pc, bnctx) ||
+            !EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 S, Sx, NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "failure to compute shared key for POP!\n");
+            BN_free(Sx);
+            EC_POINT_free(S);
+            return ret;
+        }
+        memset(k, 0, SHA512_DIGEST_LENGTH);
+        offset = peer->newprimelen - BN_num_bytes(Sx);
+        BN_bn2bin(Sx, sx + offset);
+        hkdf(dpp_instance.hashfcn, 0,
+             sx, peer->newprimelen,
+             peer->bk, dpp_instance.digestlen,
+             (unsigned char *)"New DPP Protocol Key", strlen("New DPP Protocol Key"),
+             k, dpp_instance.digestlen);
+
+        /*
+         * ...and an auth tag to prove possession
+         */
+        tlv = TLV_next(tlv);
+        if (((xoctets = (unsigned char *)malloc(peer->newprimelen)) == NULL) ||
+            ((x = BN_new()) == NULL) || ((mdctx = EVP_MD_CTX_new()) == NULL)) {
+            dpp_debug(DPP_DEBUG_ERR, "internal error trying to do POP!\n");
+            BN_free(Sx);
+            EC_POINT_free(S);
+            return ret;
+        }
+        EVP_DigestInit(mdctx, dpp_instance.hashfcn);
+        /*
+         * first the e-nonce...
+         */
+        EVP_DigestUpdate(mdctx, peer->enonce, dpp_instance.noncelen);
+        /*
+         * then the x-coordinates of the two public keys...
+         */
+        if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 peer->peernewproto, x, NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot get coordinates from peer's new protocol key!\n");
+            free(xoctets);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            return ret;
+        }
+        memset(xoctets, 0, peer->newprimelen);
+        offset = peer->newprimelen - BN_num_bytes(x);
+        BN_bn2bin(x, xoctets + offset);
+        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        
+        if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 EC_KEY_get0_public_key(peer->mynewproto), x,
+                                                 NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot get coordinates from our new protocol key!\n");
+            free(xoctets);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            return ret;
+        }
+        memset(xoctets, 0, peer->newprimelen);
+        offset = peer->newprimelen - BN_num_bytes(x);
+        BN_bn2bin(x, xoctets + offset);
+        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+
+        mdlen = dpp_instance.digestlen;
+        EVP_DigestFinal(mdctx, auth, &mdlen);
+
+        dpp_debug(DPP_DEBUG_TRACE, "adding POP auth tag...\n");
+        tlv = TLV_set_tlv(tlv, INITIATOR_AUTH_TAG, mdlen, auth);
+        free(xoctets);
+        EC_POINT_free(S);
+        BN_free(Sx);
+        BN_free(x);
+    }
+    
     /*
      * standard config object request, plus if we have a MUD URL then send it, if we have
      * csr attributes then generate a CSR too
@@ -3082,8 +3330,10 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
     TLV *tlv;
     unsigned char *val;
     EVP_ENCODE_CTX *ectx = NULL;
+    BIGNUM *x = NULL, *y = NULL;
     siv_ctx ctx;
     char *sstr, *estr;
+    unsigned short newgrp;
     int i, wrapdatalen, ntok, ncred, ret = -1;
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config response!\n");
@@ -3137,27 +3387,214 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
      * keep track of how much wrapped data we have left
      */
     wrapdatalen -= TLV_length(tlv);
+    /*
+     * next!
+     */
+    tlv = TLV_next(tlv);
 
     switch (*val) {
         case STATUS_OK:
+            /*
+             * Everything's good, so there will be connectors in this goo somewhere,
+             * ensure the right protocol key is ready when we go writing config files...
+             */
+            if ((peer->version > 1) && (peer->mynewproto != NULL)) {
+                if ((netaccesskey = EC_KEY_dup(peer->mynewproto)) == NULL) {
+                    dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
+                    goto fin;
+                }
+            } else {
+                if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
+                    dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
+                    goto fin;
+                }
+            }
+            /*
+             * there should be one or more configuration objects, go through them all...
+             */
+            TLV_foreach(tlv, i, wrapdatalen) {
+                if (TLV_type(tlv) != CONFIGURATION_OBJECT) {
+                    dpp_debug(DPP_DEBUG_ERR, "Other than Configuration Object in the DPP Config response: %s!\n",
+                              TLV_type_string(tlv));
+                    /*
+                     * be liberal in what we accept...
+                     */
+                    continue;
+                }
+                dpp_debug(DPP_DEBUG_TRACE, "\ncredential object:\n");
+                dpp_debug(DPP_DEBUG_TRACE, "%.*s\n\n", TLV_length(tlv), TLV_value(tlv));
+                if ((ncred = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                           &sstr, &estr, 2, "cred", "akm")) == 0) {
+                    dpp_debug(DPP_DEBUG_ERR, "No AKM credential in DPP Config response!\n");
+                    goto fin;
+                }
+                if (ncred < 1) {
+                    dpp_debug(DPP_DEBUG_ERR, "Got back %d credentials... bailing!\n", ncred);
+                    goto fin;
+                }
+                if (strncmp(sstr, "dpp", 3) == 0) {
+                    /*
+                     * we got a connector!
+                     */
+                    dpp_debug(DPP_DEBUG_TRACE, "A DPP AKM Configuration Object!\n");
+                    if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                        dpp_debug(DPP_DEBUG_ERR, "Bad connector in DPP AKM of Config response!\n");
+                        goto fin;
+                    }
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                        provision_connector(dpp_instance.enrollee_role, "*", 1,
+                                            connector, connector_len, peer->handle);
+                        dump_key_con(peer, NULL, 0);
+                    } else {
+                        provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                            connector, connector_len, peer->handle);
+                        dump_key_con(peer, sstr, (int)(estr - sstr));
+                    }
+                } else if (strncmp(sstr, "sae", 3) == 0) {
+                    char pwd[80];
+
+                    dpp_debug(DPP_DEBUG_TRACE, "An SAE AKM Configuration Object!\n");
+                    memset(pwd, 0, 80);
+                    /*
+                     * got a PSK configuration!
+                     */
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "cred", "pass")) != 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "use password '%.*s' ", (int)(estr - sstr), sstr);
+                        strncpy(pwd, sstr, (int)(estr - sstr));
+                    } else {
+                        dpp_debug(DPP_DEBUG_ERR, "Unknown type of sae, not 'pass'\n");
+                        goto fin;
+                    }
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
+                    } else {
+                        dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+                    }
+                    if (peer->version > 1) {
+                        /*
+                         * connector is v2 only
+                         */
+                        if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                            dpp_debug(DPP_DEBUG_ERR, "Bad connector in SAE AKM of Config response!\n");
+                            goto fin;
+                        }
+                        provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                            connector, connector_len, peer->handle);
+                        dump_key_con(peer, NULL, 0);
+                        dpp_debug(DPP_DEBUG_TRACE, "got valid connector with SAE config\n");
+                    }
+                    dump_pwd_con(sstr, (int)(estr - sstr), pwd, 1);
+                } else if (strncmp(sstr, "psk", 3) == 0) {
+                    char pwd[80];
+
+                    dpp_debug(DPP_DEBUG_TRACE, "An PSK AKM Configuration Object!\n");
+                    memset(pwd, 0, 80);
+                    /*
+                     * got a PSK configuration!
+                     */
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "cred", "pass")) != 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "use passphrase '%.*s' ", (int)(estr - sstr), sstr);
+                        strncpy(pwd, sstr, (int)(estr - sstr));
+                    } else if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                                     &sstr, &estr, 2, "cred", "psk_hex")) != 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "use hexstring '%.*s' ", (int)(estr - sstr), sstr);
+                        strncpy(pwd, sstr, (int)(estr - sstr));
+                    } else {
+                        dpp_debug(DPP_DEBUG_ERR, "Unknown type of psk, not 'pass' and not 'psk_hex'\n");
+                        goto fin;
+                    }
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
+                    } else {
+                        dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+                    }
+                    if (peer->version > 1) {
+                        /*
+                         * connector is v2 only
+                         */
+                        if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                            dpp_debug(DPP_DEBUG_ERR, "Bad connector in PSK AKM of Config response!\n");
+                            goto fin;
+                        }
+                        provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                            connector, connector_len, peer->handle);
+                        dump_key_con(peer, NULL, 0);
+                        dpp_debug(DPP_DEBUG_TRACE, "got valid connector with PSK config\n");
+                    }
+                    dump_pwd_con(sstr, (int)(estr - sstr), pwd, 0);
+                } else if (strncmp(sstr, "dot1x", 4) == 0) {
+                    char *p7, *ca, *san;
+                    int p7len, calen, sanlen;
+            
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 3, "cred", "entCreds", "certBag")) < 1) {
+                        dpp_debug(DPP_DEBUG_ERR, "No certBag in DPP Config response for dot1x!\n");
+                        goto fin;
+                    }
+                    dpp_debug(DPP_DEBUG_PKI, "got PKCS#7:\n %.*s\n", (int)(estr - sstr), sstr);
+                    p7 = sstr;
+                    p7len = (int)(estr - sstr);
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 3, "cred", "entCreds", "caCert")) < 1) {
+                        dpp_debug(DPP_DEBUG_ERR, "No caCert in DPP Config response for dot1x!\n");
+                        ca = NULL;
+                        calen = 0;
+                    } else {
+                        ca = sstr;
+                        calen = (int)(estr - sstr);
+                        dpp_debug(DPP_DEBUG_PKI, "got CA cert:\n %.*s\n", calen, ca);
+                    }
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 3, "cred", "entCreds", "trustedEapServerName")) < 1) {
+                        dpp_debug(DPP_DEBUG_ERR, "No SAN to match in server cert!\n");
+                        san = NULL;
+                        sanlen = 0;
+                    } else {
+                        dpp_debug(DPP_DEBUG_ERR, "Got a SAN to match in server cert!\n");
+                        san = sstr;
+                        sanlen = (int)(estr - sstr);
+                    }
+                    extract_certs(p7, p7len, ca, calen);
+                    if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
+                                              &sstr, &estr, 2, "discovery", "ssid")) == 0) {
+                        dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
+                    } else {
+                        dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
+                    }
+                    dump_cert_con(sstr, (int)(estr - sstr), p7, p7len, san, sanlen);
+                    /*
+                     * dot1x credentials are v2 only so there'll always be a connector
+                     */
+                    if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
+                        dpp_debug(DPP_DEBUG_ERR, "Bad connector in dot1x AKM of Config response!\n");
+                        goto fin;
+                    }
+                    provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
+                                        connector, connector_len, peer->handle);
+                    dump_key_con(peer, NULL, 0);
+                    dpp_debug(DPP_DEBUG_TRACE, "got valid connector with dot1x config\n");
+                } else {
+                    dpp_debug(DPP_DEBUG_ERR, "Unknown credential type %.*s!\n", (int)(estr - sstr), sstr);
+                    goto fin;
+                }
+            }
+            ret = 1;
             break;
         case STATUS_CONFIGURE_PENDING:
             dpp_debug(DPP_DEBUG_TRACE, "Configurator said configuration is pending...\n");
+            ret = -1;           // don't support this yet
             break;
         case STATUS_CSR_NEEDED:
+            if (TLV_type(tlv) != CSR_ATTRS_REQUEST) {
+                dpp_debug(DPP_DEBUG_ERR, "status says CSR needed but no CSR Attrs request!\n");
+                goto fin;
+            }
             dpp_debug(DPP_DEBUG_TRACE, "Configurator said we need a CSR to continue...\n");
-            break;
-        default:
-            dpp_debug(DPP_DEBUG_ERR, "Configurator returned %d as status in DPP Config Response: FAIL!\n",
-                      *val);
-            goto fin;
-    }
-    tlv = TLV_next(tlv);
-    /*
-     * we should have one or more configuration objects now, scroll through them
-     */
-    TLV_foreach(tlv, i, wrapdatalen) {
-        if (TLV_type(tlv) == CSR_ATTRS_REQUEST) {
             /*
              * OK, gotta start over and supply a CSR...
              */
@@ -3176,186 +3613,58 @@ process_dpp_config_response (struct candidate *peer, unsigned char *attrs, int l
             peer->csrattrs_len = i;
             (void)EVP_DecodeFinal(ectx, (unsigned char *)&(peer->csrattrs[i]), &i);
             peer->csrattrs_len += i;
-            EVP_ENCODE_CTX_free(ectx);
             send_dpp_config_req_frame(peer);
-            return 0;
-        }
-        if (TLV_type(tlv) != CONFIGURATION_OBJECT) {
-            dpp_debug(DPP_DEBUG_ERR, "Other than Configuration Object in the DPP Config response: %s!\n",
-                      TLV_type_string(tlv));
+            ret = 0;
+            break;
+        case STATUS_NEW_KEY_NEEDED:
+            if ((TLV_type(tlv) != FINITE_CYCLIC_GROUP) ||
+                (TLV_lookahead(tlv) != RESPONDER_PROTOCOL_KEY)) {
+                dpp_debug(DPP_DEBUG_ERR, "status says new key needed but no group/key in response\n");
+                goto fin;
+            }
             /*
-             * be liberal in what we accept...
+             * extract the peer's protocol key, generate one and grab peer's new one...
              */
-            continue;
-        }
-        dpp_debug(DPP_DEBUG_TRACE, "\ncredential object:\n");
-        dpp_debug(DPP_DEBUG_TRACE, "%.*s\n\n", TLV_length(tlv), TLV_value(tlv));
-        if ((ncred = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                   &sstr, &estr, 2, "cred", "akm")) == 0) {
-            dpp_debug(DPP_DEBUG_ERR, "No AKM credential in DPP Config response!\n");
-            goto fin;
-        }
-        if (ncred < 1) {
-            dpp_debug(DPP_DEBUG_ERR, "Got back %d credentials... bailing!\n", ncred);
-            goto fin;
-        }
-        if (strncmp(sstr, "dpp", 3) == 0) {
-            /*
-             * we got a connector!
-             */
-            dpp_debug(DPP_DEBUG_TRACE, "A DPP AKM Configuration Object!\n");
-            if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
-                dpp_debug(DPP_DEBUG_ERR, "Bad connector in DPP AKM of Config response!\n");
+            memcpy((unsigned short *)&newgrp, TLV_value(tlv), sizeof(unsigned short));
+            newgrp = ieee_order(newgrp);
+            dpp_debug(DPP_DEBUG_TRACE, "Configurator said we need to generate a new key in %d to continue...\n",
+                      newgrp);
+            if ((peer->mynewproto = generate_new_protocol_key(newgrp)) == NULL) {
+                dpp_debug(DPP_DEBUG_ERR, "can't generate new protocol key in group %d\n", newgrp);
                 goto fin;
             }
-            if ((netaccesskey = EC_KEY_dup(peer->my_proto)) == NULL) {
-                dpp_debug(DPP_DEBUG_ERR, "Unable to copy protocol key for network access!\n");
+            peer->newprimelen = prime_len_by_curve(newgrp);
+            tlv = TLV_next(tlv);
+            if (((peer->peernewproto = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) ||
+                ((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
+                dpp_debug(DPP_DEBUG_ERR, "can't generate peer's new protocol key!\n");
                 goto fin;
             }
-
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                provision_connector(dpp_instance.enrollee_role, "*", 1,
-                                    connector, connector_len, peer->handle);
-                dump_key_con(peer, NULL, 0);
-            } else {
-                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                    connector, connector_len, peer->handle);
-                dump_key_con(peer, sstr, (int)(estr - sstr));
-            }
-        } else if (strncmp(sstr, "sae", 3) == 0) {
-            char pwd[80];
-
-            dpp_debug(DPP_DEBUG_TRACE, "An SAE AKM Configuration Object!\n");
-            memset(pwd, 0, 80);
-            /*
-             * got a PSK configuration!
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "cred", "pass")) != 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "use password '%.*s' ", (int)(estr - sstr), sstr);
-                strncpy(pwd, sstr, (int)(estr - sstr));
-            } else {
-                dpp_debug(DPP_DEBUG_ERR, "Unknown type of sae, not 'pass'\n");
+            BN_bin2bn(TLV_value(tlv), peer->newprimelen, x);
+            BN_bin2bn(TLV_value(tlv) + peer->newprimelen, peer->newprimelen, y);
+            if (!EC_POINT_set_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                     peer->peernewproto, x, y, bnctx) ||
+                !EC_POINT_is_on_curve(EC_KEY_get0_group(peer->mynewproto), peer->peernewproto, bnctx)) {
+                dpp_debug(DPP_DEBUG_ERR, "unable to assign peer's new protocol key!\n");
                 goto fin;
             }
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
-            } else {
-                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
-            }
-            if (peer->version > 1) {
-                /*
-                 * connector is v2 only
-                 */
-                if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
-                    dpp_debug(DPP_DEBUG_ERR, "Bad connector in SAE AKM of Config response!\n");
-                    goto fin;
-                }
-                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                    connector, connector_len, peer->handle);
-                dpp_debug(DPP_DEBUG_TRACE, "got valid connector with SAE config\n");
-            }
-            dump_pwd_con(sstr, (int)(estr - sstr), pwd, 1);
-        } else if (strncmp(sstr, "psk", 3) == 0) {
-            char pwd[80];
-
-            dpp_debug(DPP_DEBUG_TRACE, "An PSK AKM Configuration Object!\n");
-            memset(pwd, 0, 80);
-            /*
-             * got a PSK configuration!
-             */
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "cred", "pass")) != 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "use passphrase '%.*s' ", (int)(estr - sstr), sstr);
-                strncpy(pwd, sstr, (int)(estr - sstr));
-            } else if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                             &sstr, &estr, 2, "cred", "psk_hex")) != 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "use hexstring '%.*s' ", (int)(estr - sstr), sstr);
-                strncpy(pwd, sstr, (int)(estr - sstr));
-            } else {
-                dpp_debug(DPP_DEBUG_ERR, "Unknown type of psk, not 'pass' and not 'psk_hex'\n");
-                goto fin;
-            }
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
-            } else {
-                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
-            }
-            if (peer->version > 1) {
-                /*
-                 * connector is v2 only
-                 */
-                if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
-                    dpp_debug(DPP_DEBUG_ERR, "Bad connector in PSK AKM of Config response!\n");
-                    goto fin;
-                }
-                provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                    connector, connector_len, peer->handle);
-                dpp_debug(DPP_DEBUG_TRACE, "got valid connector with PSK config\n");
-            }
-            dump_pwd_con(sstr, (int)(estr - sstr), pwd, 0);
-        } else if (strncmp(sstr, "dot1x", 4) == 0) {
-            char *p7, *ca, *san;
-            int p7len, calen, sanlen;
-            
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "entCreds", "certBag")) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No certBag in DPP Config response for dot1x!\n");
-                goto fin;
-            }
-            dpp_debug(DPP_DEBUG_PKI, "got PKCS#7:\n %.*s\n", (int)(estr - sstr), sstr);
-            p7 = sstr;
-            p7len = (int)(estr - sstr);
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "entCreds", "caCert")) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No caCert in DPP Config response for dot1x!\n");
-                ca = NULL;
-                calen = 0;
-            } else {
-                ca = sstr;
-                calen = (int)(estr - sstr);
-                dpp_debug(DPP_DEBUG_PKI, "got CA cert:\n %.*s\n", calen, ca);
-            }
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 3, "cred", "entCreds", "trustedEapServerName")) < 1) {
-                dpp_debug(DPP_DEBUG_ERR, "No SAN to match in server cert!\n");
-                san = NULL;
-                sanlen = 0;
-            } else {
-                dpp_debug(DPP_DEBUG_ERR, "Got a SAN to match in server cert!\n");
-                san = sstr;
-                sanlen = (int)(estr - sstr);
-            }
-            extract_certs(p7, p7len, ca, calen);
-            if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
-                                      &sstr, &estr, 2, "discovery", "ssid")) == 0) {
-                dpp_debug(DPP_DEBUG_TRACE, "with an any SSID I guess\n");
-            } else {
-                dpp_debug(DPP_DEBUG_TRACE, "with SSID %.*s\n", (int)(estr - sstr), sstr);
-            }
-            dump_cert_con(sstr, (int)(estr - sstr), p7, p7len, san, sanlen);
-            /*
-             * dot1x credentials are v2 only so there'll always be a connector
-             */
-            if (check_connector(peer, TLV_value(tlv), TLV_length(tlv)) < 0) {
-                dpp_debug(DPP_DEBUG_ERR, "Bad connector in dot1x AKM of Config response!\n");
-                goto fin;
-            }
-            provision_connector(dpp_instance.enrollee_role, sstr, (int)(estr - sstr),
-                                connector, connector_len, peer->handle);
-            dpp_debug(DPP_DEBUG_TRACE, "got valid connector with dot1x config\n");
-        } else {
-            dpp_debug(DPP_DEBUG_ERR, "Unknown credential type %.*s!\n", (int)(estr - sstr), sstr);
-            goto fin;
-        }
+            send_dpp_config_req_frame(peer);
+            ret = 0;
+            break;
+        default:
+            dpp_debug(DPP_DEBUG_ERR, "Configurator returned %d as status in DPP Config Response: FAIL!\n",
+                      *val);
+            break;
     }
-    ret = 1;
 fin:
     if (ectx != NULL) {
         EVP_ENCODE_CTX_free(ectx);
+    }
+    if (x != NULL) {
+        BN_free(x);
+    }
+    if (y != NULL) {
+        BN_free(y);
     }
     return ret;
 }
@@ -3401,6 +3710,11 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     int ntok;
     siv_ctx ctx;
     char *sstr, *estr;
+    BIGNUM *x = NULL, *y = NULL, *Sx = NULL;
+    const BIGNUM *pc;
+    EC_POINT *S;
+    int offset;
+    unsigned char sx[SHA512_DIGEST_LENGTH], auth[SHA512_DIGEST_LENGTH], k[SHA512_DIGEST_LENGTH];
 
     dpp_debug(DPP_DEBUG_TRACE, "got a DPP config request!\n");
 
@@ -3442,6 +3756,149 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     memcpy(peer->enonce, TLV_value(tlv), TLV_length(tlv));
     
     tlv = TLV_next(tlv);
+    /*
+     * if we're asking for protocol keys then make sure those are in this request
+     */
+    if (dpp_instance.newgroup) {
+        unsigned char *xoctets = NULL;
+        unsigned int mdlen = 0;
+        EVP_MD_CTX *mdctx = NULL;
+        
+        if ((TLV_type(tlv) != INITIATOR_PROTOCOL_KEY) ||
+            (TLV_lookahead(tlv) != INITIATOR_AUTH_TAG)) {
+            dpp_debug(DPP_DEBUG_TRACE, "we need a new protocol key but the enrollee didn't provide one\n");
+            /*
+             * we're the configurator, reuse the Pc key for all enrollees
+             */
+            peer->mynewproto = EC_KEY_dup(dpp_instance.Pc);
+            peer->newprimelen = prime_len_by_curve(dpp_instance.newgroup);
+            return 3;
+        }
+        dpp_debug(DPP_DEBUG_TRACE, "enrollee sent new protocol key and POP auth tag!\n");
+        if (((peer->peernewproto = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) ||
+            ((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
+            dpp_debug(DPP_DEBUG_ERR, "internal POP error (0)!\n");
+            return -1;
+        }
+        /*
+         * extract and validate key
+         */
+        BN_bin2bn(TLV_value(tlv), peer->newprimelen, x);
+        BN_bin2bn(TLV_value(tlv) + peer->newprimelen, peer->newprimelen, y);
+        if (!EC_POINT_set_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 peer->peernewproto, x, y, bnctx) ||
+            !EC_POINT_is_on_curve(EC_KEY_get0_group(peer->mynewproto), peer->peernewproto, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to create peer's new protocol key!\n");
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+
+        /*
+         * compute S = pc * Pe and generate secret key k
+         */
+        if (((Sx = BN_new()) == NULL) ||
+            (S = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "internal POP error (1)!\n");
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        if (((pc = EC_KEY_get0_private_key(peer->mynewproto)) == NULL) ||
+            !EC_POINT_mul(EC_KEY_get0_group(peer->mynewproto), S, NULL, peer->peernewproto, pc, bnctx) ||
+            !EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 S, Sx, NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "failure to compute shared key for POP!\n");
+            BN_free(Sx);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        memset(k, 0, SHA512_DIGEST_LENGTH);
+        memset(sx, 0, SHA512_DIGEST_LENGTH);
+        offset = peer->newprimelen - BN_num_bytes(Sx);
+        BN_bn2bin(Sx, sx + offset);
+        hkdf(dpp_instance.hashfcn, 0,
+             sx, peer->newprimelen,
+             peer->bk, dpp_instance.digestlen,
+             (unsigned char *)"New DPP Protocol Key", strlen("New DPP Protocol Key"),
+             k, dpp_instance.digestlen);
+
+        /*
+         * make sure the authenticating tag is correct
+         */
+        tlv = TLV_next(tlv);
+        if (((xoctets = (unsigned char *)malloc(peer->newprimelen)) == NULL) ||
+            ((mdctx = EVP_MD_CTX_new()) == NULL)) {
+            dpp_debug(DPP_DEBUG_ERR, "internal POP error (2)!\n");
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        EVP_DigestInit(mdctx, dpp_instance.hashfcn);
+        /*
+         * first the e-nonce...
+         */
+        EVP_DigestUpdate(mdctx, peer->enonce, dpp_instance.noncelen);
+        /*
+         * then the x-coordinates of the two public keys...
+         */
+        if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 EC_KEY_get0_public_key(peer->mynewproto), x,
+                                                 NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot get coordinates from our new protocol key!\n");
+            free(xoctets);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        memset(xoctets, 0, peer->newprimelen);
+        offset = peer->newprimelen - BN_num_bytes(x);
+        BN_bn2bin(x, xoctets + offset);
+        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        
+        if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
+                                                 peer->peernewproto, x, NULL, bnctx)) {
+            dpp_debug(DPP_DEBUG_ERR, "cannot get coordinates from peer's new protocol key!\n");
+            free(xoctets);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        memset(xoctets, 0, peer->newprimelen);
+        offset = peer->newprimelen - BN_num_bytes(x);
+        BN_bn2bin(x, xoctets + offset);
+        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+
+        mdlen = dpp_instance.digestlen;
+        EVP_DigestFinal(mdctx, auth, &mdlen);
+
+        if (memcmp(auth, TLV_value(tlv), mdlen)) {
+            dpp_debug(DPP_DEBUG_ERR, "POP failed for new protocol key!\n");
+            free(xoctets);
+            EC_POINT_free(S);
+            BN_free(Sx);
+            BN_free(x);
+            BN_free(y);
+            return -1;
+        }
+        dpp_debug(DPP_DEBUG_TRACE, "POP passed for new protocol key\n");
+
+        free(xoctets);
+        EC_POINT_free(S);
+        BN_free(Sx);
+        BN_free(x);
+        BN_free(y);
+        tlv = TLV_next(tlv);
+    }
     if (TLV_type(tlv) != CONFIG_ATTRIBUTES_OBJECT) {
         dpp_debug(DPP_DEBUG_ERR, "malformed wrapped data in DPP Config Request-- no C-attrs!\n");
         return -1;
@@ -3458,7 +3915,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     dpp_debug(DPP_DEBUG_ANY, "there are %d result(s) for 'name': %.*s\n",
               ntok, estr - sstr, sstr);
     if ((estr - sstr) > sizeof(peer->enrollee_name)) {
-        strncpy(peer->enrollee_name, sstr, sizeof(peer->enrollee_name));
+        strncpy(peer->enrollee_name, sstr, sizeof(peer->enrollee_name)-1);
     } else {
         strncpy(peer->enrollee_name, sstr, estr - sstr);
     }
@@ -3470,7 +3927,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     dpp_debug(DPP_DEBUG_ANY, "there are %d result(s) for 'netRole': %.*s\n",
               ntok, estr - sstr, sstr);
     if ((estr - sstr) > sizeof(peer->enrollee_role)) {
-        strncpy(peer->enrollee_role, sstr, sizeof(peer->enrollee_role));
+        strncpy(peer->enrollee_role, sstr, sizeof(peer->enrollee_role)-1);
     } else {
         strncpy(peer->enrollee_role, sstr, estr - sstr);
     }
@@ -3479,7 +3936,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         if ((ntok = get_json_data((char *)TLV_value(tlv), TLV_length(tlv),
                                   &sstr, &estr, 1, "pkcs10")) < 1) {
             dpp_debug(DPP_DEBUG_TRACE, "provisioning enterprise credentials but no CSR\n");
-            return 0;
+            return 2;
         }
         dpp_debug(DPP_DEBUG_PKI, "there's %d result(s) of a CSR:\n %.*s\n",
                   ntok, estr - sstr, sstr);
@@ -3497,7 +3954,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
 //        return SOMETHING
     }
 
-    return 2;
+    return 0;
 }
 
 int
@@ -3542,15 +3999,19 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                 ret = process_dpp_config_request(peer, garq->query_req, len - sizeof(gas_action_req_frame));
                 switch (ret) {
                     case 0:
-                        /* don't advance the state, we're starting over */
-                        generate_dpp_config_resp_frame(peer, STATUS_CSR_NEEDED);
+                        generate_dpp_config_resp_frame(peer, STATUS_OK);
+                        peer->state = DPP_PROVISIONING;
                         break;
                     case 1:
                         peer->state = DPP_CA_RESP_PENDING;
                         break;
                     case 2:
-                        generate_dpp_config_resp_frame(peer, STATUS_OK);
-                        peer->state = DPP_PROVISIONING;
+                        /* don't advance the state, we're starting over */
+                        generate_dpp_config_resp_frame(peer, STATUS_CSR_NEEDED);
+                        break;
+                    case 3:
+                        /* don't advance the state, we're starting over here too! */
+                        generate_dpp_config_resp_frame(peer, STATUS_NEW_KEY_NEEDED);
                         break;
                     default:
                         dpp_debug(DPP_DEBUG_ERR, "error processing DPP Config request!\n");
@@ -3647,8 +4108,8 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                                 return -1;
                             }
                             /*
-                             * a ret of 0 means we already responded with a CSR, don't want to send a 
-                             * config result in this case
+                             * a ret of 0 means we already responded with a CSR or new key, don't want
+                             * to send a config result in this case
                              */
                             if (ret > 0) {
                                 if (peer->version > 1) {
@@ -5562,6 +6023,8 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     }
     peer->t0 = 0;
     peer->my_proto = NULL;
+    peer->peernewproto = NULL;
+    peer->mynewproto = NULL;
     peer->mauth = initiator ? 1 : mutualauth;   /* initiator changes, responder set */
     peer->csrattrs = NULL;
     peer->csrattrs_len = 0;
@@ -5700,14 +6163,13 @@ addpolicy (char *akm, char *auxdata, char *ssid)
 }
 
 int
-dpp_initialize (int core, char *keyfile, char *signkeyfile,
+dpp_initialize (int core, char *keyfile, char *signkeyfile, int newgrp,
                 char *enrolleerole, char *mudurl, int chirp, char *caip,
                 int opclass, int channel, int verbosity)
 {
     FILE *fp;
     BIO *bio = NULL;
     int ret = 0;
-    BIGNUM *prime = NULL;
     struct cpolicy cp, *pol;
 
     /*
@@ -5748,6 +6210,7 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
     /*
      * if we're the configurator get the signing key...
      */
+    dpp_instance.newgroup = 0;
     if (core & DPP_CONFIGURATOR) {
         bio = BIO_new(BIO_s_file());
         if ((fp = fopen(signkeyfile, "r")) == NULL) {
@@ -5785,6 +6248,7 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
             dpp_debug(DPP_DEBUG_TRACE, "AKM: %s, auxdata: %s, SSID: %s\n",
                    pol->akm, pol->auxdata, pol->ssid);
         }
+        dpp_instance.newgroup = newgrp;
     } else {
         strcpy(dpp_instance.enrollee_role, enrolleerole);
         if (mudurl) {
@@ -5824,18 +6288,11 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
     EC_KEY_set_conv_form(dpp_instance.bootstrap, POINT_CONVERSION_COMPRESSED);
     EC_KEY_set_asn1_flag(dpp_instance.bootstrap, OPENSSL_EC_NAMED_CURVE);
 
-    /*
-     * figure out what group our bootstrap key is in and how big that 
-     * prime is (handy when constructing and parsing messages)
-     */
-    if (((dpp_instance.group = EC_KEY_get0_group(dpp_instance.bootstrap)) == NULL) ||
-        ((prime = BN_new()) == NULL) ||
-        !EC_GROUP_get_curve_GFp(dpp_instance.group, prime, NULL, NULL, bnctx)) {
-        fprintf(stderr, "DDP: unable to get group of bootstrap key\n");
+    if ((dpp_instance.group = EC_KEY_get0_group(dpp_instance.bootstrap)) == NULL) {
+        fprintf(stderr, "DPP: unable to get group of bootstrap key!\n");
         ret = -1;
         goto fin;
     }
-    dpp_instance.primelen = BN_num_bytes(prime);
     dpp_instance.nid = EC_GROUP_get_curve_name(dpp_instance.group);
     switch (dpp_instance.nid) {
         case NID_X9_62_prime256v1:
@@ -5885,6 +6342,27 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
             ret = -1;
             goto fin;
     }
+
+    dpp_instance.primelen = prime_len_by_curve(dpp_instance.group_num);
+
+    /*
+     * if we're the configurator and were initialized to ask for a new key
+     * make sure it differs from our bootstrapping key, if not don't ask
+     */
+    if (dpp_instance.newgroup) {
+        if (dpp_instance.group_num == dpp_instance.newgroup) {
+            dpp_instance.newgroup = 0;
+        } else {
+            /*
+             * if we are gonna ask, then generate a keypair on the new curve
+             */
+            if ((dpp_instance.Pc = generate_new_protocol_key(dpp_instance.newgroup)) == NULL) {
+                dpp_debug(DPP_DEBUG_CRYPTO, "unable to create new protocol key in group %d\n",
+                          dpp_instance.newgroup);
+                dpp_instance.newgroup = 0;
+            }
+        }
+    }             
     dpp_instance.noncelen = dpp_instance.digestlen/2;
     EVP_add_digest(dpp_instance.hashfcn);
     if (dpp_instance.hashfcn != EVP_sha256()) {
@@ -5893,9 +6371,6 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile,
     TAILQ_INIT(&dpp_instance.peers);
     ret = 1;
 fin:
-    if (prime != NULL) {
-        BN_free(prime);
-    }
     return ret;
 }
 

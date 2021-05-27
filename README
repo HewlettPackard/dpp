@@ -95,8 +95,9 @@ USAGE: ./sss [-hCIBapkceirdfgs]
         -f <channel> to use with DPP
         -g <opclass> operating class to use with DPP
         -z <info> to pass along with public key in PKEX
+	-b <curve> Configurator asks for a new protocol key
         -k <filename> my bootstrapping key
-        -b  bootstrapping (PKEX) only, don't run DPP
+        -y  bootstrapping (PKEX) only, don't run DPP
         -x <index> DPP only with key <index> in -B <filename>, don't do PKEX
         -m <MAC address> to initiate to, otherwise uses broadcast
         -s  change opclass/channel to what was set with -f and -g
@@ -147,12 +148,13 @@ the enrollee with a role of "ap", use "thisissecret" as the PKEX password, use
 respbp384.pem as the bootstrapping key, use respbkeys.txt as the flat file of
 peer's trusted bootstrapping keys, and set verbose debugging.
 
-% ./sss -I lo0 -i -c signp521.pem -p thisissecret -k initbp384.pem -B initbkeys.txt -d 63
+% ./sss -I ath0 -i -c signp521.pem -p thisissecret -k initbp256.pem -b 21 -B initbkeys.txt -d 63
 
 This says to use the interface ath0 (802.11 radio)), run as the initiator, run as a
 configurator and sign with the key signp521.pem, use "thisissecret" as the PKEX
-password, use initbp384.pem as the bootstrapping key, use initbkeys.txt as the flat
-file of peer's trusted bootstrapping keys, and set verbose debugging.
+password, use initbp256.pem as the bootstrapping key, request the enrollee generate
+a new protocol key in group 21 (NIST p521), use initbkeys.txt as the flat file of
+peer's trusted bootstrapping keys, and set verbose debugging.
 
   Since this was a run of DPP as well, the enrollee will get a connector signed by
 the configurator. Since the enrollee had the role "ap" it will get a connector for

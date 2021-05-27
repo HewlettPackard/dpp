@@ -685,7 +685,7 @@ int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1;
-    int keyidx = 0, opt, infd;
+    int keyidx = 0, opt, infd, newgroup = 0;
     struct sockaddr_in serv;
     char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10];
     char *ptr, *endptr, identifier[80], pkexinfo[80];
@@ -705,7 +705,7 @@ main (int argc, char **argv)
 //    strcpy(identifier, "none");
 //    strcpy(pkexinfo, "none");
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:bae:c:d:p:n:z:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:b:yae:c:d:p:n:z:");
         if (c < 0) {
             break;
         }
@@ -735,6 +735,9 @@ main (int argc, char **argv)
             case 'r':           /* responder */
                 is_initiator = 0;
                 break;
+            case 'b':
+                newgroup = atoi(optarg);
+                break;
             case 'c':           /* configurator */
                 strcpy(signkeyfile, optarg);
                 config_or_enroll |= 0x02;
@@ -758,7 +761,7 @@ main (int argc, char **argv)
                 targetmac[4] = (unsigned char)strtol(ptr, &endptr, 16); ptr = endptr+1; targetmac[4] &= 0xff;
                 targetmac[5] = (unsigned char)strtol(ptr, &endptr, 16); ptr = endptr+1; targetmac[5] &= 0xff;
                 break;
-            case 'b':
+            case 'y':
                 do_pkex = 1;
                 do_dpp = 0;
                 break;
@@ -777,6 +780,7 @@ main (int argc, char **argv)
                         "\t-e <role> run DPP as the enrollee in the role of <role> (sta or ap)\n"
                         "\t-i  run DPP as the initiator\n"
                         "\t-r  run DPP as the responder\n"
+                        "\t-b <curve> Configurator asks for enrollee to generate a new protocol key\n"
                         "\t-a  do not perform mutual authentication in DPP\n"
                         "\t-C <filename> of radio configuration file\n"
                         "\t-I <IP address of relay>\n"
@@ -785,7 +789,7 @@ main (int argc, char **argv)
                         "\t-z <info> to pass along with public key in PKEX\n"
                         "\t-n <identifier> for the code used in PKEX\n"
                         "\t-k <filename> my bootstrapping key\n"
-                        "\t-b  bootstrapping (PKEX) only, don't run DPP\n"
+                        "\t-y  bootstrapping (PKEX) only, don't run DPP\n"
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
                         "\t-d <debug> set debugging mask\n",
@@ -848,8 +852,8 @@ main (int argc, char **argv)
         }
     }
     if (do_dpp) {
-        if (dpp_initialize(config_or_enroll, keyfile,
-                           signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
+        if (dpp_initialize(config_or_enroll, keyfile, signkeyfile[0] == 0 ? NULL : signkeyfile,
+                           newgroup, enrollee_role,
                            NULL, 0, NULL, 0, 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
             exit(1);

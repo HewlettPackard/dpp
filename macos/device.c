@@ -505,7 +505,7 @@ main (int argc, char **argv)
         }
     }
     if (dpp_initialize(config_or_enroll, keyfile,
-                       signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
+                       signkeyfile[0] == 0 ? NULL : signkeyfile, 0, enrollee_role,
                        NULL, 0, NULL, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);

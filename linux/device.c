@@ -39,7 +39,6 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/queue.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -380,6 +379,7 @@ int
 main (int argc, char **argv)
 {
     int debug = 0, c, got_controller = 0, do_pkex = 0, mutual = 1, keyidx = 0, config_or_enroll = 0;
+    int newgroup = 0;
     char password[30], pkexinfo[80], enrollee_role[10], signkeyfile[30], mudurl[80];
     char identifier[80], keyfile[80];
     struct sockaddr_in clnt;
@@ -396,7 +396,7 @@ main (int argc, char **argv)
     memset(pkexinfo, 0, 80);
     strcpy(enrollee_role, "sta");
     for (;;) {
-        c = getopt(argc, argv, "hd:f:g:C:k:p:ax:B:n:e:c:u:");
+        c = getopt(argc, argv, "hd:f:g:C:k:p:ax:B:n:e:c:u:b:");
         if (c < 0) {
             break;
         }
@@ -406,6 +406,9 @@ main (int argc, char **argv)
                 break;
             case 'B':           /* bootstrap key file */
                 strcpy(bootstrapfile, optarg);
+                break;
+            case 'b':
+                newgroup = atoi(optarg);
                 break;
             case 'C':
                 got_controller = 1;
@@ -509,7 +512,7 @@ main (int argc, char **argv)
         }
     }
     if (dpp_initialize(config_or_enroll, keyfile,
-                       signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
+                       signkeyfile[0] == 0 ? NULL : signkeyfile, newgroup, enrollee_role,
                        mudurl[0] == 0 ? NULL : mudurl, 0, NULL, 0, 0, debug) < 0) {
         fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
         exit(1);

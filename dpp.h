@@ -40,7 +40,7 @@ typedef unsigned int dpp_handle;
 /*
  * exported APIs to interact with the DPP module
  */
-int dpp_initialize(int, char *, char *, char *, char *, int, char *, int, int, int);
+int dpp_initialize(int, char *, char *, int, char *, char *, int, char *, int, int, int);
 void dpp_add_chirp_freq(unsigned char *, unsigned long);
 dpp_handle dpp_create_peer(unsigned char *, int, int, int);
 void dpp_free_peer(dpp_handle);

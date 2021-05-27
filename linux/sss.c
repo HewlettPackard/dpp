@@ -1851,7 +1851,7 @@ int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
-    int chchandpp = 0, chirp = 0, ver = 2;
+    int chchandpp = 0, chirp = 0, ver = 2, newgroup = 0;
     struct interface *inf;
     char interface[IFNAMSIZ], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
@@ -1872,9 +1872,9 @@ main (int argc, char **argv)
     memset(pkexinfo, 0, 80);
     memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:base:c:d:p:n:z:qf:g:u:tw:v:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:b:yase:c:d:p:n:z:qf:g:u:tw:v:");
         /*
-         * left: j, l, o, v, y
+         * left: j, l, o, v
          */
         if (c < 0) {
             break;
@@ -1914,6 +1914,9 @@ main (int argc, char **argv)
             case 'r':           /* responder */
                 is_initiator = 0;
                 break;
+            case 'b':
+                newgroup = atoi(optarg);
+                break;
             case 'c':           /* configurator */
                 strcpy(signkeyfile, optarg);
                 config_or_enroll |= 0x02;
@@ -1937,7 +1940,7 @@ main (int argc, char **argv)
                 targetmac[4] = (unsigned char)strtol(ptr, &endptr, 16); ptr = endptr+1; targetmac[4] &= 0xff;
                 targetmac[5] = (unsigned char)strtol(ptr, &endptr, 16); ptr = endptr+1; targetmac[5] &= 0xff;
                 break;
-            case 'b':
+            case 'y':
                 do_pkex = 1;
                 do_dpp = 0;
                 break;
@@ -1989,8 +1992,9 @@ main (int argc, char **argv)
                         "\t-g <opclass> operating class to use with DPP\n"
                         "\t-z <info> to pass along with public key in PKEX\n"
                         "\t-n <identifier> for the code used in PKEX\n"
+                        "\t-b <curve> Configurator asks for a new protocol key\n"
                         "\t-k <filename> my bootstrapping key\n"
-                        "\t-b  bootstrapping (PKEX) only, don't run DPP\n"
+                        "\t-y  bootstrapping (PKEX) only, don't run DPP\n"
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
                         "\t-s  change opclass/channel to what was set with -f and -g during DPP\n"
@@ -2039,7 +2043,7 @@ main (int argc, char **argv)
     }
     if (do_dpp) {
         if (dpp_initialize(config_or_enroll, keyfile,
-                           signkeyfile[0] == 0 ? NULL : signkeyfile, enrollee_role,
+                           signkeyfile[0] == 0 ? NULL : signkeyfile, newgroup, enrollee_role,
                            mudurl[0] == 0 ? NULL : mudurl, chirp, caip[0] == 0 ? "127.0.0.1" : caip,
                            chchandpp ? opclass : 0, chchandpp ? channel : 0, debug) < 0) {
             fprintf(stderr, "%s: cannot configure DPP, check config file!\n", argv[0]);
