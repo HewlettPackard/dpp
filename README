@@ -45,6 +45,11 @@ REQUIREMENTS
   libcrypto from OpenSSL, version 0.9.8 or later. Basically, all
 you need is EC support that has the pre-defined groups.
 
+  Service discovery using MDNS and DNS-SD uses avahi. That must be installed
+and enabled in the build in order to use it. Similarly, curl is used for
+the configurette bootstrapping service and client and needs to be enabled
+to use that feature.
+
 BUILDING
 
   The file freebsd_6.4_RC1_diffs contains patches for a few
@@ -61,11 +66,15 @@ OS with these patchs.
 
    Then configure the package like this:
 
-% ./configure --with-ssl=<directory> [--enable-brainpool] 
+% ./configure --with-ssl=<directory> [--enable-brainpool] [--enable-avahi]
+	[--enable-curl]
 
 where <directory> is the top level directory of openssl. Enable
-Brainpool if you have support for those curves. Then change
-directories into the one that matches your OS-- macos, linux,
+Brainpool if you have support for those curves. Enable avahi if you want
+to use the controller, cette, and capp, utilities. In addition, capp
+requires curl.
+
+  Then change directories into the one that matches your OS-- macos, linux,
 or freebsd-- and make.
 
 HOW TO USE
@@ -276,6 +285,34 @@ into initbkeys.txt:
 The controller will identify the unprovisioned peer from the "chirp", find a matching
 bootstrapping key in the index file, initiate through the relay to the IoT device and
 provision a connector on it.
+
+* Service Discovery Features
+
+(Only supported under linux for the time being)
+
+The controller uses the avahi libraries to advertise its existance. The relay
+will use avahi to discover, and connect to it. If avahi is not enabled it is
+assumed that the controller is running at some fixed address that the relay has
+a priori knowlege about.
+
+Configurators (sss and controller) can farm out bootstrapping capabilities to
+a configurette service (cette) that advertises itself using MDNS and that provides
+a REST API to allow a configurator app utility (capp) to upload DPP URI information
+which the configurette will then store in the bootstrapping keys flat file.
+
+(NOTE: as of right now, the HTTP transaction is not secured which is a major
+vulnerability. Do not ship code that does not have some agreed-upon way to
+authenticate a TLS connection to protect the transaction). 
+
+If curl is not enabled capp cannot function. It will do DNS-SD, provided avahi
+is enabled, but will not access the REST API.
+
+If avahi is not enabled, cette will create an HTTPS server on its enabled interfaces
+and await an authenticated connection. If avahi is not enabled capp will connect
+to a server and port based on command line options. 
+
+The capp application is a backend for a real app that has access to a camera and
+scans QR codes and is able to invoke capp with the resulting DPP URI.
 
 WORKING WITH WPA_SUPPLICANT
 

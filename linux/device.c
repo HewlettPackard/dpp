@@ -164,6 +164,17 @@ process_incoming_mgmt_frame (unsigned char type, unsigned char *msg, int len)
                         return -1;
                     }
                     break;
+                case DPP_CONFIG_RESULT:
+                    printf("Config Result...\n");
+                    if (dhandle < 1) {
+                        printf("...but DPP Hasn't started yet!\n");
+                        return -1;
+                    }
+                    if (process_dpp_config_frame(dpp->frame_type, msg, len, dhandle) < 0) {
+                        fprintf(stderr, "error processing DPP Config frame!\n");
+                        return -1;
+                    }
+                    break;
                 default:
                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
                     break;
@@ -475,7 +486,7 @@ main (int argc, char **argv)
         exit(1);
     }
 
-    if (!do_pkex && (keyidx == 0)) {
+    if (mutual && !do_pkex && (keyidx == 0)) {
         fprintf(stderr, "%s: either do PKEX or specify an index into bootstrapping file with -x\n",
                 argv[0]);
         exit(1);
@@ -523,7 +534,7 @@ main (int argc, char **argv)
         bootstrap_peer(0, keyidx, 1, mutual);
     } else {
         printf("PKEX, then DPP...\n");
-        phandle = pkex_create_peer(2);
+        phandle = pkex_create_peer(DPP_VERSION);
         pkex_initiate(phandle);
     }
 

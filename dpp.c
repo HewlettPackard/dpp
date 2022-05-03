@@ -188,6 +188,17 @@ struct candidate {
     unsigned char enonce[SHA512_DIGEST_LENGTH/2];
 };
 
+#define state_to_string(x) (x) == DPP_FAILED ? "DPP failed" : \
+                           (x) == DPP_NOTHING ? "DPP nothing" : \
+                           (x) == DPP_BOOTSTRAPPED ? "DPP bootstrapped":           \
+                           (x) == DPP_AWAITING ? "DPP awaiting" : \
+                           (x) == DPP_AUTHENTICATING ? "DPP authenticating" : \
+                           (x) == DPP_AUTHENTICATED ? "DPP authenticated" : \
+                           (x) == DPP_PROVISIONING ? "DPP provisioning" : \
+                           (x) == DPP_CA_RESP_PENDING ? "DPP CA response pending" : \
+                           (x) == DPP_PROVISIONED ? "DPP provisioned" : \
+                           "unknown"
+
 /*
  * stuff that gets provisioned when we are an enrollee
  */
@@ -1962,7 +1973,8 @@ generate_csr (struct candidate *peer, char **csr)
                                     if ((os = ASN1_OCTET_STRING_new()) == NULL) {
                                         break;
                                     }
-                                    if (!ASN1_OCTET_STRING_set(os, (unsigned char *)"beer", strlen("beer"))) {
+                                    if (!ASN1_OCTET_STRING_set(os, (unsigned char *)"le vrai pastis de Marsaille",
+                                                               strlen("le vrai pastis de Marsaille"))) {
                                         break;
                                     }
                                     ex = X509_EXTENSION_create_by_NID(NULL, value->nid, 0, os);
@@ -2628,8 +2640,23 @@ problemo:
                                      "\"signedConnector\":"
                                      "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                      "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                     "\"ppKey\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                     "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                      "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
                                      cp->ssid, cp->akm, conn,
+#ifdef HAS_BRAINPOOL
+                                     nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                     nid == NID_secp384r1 ? "P-384" : \
+                                     nid == NID_secp521r1 ? "P-521" : \
+                                     nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                     nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                     nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                     nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                     nid == NID_secp384r1 ? "P-384" : \
+                                     nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                     burlx, burly, kid,
 #ifdef HAS_BRAINPOOL
                                      nid == NID_X9_62_prime256v1 ? "P-256" : \
                                      nid == NID_secp384r1 ? "P-384" : \
@@ -2654,8 +2681,23 @@ problemo:
                                          "\"signedConnector\":"
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"ppKey\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
                                          cp->ssid, cp->akm, cp->auxdata, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2690,8 +2732,23 @@ problemo:
                                          "\"signedConnector\":"
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"ppKey\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
                                          cp->ssid, cp->akm, cp->auxdata, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2735,8 +2792,23 @@ problemo:
                                          "\"signedConnector\":"
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"ppKey\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
                                          cp->ssid, cp->akm, peer->p7, dpp_instance.cacert, cp->auxdata, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2760,8 +2832,23 @@ problemo:
                                          "\"signedConnector\":"
                                          "\"%s\",\"csign\":{\"kty\":\"EC\",\"crv\":\"%s\","
                                          "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
+                                         "\"ppKey\":{\"kty\":\"EC\",\"crv\":\"%s\","
+                                         "\"x\":\"%s\",\"y\":\"%s\",\"kid\":\"%s\"},"
                                          "\"expiry\":\"%04d-%02d-%02dT%02d:%02d:%02d\"}}",
                                          cp->ssid, cp->akm, peer->p7, conn,
+#ifdef HAS_BRAINPOOL
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : \
+                                         nid == NID_brainpoolP256r1 ? "BP-256" : \
+                                         nid == NID_brainpoolP384r1 ? "BP-384" : \
+                                         nid == NID_brainpoolP512r1 ? "BP-512" : "unknown",
+#else
+                                         nid == NID_X9_62_prime256v1 ? "P-256" : \
+                                         nid == NID_secp384r1 ? "P-384" : \
+                                         nid == NID_secp521r1 ? "P-521" : "unknown",
+#endif  /* HAS_BRAINPOOL */
+                                         burlx, burly, kid,
 #ifdef HAS_BRAINPOOL
                                          nid == NID_X9_62_prime256v1 ? "P-256" : \
                                          nid == NID_secp384r1 ? "P-384" : \
@@ -2889,7 +2976,7 @@ send_dpp_config_req_frame (struct candidate *peer)
     char confattsobj[1500], whoami[20], *csr = NULL;
     unsigned char *ptr, *xoctets = NULL;
     unsigned int mdlen = 0;
-    EVP_MD_CTX *mdctx = NULL;
+    HMAC_CTX *hctx = NULL;
     BIGNUM *x = NULL, *y = NULL, *Sx = NULL;
     const BIGNUM *pc;
     EC_POINT *S;
@@ -2915,9 +3002,19 @@ send_dpp_config_req_frame (struct candidate *peer)
     if (peer->mynewproto != NULL) {
         dpp_debug(DPP_DEBUG_TRACE, "adding new protocol key...\n");
         if (((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
+            ((hctx = HMAC_CTX_new()) == NULL) ||
             !EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
                                                  EC_KEY_get0_public_key(peer->mynewproto),
                                                  x, y, bnctx)) {
+            if (x != NULL) {
+                BN_free(x);
+            }
+            if (y != NULL) {
+                BN_free(y);
+            }
+            if (hctx != NULL) {
+                HMAC_CTX_free(hctx);
+            }
             return ret;
         }
         /*
@@ -2937,6 +3034,7 @@ send_dpp_config_req_frame (struct candidate *peer)
         if (((Sx = BN_new()) == NULL) ||
             (S = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) {
             dpp_debug(DPP_DEBUG_ERR, "cannot create POP secret!\n");
+            HMAC_CTX_free(hctx);
             return ret;
         }
         if (((pc = EC_KEY_get0_private_key(peer->mynewproto)) == NULL) ||
@@ -2946,6 +3044,7 @@ send_dpp_config_req_frame (struct candidate *peer)
             dpp_debug(DPP_DEBUG_ERR, "failure to compute shared key for POP!\n");
             BN_free(Sx);
             EC_POINT_free(S);
+            HMAC_CTX_free(hctx);
             return ret;
         }
         memset(k, 0, SHA512_DIGEST_LENGTH);
@@ -2962,17 +3061,18 @@ send_dpp_config_req_frame (struct candidate *peer)
          */
         tlv = TLV_next(tlv);
         if (((xoctets = (unsigned char *)malloc(peer->newprimelen)) == NULL) ||
-            ((x = BN_new()) == NULL) || ((mdctx = EVP_MD_CTX_new()) == NULL)) {
+            ((x = BN_new()) == NULL)) {
             dpp_debug(DPP_DEBUG_ERR, "internal error trying to do POP!\n");
             BN_free(Sx);
             EC_POINT_free(S);
+            HMAC_CTX_free(hctx);
             return ret;
         }
-        EVP_DigestInit(mdctx, dpp_instance.hashfcn);
+        HMAC_Init_ex(hctx, k, dpp_instance.digestlen, dpp_instance.hashfcn, NULL);
         /*
-         * first the e-nonce...
+         * An HMAC keyed with k, and a body consisting of first the e-nonce...
          */
-        EVP_DigestUpdate(mdctx, peer->enonce, dpp_instance.noncelen);
+        HMAC_Update(hctx, peer->enonce, dpp_instance.noncelen);
         /*
          * then the x-coordinates of the two public keys...
          */
@@ -2983,12 +3083,13 @@ send_dpp_config_req_frame (struct candidate *peer)
             EC_POINT_free(S);
             BN_free(Sx);
             BN_free(x);
+            HMAC_CTX_free(hctx);
             return ret;
         }
         memset(xoctets, 0, peer->newprimelen);
         offset = peer->newprimelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
-        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        HMAC_Update(hctx, xoctets, peer->newprimelen);
         
         if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
                                                  EC_KEY_get0_public_key(peer->mynewproto), x,
@@ -2998,15 +3099,16 @@ send_dpp_config_req_frame (struct candidate *peer)
             EC_POINT_free(S);
             BN_free(Sx);
             BN_free(x);
+            HMAC_CTX_free(hctx);
             return ret;
         }
         memset(xoctets, 0, peer->newprimelen);
         offset = peer->newprimelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
-        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        HMAC_Update(hctx, xoctets, peer->newprimelen);
 
         mdlen = dpp_instance.digestlen;
-        EVP_DigestFinal(mdctx, auth, &mdlen);
+        HMAC_Final(hctx, auth, &mdlen);
 
         dpp_debug(DPP_DEBUG_TRACE, "adding POP auth tag...\n");
         tlv = TLV_set_tlv(tlv, INITIATOR_AUTH_TAG, mdlen, auth);
@@ -3014,6 +3116,7 @@ send_dpp_config_req_frame (struct candidate *peer)
         EC_POINT_free(S);
         BN_free(Sx);
         BN_free(x);
+        HMAC_CTX_free(hctx);
     }
     
     /*
@@ -3712,6 +3815,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     char *sstr, *estr;
     BIGNUM *x = NULL, *y = NULL, *Sx = NULL;
     const BIGNUM *pc;
+    HMAC_CTX *hctx = NULL;
     EC_POINT *S;
     int offset;
     unsigned char sx[SHA512_DIGEST_LENGTH], auth[SHA512_DIGEST_LENGTH], k[SHA512_DIGEST_LENGTH];
@@ -3762,7 +3866,6 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
     if (dpp_instance.newgroup) {
         unsigned char *xoctets = NULL;
         unsigned int mdlen = 0;
-        EVP_MD_CTX *mdctx = NULL;
         
         if ((TLV_type(tlv) != INITIATOR_PROTOCOL_KEY) ||
             (TLV_lookahead(tlv) != INITIATOR_AUTH_TAG)) {
@@ -3776,8 +3879,18 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         }
         dpp_debug(DPP_DEBUG_TRACE, "enrollee sent new protocol key and POP auth tag!\n");
         if (((peer->peernewproto = EC_POINT_new(EC_KEY_get0_group(peer->mynewproto))) == NULL) ||
-            ((x = BN_new()) == NULL) || ((y = BN_new()) == NULL)) {
+            ((x = BN_new()) == NULL) || ((y = BN_new()) == NULL) ||
+            ((hctx = HMAC_CTX_new()) == NULL)) {
             dpp_debug(DPP_DEBUG_ERR, "internal POP error (0)!\n");
+            if (x != NULL) {
+                BN_free(x);
+            }
+            if (y != NULL) {
+                BN_free(y);
+            }
+            if (hctx != NULL) {
+                HMAC_CTX_free(hctx);
+            }
             return -1;
         }
         /*
@@ -3791,6 +3904,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             dpp_debug(DPP_DEBUG_ERR, "unable to create peer's new protocol key!\n");
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
 
@@ -3802,6 +3916,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             dpp_debug(DPP_DEBUG_ERR, "internal POP error (1)!\n");
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
         if (((pc = EC_KEY_get0_private_key(peer->mynewproto)) == NULL) ||
@@ -3814,6 +3929,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             BN_free(Sx);
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
         memset(k, 0, SHA512_DIGEST_LENGTH);
@@ -3830,20 +3946,20 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
          * make sure the authenticating tag is correct
          */
         tlv = TLV_next(tlv);
-        if (((xoctets = (unsigned char *)malloc(peer->newprimelen)) == NULL) ||
-            ((mdctx = EVP_MD_CTX_new()) == NULL)) {
+        if ((xoctets = (unsigned char *)malloc(peer->newprimelen)) == NULL) {
             dpp_debug(DPP_DEBUG_ERR, "internal POP error (2)!\n");
             EC_POINT_free(S);
             BN_free(Sx);
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
-        EVP_DigestInit(mdctx, dpp_instance.hashfcn);
+        HMAC_Init_ex(hctx, k, dpp_instance.digestlen, dpp_instance.hashfcn, NULL);
         /*
          * first the e-nonce...
          */
-        EVP_DigestUpdate(mdctx, peer->enonce, dpp_instance.noncelen);
+        HMAC_Update(hctx, peer->enonce, dpp_instance.noncelen);
         /*
          * then the x-coordinates of the two public keys...
          */
@@ -3856,12 +3972,13 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             BN_free(Sx);
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
         memset(xoctets, 0, peer->newprimelen);
         offset = peer->newprimelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
-        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        HMAC_Update(hctx, xoctets, peer->newprimelen);
         
         if (!EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(peer->mynewproto),
                                                  peer->peernewproto, x, NULL, bnctx)) {
@@ -3871,15 +3988,16 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             BN_free(Sx);
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
         memset(xoctets, 0, peer->newprimelen);
         offset = peer->newprimelen - BN_num_bytes(x);
         BN_bn2bin(x, xoctets + offset);
-        EVP_DigestUpdate(mdctx, xoctets, peer->newprimelen);
+        HMAC_Update(hctx, xoctets, peer->newprimelen);
 
         mdlen = dpp_instance.digestlen;
-        EVP_DigestFinal(mdctx, auth, &mdlen);
+        HMAC_Final(hctx, auth, &mdlen);
 
         if (memcmp(auth, TLV_value(tlv), mdlen)) {
             dpp_debug(DPP_DEBUG_ERR, "POP failed for new protocol key!\n");
@@ -3888,6 +4006,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
             BN_free(Sx);
             BN_free(x);
             BN_free(y);
+            HMAC_CTX_free(hctx);
             return -1;
         }
         dpp_debug(DPP_DEBUG_TRACE, "POP passed for new protocol key\n");
@@ -3897,6 +4016,7 @@ process_dpp_config_request (struct candidate *peer, unsigned char *attrs, int le
         BN_free(Sx);
         BN_free(x);
         BN_free(y);
+        HMAC_CTX_free(hctx);
         tlv = TLV_next(tlv);
     }
     if (TLV_type(tlv) != CONFIG_ATTRIBUTES_OBJECT) {
@@ -4186,7 +4306,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
             case DPP_AUTHENTICATED:
                 break;
             default:
-                dpp_debug(DPP_DEBUG_ERR, "unknown state for DPP Config exchange: %s\n", peer->state);
+                dpp_debug(DPP_DEBUG_ERR, "unknown state for DPP Config exchange: %d\n", peer->state);
         }
     }
 
@@ -5666,6 +5786,10 @@ process_dpp_auth_request (struct candidate *peer, dpp_action_frame *frame, int f
         goto fin;
     }
     if (peer->mauth) {
+        if (peer->peer_bootstrap == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "set to mutual auth but no peer bootstrap key!\n");
+            goto fin;
+        }
         /*
          * if we're doing mutual authentication then make sure we have the initiator's key
          */
@@ -5684,8 +5808,11 @@ process_dpp_auth_request (struct candidate *peer, dpp_action_frame *frame, int f
      */
     if ((tlv = find_tlv(PROTOCOL_VERSION, attrs, len)) != NULL) {
         peer->version = *((unsigned char *)TLV_value(tlv));
-        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "peer send a version of %d\n", peer->version);
-        if ((peer->version > 2) || (peer->version == 0)) {
+        dpp_debug(DPP_DEBUG_PROTOCOL_MSG, "peer sent a version of %d\n", peer->version);
+        /*
+         * attempt the lowest instead of just bailing on this guy
+         */
+        if (peer->version == 0) {
             peer->version = 1;
         }
     } else {
@@ -5859,6 +5986,11 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
     dpp_action_frame *frame = (dpp_action_frame *)data;
     struct candidate *peer = NULL;
 
+    dpp_debug(DPP_DEBUG_TRACE, "enter process_dpp_auth_frame() for peer %d\n", handle);
+    TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
+        dpp_debug(DPP_DEBUG_TRACE, "\tpeer %d is in state %s\n", handle,
+                  state_to_string(peer->state));
+    }
     TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
         if (peer->handle == handle) {
             break;
@@ -5886,7 +6018,8 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
     ieeeize_ntoh_attributes(frame->attributes, len - sizeof(dpp_action_frame));
 
     if (debug & DPP_DEBUG_TRACE) {
-        dpp_debug(DPP_DEBUG_TRACE, "Got a DPP Auth Frame!\n");
+        dpp_debug(DPP_DEBUG_TRACE, "Got a DPP Auth Frame! In state %s\n",
+                  state_to_string(peer->state));
         dump_tlvs(frame->attributes, len - sizeof(dpp_action_frame));
     }
     
@@ -5948,6 +6081,8 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
                 }
                 if (send_dpp_auth_response(peer, STATUS_OK) > 0) {
                     peer->state = DPP_AUTHENTICATING;
+                } else {
+                    dpp_debug(DPP_DEBUG_ERR, "send_dpp_auth_response() failed!\n");
                 }
                 break;
             case DPP_AUTHENTICATING:
@@ -5979,6 +6114,11 @@ process_dpp_auth_frame (unsigned char *data, int len, dpp_handle handle)
             dpp_debug(DPP_DEBUG_ANY, "wait for the enrollee to start the configuration protocol....\n");
             peer->t0 = srv_add_timeout(srvctx, SRV_SEC(10), no_peer, peer);
         }
+    }
+    dpp_debug(DPP_DEBUG_TRACE, "exit process_dpp_auth_frame() for peer %d\n", handle);
+    TAILQ_FOREACH(peer, &dpp_instance.peers, entry) {
+        dpp_debug(DPP_DEBUG_TRACE, "\tpeer %d is in state %s\n", handle,
+                  state_to_string(peer->state));
     }
 
     return 1;
@@ -6025,6 +6165,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     peer->my_proto = NULL;
     peer->peernewproto = NULL;
     peer->mynewproto = NULL;
+    peer->peer_bootstrap = NULL;
     peer->mauth = initiator ? 1 : mutualauth;   /* initiator changes, responder set */
     peer->csrattrs = NULL;
     peer->csrattrs_len = 0;
@@ -6046,7 +6187,8 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
 
     peer->is_initiator = initiator;
     if (peer->is_initiator) {
-        peer->version = 2;              /* we can do v2 so we state it up front */
+        peer->version = 3;              /* we can do v3 now, so state it up front */
+        RAND_bytes(peer->enonce, dpp_instance.noncelen);
     } else {
         peer->version = 1;              /* leave it up to the initiator, assume the worst */
     }

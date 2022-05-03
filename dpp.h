@@ -35,7 +35,8 @@
 
 typedef unsigned int dpp_handle;
 
-#define DPP_PORT 8908
+#define DPP_VERSION     3
+#define DPP_PORT        8908
 
 /*
  * exported APIs to interact with the DPP module

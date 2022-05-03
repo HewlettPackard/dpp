@@ -614,7 +614,7 @@ bootstrap_peer (char *relay, int keyidx, int is_initiator, int mauth)
     memset((char *)&clnt, 0, sizeof(struct sockaddr_in));
     clnt.sin_family = AF_INET;
     clnt.sin_addr.s_addr = inet_addr(relay);
-    clnt.sin_port = htons(8741);
+    clnt.sin_port = htons(DPP_PORT);
     if ((conv->fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         fprintf(stderr, "unable to create socket!\n");
         free(conv);

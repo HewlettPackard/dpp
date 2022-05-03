@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <ctype.h>              /* DELETE ME WITH SCAN STUFF */
 #include <signal.h>
+#include <pthread.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -44,18 +45,38 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#ifdef HASAVAHI
+#include <avahi-client/client.h>
+#include <avahi-client/publish.h>
+#include <avahi-common/alternative.h>
+#include <avahi-common/simple-watch.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/error.h>
+#include <avahi-common/timeval.h>
+#endif  /* HASAVAHI*/
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/ec.h>
+#include <openssl/bio.h>
 #include "ieee802_11.h"
 #include "service.h"
 #include "common.h"
 #include "tlv.h"
 #include "pkex.h"
 #include "dpp.h"
+
+#ifdef HASAVAHI
+static char *conname = NULL;
+static  AvahiEntryGroup *congroup = NULL;
+static AvahiSimplePoll *avpoll = NULL;
+static void create_service(AvahiClient *c);
+char b64keyhash[44];    /* ceil(SHA256_DIGEST_LENGTH/3)*4 = 44 */
+#endif  /* HASAVAHI*/
 
 struct conversation {
     TAILQ_ENTRY(conversation) entry;
@@ -91,18 +112,6 @@ print_buffer (char *str, unsigned char *buf, int len)
     printf("%s:\n", str);
     dump_buffer(buf, len);
     printf("\n");
-}
-
-static void
-delete_conversation (timerid id, void *data)
-{
-    struct conversation *conv = (struct conversation *)data;
-
-    srv_rem_input(srvctx, conv->fd);
-    close(conv->fd);
-    TAILQ_REMOVE(&conversations, conv, entry);
-    free(conv);
-    return;
 }
 
 static void
@@ -210,11 +219,10 @@ message_from_relay (int fd, void *data)
                     /*
                      * all done!
                      */
-                    (void)srv_add_timeout(srvctx, SRV_MSEC(10), delete_conversation, conv);
-//                    srv_rem_input(srvctx, fd);
-//                    close(fd);
-//                    TAILQ_REMOVE(&conversations, conv, entry);
-//                    free(conv);
+                    srv_rem_input(srvctx, fd);
+                    close(fd);
+                    TAILQ_REMOVE(&conversations, conv, entry);
+                    free(conv);
                     break;
                 default:
                     fprintf(stderr, "unknown DPP frame %d\n", dpp->frame_type);
@@ -442,8 +450,8 @@ new_connection (int fd, void *data)
 
     frame = (dpp_action_frame *)&buf[1];
     switch (frame->frame_type) {
-        case PKEX_SUB_EXCH_REQ:   // controller only does PKEXv2
-            if ((conv->handle = pkex_create_peer(2)) < 1) {
+        case PKEX_SUB_EXCH_REQ:   // controller does not do v1
+            if ((conv->handle = pkex_create_peer(DPP_VERSION)) < 1) {
                 fprintf(stderr, "can't create pkex instance!\n");
                 goto fail;
             }
@@ -486,10 +494,14 @@ new_connection (int fd, void *data)
                     continue;
                 }
                 print_buffer("asn1", keyasn1, asn1len);
+                if (keyasn1[asn1len-1] == 0x00) {
+                    asn1len--;
+                    print_buffer("extra NULL in ASN.1, lopping off...", keyasn1, asn1len);
+                }
                 printf("checking %d...", ret);
                 EVP_DigestInit(mdctx, EVP_sha256());
                 EVP_DigestUpdate(mdctx, "chirp", strlen("chirp"));
-                EVP_DigestUpdate(mdctx, keyasn1, asn1len - 1);
+                EVP_DigestUpdate(mdctx, keyasn1, asn1len);
                 EVP_DigestFinal(mdctx, keyhash, &mdlen);
                 print_buffer("computed", keyhash, mdlen);
                 print_buffer("chirped", TLV_value(rhash), SHA256_DIGEST_LENGTH); 
@@ -629,15 +641,173 @@ term (unsigned short reason)
     return;
 }
 
+#ifdef HASAVAHI
+static void
+congroup_callback (AvahiEntryGroup *g, AvahiEntryGroupState state, void *userdata)
+{
+    char *n;
+    
+    assert (g == congroup || congroup == NULL);
+    congroup = g;
+    switch (state) {
+        case AVAHI_ENTRY_GROUP_ESTABLISHED:
+            printf("our controller service '%s' is established!\n", conname);
+            break;
+        case AVAHI_ENTRY_GROUP_COLLISION:
+            n = avahi_alternative_service_name(conname);
+            printf("service name '%s' collided, renaming to '%s'\n", conname, n);
+            avahi_free(conname);
+            conname = n;
+            create_service(avahi_entry_group_get_client(g));
+            break;
+        case AVAHI_ENTRY_GROUP_FAILURE:
+            printf("group formation failed, bailing!\n");
+            avahi_simple_poll_quit(avpoll);
+            break;
+        default:
+            printf("some other weird avahi group message (%d)...\n", state);
+            break;
+    }
+}
+
+static void
+create_service (AvahiClient *c)
+{
+    char *n, bsstring[150];
+    int ret;
+
+    if (!congroup) {
+        if ((congroup = avahi_entry_group_new(c, congroup_callback, NULL)) == NULL) {
+            fprintf(stderr, "avahi_entry_group_new() failed: %s\n", avahi_strerror(avahi_client_errno(c)));
+            goto fin;
+        }
+    }
+
+    if (avahi_entry_group_is_empty(congroup)) {
+        sprintf(bsstring, "bskeyhash=%s", b64keyhash);
+        printf("adding controller service '%s'\n", conname);
+        if ((ret = avahi_entry_group_add_service(congroup, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, 0, conname,
+                                                 "_dpp._tcp", NULL, NULL, DPP_PORT,
+                                                 "txtversion=1", "organization=Industrial Lounge", bsstring,
+                                                 NULL)) < 0) {
+            if (ret == AVAHI_ERR_COLLISION) {
+                n = avahi_alternative_service_name(conname);
+                printf("got a name collision, renaming '%s' to '%s'\n", conname, n);
+                avahi_free(conname);
+                conname = n;
+                avahi_entry_group_reset(congroup);
+                create_service(c);
+                return;
+            }
+        }
+        if ((ret = avahi_entry_group_add_service_subtype(congroup, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, 0, conname,
+                                                         "_dpp._tcp", NULL, "_controller._sub._dpp._tcp")) < 0) {
+            if (ret == AVAHI_ERR_COLLISION) {
+                n = avahi_alternative_service_name(conname);
+                printf("got a name collision, renaming '%s' to '%s'\n", conname, n);
+                avahi_free(conname);
+                conname = n;
+                avahi_entry_group_reset(congroup);
+                create_service(c);
+                return;
+            }
+        }
+        if ((ret = avahi_entry_group_commit(congroup)) < 0) {
+            fprintf(stderr, "failed to commit group: %s :-(\n", avahi_strerror(ret));
+            goto fin;
+        }
+    }
+
+    if (0) {
+fin:
+        avahi_simple_poll_quit(avpoll);
+    }
+    return;
+}
+
+static void
+concallback (AvahiClient *c, AvahiClientState state, void *userdata)
+{
+    switch (state) {
+        case AVAHI_CLIENT_S_RUNNING:
+            create_service(c);
+            break;
+        case AVAHI_CLIENT_FAILURE:
+            printf("client failed: %s\n", avahi_strerror(avahi_client_errno(c)));
+            avahi_simple_poll_quit(avpoll);
+            break;
+        case AVAHI_CLIENT_S_COLLISION:
+            /* dropthru intentional */
+        case AVAHI_CLIENT_S_REGISTERING:
+            if (congroup) {
+                avahi_entry_group_reset(congroup);
+            }
+            break;
+        default:
+            printf("other avahi state in bscallback: %d\n", state);
+            break;
+    }
+}
+
+static void
+dump_callback (AvahiTimeout *e, void *userdata)
+{
+    AvahiClient *client = (AvahiClient *)userdata;
+    if (avahi_client_get_state(client) == AVAHI_CLIENT_S_RUNNING) {
+        printf("our client is running!\n");
+    }
+}
+
+void *
+publish_controller (void *unused)
+{
+    AvahiClient *client = NULL;
+    int err;
+    struct timeval tv;
+
+    if ((avpoll = avahi_simple_poll_new()) == NULL) {
+        fprintf(stderr, "unable to create poll for mdns thread!\n");
+        pthread_exit(NULL);
+        return NULL; 
+    }
+    conname = avahi_strdup("Controller");
+
+    if ((client = avahi_client_new(avahi_simple_poll_get(avpoll), 0, concallback,
+                                   NULL, &err)) == NULL) {
+        fprintf(stderr, "can't create avahi client for mdns thread!\n");
+        pthread_exit(NULL);
+        return NULL;
+    }
+    avahi_simple_poll_get(avpoll)->timeout_new(avahi_simple_poll_get(avpoll),
+                                             avahi_elapse_time(&tv, 1000*10, 0),
+                                             dump_callback,
+                                             client);
+    avahi_simple_poll_loop(avpoll);
+
+    pthread_exit(NULL);
+    return NULL;
+}
+#endif  /* HASAVAHI*/
+
 int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1;
-    int opt, infd, newgroup = 0;
+    int opt, infd, newgroup = 0, do_mdns = 0;
     struct sockaddr_in serv;
     char relay[20], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+#ifdef HASAVAHI
+    FILE *fp;
+    BIO *bio;
+    unsigned char *p, bkhash[SHA256_DIGEST_LENGTH];
+    int len;
+    EC_KEY *bskey;
+    EVP_MD_CTX *mdctx;
+    unsigned int mdlen = SHA256_DIGEST_LENGTH;
+    pthread_t t;
+#endif  /* HASAVAHI*/
 
     if ((srvctx = srv_create_context()) == NULL) {
         fprintf(stderr, "%s: cannot create service context!\n", argv[0]);
@@ -651,7 +821,7 @@ main (int argc, char **argv)
     memset(pkexinfo, 0, 80);
     memset(caip, 0, 40);
     for (;;) {
-        c = getopt(argc, argv, "hirm:k:I:B:x:yb:ae:c:d:p:n:z:w:");
+        c = getopt(argc, argv, "hirm:k:I:B:x:yb:ae:c:d:p:n:z:w:j");
         if (c < 0) {
             break;
         }
@@ -697,6 +867,9 @@ main (int argc, char **argv)
             case 'a':           /* not mutual authentication */
                 mutual = 0;
                 do_dpp = 1;
+                break;
+            case 'j':
+                do_mdns = 1;
                 break;
             case 'm':
                 ptr = optarg;
@@ -745,6 +918,7 @@ main (int argc, char **argv)
                         "\t-x  <index> DPP only with key <index> in -B <filename>, don't do PKEX\n"
                         "\t-m <MAC address> to initiate to, otherwise uses broadcast\n"
                         "\t-u <url> to find a MUD file (enrollee only)\n"
+                        "\t-j  use MDNS to advertise controller services\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0]);
                 exit(1);
@@ -818,8 +992,52 @@ main (int argc, char **argv)
         fprintf(stderr, "don't support relay initiation yet\n");
         exit(1);
     }
+    if (do_mdns) {
+#ifdef HASAVAHI
+        if ((fp = fopen(keyfile, "r")) == NULL) {
+            fprintf(stderr, "%s: unable to open keyfile %s!\n", argv[0], keyfile);
+            exit(1);
+        }
+        bio = BIO_new(BIO_s_file());
+        BIO_set_fp(bio, fp, BIO_CLOSE);
+        if ((bskey = PEM_read_bio_ECPrivateKey(bio, NULL, NULL, NULL)) == NULL) {
+            fprintf(stderr, "%s: unable to read key in keyfile %s\n", argv[0], keyfile);
+            exit(1);
+        }
+        BIO_free(bio);
+        EC_KEY_set_conv_form(bskey, POINT_CONVERSION_COMPRESSED);
+        EC_KEY_set_asn1_flag(bskey, OPENSSL_EC_NAMED_CURVE);
+
+        if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+            fprintf(stderr, "%s: unable to create BIO!\n", argv[0]);
+            exit(1);
+        }
+        (void)i2d_EC_PUBKEY_bio(bio, bskey);
+        (void)BIO_flush(bio);
+        len = BIO_get_mem_data(bio, &p);
+        if ((mdctx = EVP_MD_CTX_new()) != NULL) {
+            EVP_DigestInit(mdctx, EVP_sha256());
+            EVP_DigestUpdate(mdctx, p, len);
+            EVP_DigestFinal(mdctx, bkhash, &mdlen);
+            EVP_MD_CTX_free(mdctx);
+            (void)EVP_EncodeBlock((unsigned char *)b64keyhash, bkhash, mdlen);
+            printf("bootstrap key hash is %s\n", b64keyhash);
+        }
+        BIO_free(bio);
+        if (pthread_create(&t, NULL, publish_controller, NULL)) {
+            fprintf(stderr, "%s: unable to create client mdns browser\n", argv[0]);
+        }
+#else
+        fprintf(stderr, "%s: AVAHI is not enabled, can't do mdns processing\n", argv[0]);
+#endif  /* HASAVAHI*/
+    }
 
     srv_main_loop(srvctx);
+#ifdef HASAVAHI
+    if (do_mdns) {
+        pthread_exit(NULL);
+    }
+#endif  /* HASAVAHI*/
 
     exit(1);
 }

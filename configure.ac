@@ -50,6 +50,36 @@ AC_ARG_ENABLE(brainpool,
        AC_MSG_RESULT(no)
 )
 
+AC_MSG_CHECKING([enable-curl])
+AC_ARG_ENABLE(curl,
+	AC_HELP_STRING([--enable-curl],[Has Curl support]) [],
+[ case "$enableval" in
+    yes)
+	AC_MSG_RESULT(yes)
+	CFLAGS="$CFLAGS -DHASCURL"
+	LIBS="$LIBS -lcurl"
+	;;
+    *)	AC_MSG_RESULT(no)
+    	;;
+esac ],
+     AC_MSG_RESULT(no)
+)
+
+AC_MSG_CHECKING([enable-avahi])
+AC_ARG_ENABLE(avahi,
+	AC_HELP_STRING([--enable-avahi],[Has MDNS and DNS-SD support]) [],
+[ case "$enableval" in
+    yes)
+	AC_MSG_RESULT(yes)
+	CFLAGS="$CFLAGS -DHASAVAHI"
+	LIBS="$LIBS -lavahi-client -lavahi-common -lavahi-core"
+	;;
+    *)	AC_MSG_RESULT(no)
+    	;;
+esac ],
+     AC_MSG_RESULT(no)
+)
+
 # OS specific stuff
 AC_CANONICAL_HOST
 case $host in
@@ -68,6 +98,9 @@ case $host in
 		   [])
 	AC_CHECK_LIB([dl], dlopen, [],
 		   [AC_MSG_FAILURE([can't find dl])],
+		   [])
+	AC_CHECK_LIB([ssl], SSL_read, [],
+		   [AC_MSG_FAILURE([can't find ssl])],
 		   [])
 	AC_ARG_ENABLE(static,
 		AS_HELP_STRING([--enable-static], [build static]),

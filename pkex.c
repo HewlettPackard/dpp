@@ -958,7 +958,7 @@ compute_z (struct pkex_peer *peer)
     /*
      * ...concatenated with the password
      */
-    memcpy(ptr, pkex_instance.password, strlen(pkex_instance.password));
+    memcpy(ptr, pkex_instance.password, strnlen(pkex_instance.password, 80));
     print_buffer(DPP_DEBUG_TRACE, "password", (unsigned char *)pkex_instance.password, strlen(pkex_instance.password));
 
     if (peer->version == 1) {
@@ -1642,13 +1642,13 @@ process_pkex_exchange (pkex_frame *frame, int len, struct pkex_peer *peer)
     tlv = (TLV *)frame->attributes;
 
     /*
-     * we only support v2 so if there was a PROTOCOL_VERSION TLV then set the
-     * version to 2, record what the peer's version was but we're gonna say 2
-     * no matter what
+     * PROTOCOL_VERSION happened in v2 so if there was a PROTOCOL_VERSION TLV then 
+     * record what the peer's version, otherwise assume v1
      */
     if ((tlv = find_tlv(PROTOCOL_VERSION, frame->attributes, len)) != NULL) {
         peer->peerversion = *(TLV_value(tlv));
-        peer->version = 2;
+    } else {
+        peer->peerversion = 1;
     }
     if (!peer->initiator) {
         /*
@@ -2022,6 +2022,7 @@ pkex_create_peer (int version)
     peer->initiator = 0;
     peer->retrans = 0;
     TAILQ_INSERT_HEAD(&pkex_instance.peers, peer, entry);
+    printf("creating PKEX peer with version %d\n", peer->version);
 
     return peer->handle;
 }

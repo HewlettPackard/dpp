@@ -428,10 +428,11 @@ bpf_in (int fd, void *data)
                                             pinst = create_pkex_instance(inf->bssid, frame->sa, 1);
                                             pkex_update_macs(pinst->handle, inf->bssid, frame->sa);
                                         } else if (dpp->frame_type == PKEX_SUB_EXCH_REQ) {
-                                            pinst = create_pkex_instance(inf->bssid, frame->sa, 2);
+                                            pinst = create_pkex_instance(inf->bssid, frame->sa, DPP_VERSION);
                                         } else {
                                             fprintf(stderr, "cannot find instance from " MACSTR "\n",
                                                     MAC2STR(frame->sa));
+                                            break;
                                         }
                                     }
                                     if (memcmp(pinst->peermac, broadcast, ETH_ALEN) == 0) {
@@ -1435,7 +1436,7 @@ int
 main (int argc, char **argv)
 {
     int s, c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
-    int mediaopt, chchan = 0, chirp = 0, ver = 2, newgroup = 0;
+    int mediaopt, chchan = 0, chirp = 0, ver, newgroup = 0;
     struct interface *inf;
     struct ifreq ifr;
     struct ieee80211req ireq;
@@ -1459,6 +1460,7 @@ main (int argc, char **argv)
     strcpy(bootstrapfile, "none");
     strcpy(signkeyfile, "none");
     strcpy(identifier, "none");
+    ver = DPP_VERSION;
     /*
      * default channel, operating class, and mode
      */
@@ -1560,7 +1562,7 @@ main (int argc, char **argv)
                 strcpy(mudurl, optarg);
             case 'v':
                 ver = atoi(optarg);
-                if (ver < 1 || ver > 2) {
+                if (ver < 1 || ver > DPP_VERSION) {
                     fprintf(stderr, "%s: unknown version, %d\n", argv[0], ver);
                     exit(1);
                 }

@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <ctype.h>              /* DELETE ME WITH SCAN STUFF */
 #include <signal.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/queue.h>
@@ -422,10 +423,11 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                                         pinst = create_pkex_instance(inf->bssid, frame->sa, 1);
                                         pkex_update_macs(pinst->handle, inf->bssid, frame->sa);
                                     } else if (dpp->frame_type == PKEX_SUB_EXCH_REQ) {
-                                        pinst = create_pkex_instance(inf->bssid, frame->sa, 2);
+                                        pinst = create_pkex_instance(inf->bssid, frame->sa, DPP_VERSION);
                                     } else {
                                         fprintf(stderr, "cannot find pkex instance from " MACSTR "\n",
                                                 MAC2STR(frame->sa));
+                                        break;
                                     }
                                 }
                                 if (memcmp(pinst->peermac, broadcast, ETH_ALEN) == 0) {
@@ -457,7 +459,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                                 break;
                             case DPP_CHIRP:
                                 /*
-                                 * this is a controller feature, let's just ignore it here.
+                                 * someone is out there, someone I know about?
                                  */
                                 fprintf(stderr, "got a DPP chirp from " MACSTR "\n", MAC2STR(frame->sa));
                                 if ((rhash = find_tlv(RESPONDER_BOOT_HASH, dpp->attributes, left)) == NULL) {
@@ -625,7 +627,7 @@ static void
 bpf_frame_in (int fd, void *data)
 {
     struct interface *inf = (struct interface *)data;
-    unsigned char buf[2048];
+    unsigned char buf[WIRELESS_MTU];
     struct ieee80211_mgmt_frame *frame;
     struct sockaddr_ll from;
     socklen_t fromlen;
@@ -772,6 +774,9 @@ send_nl_msg (struct nl_msg *msg, struct interface *inf,
         nlmsg_free(msg);
         return -1;
     }
+
+    nl_socket_disable_seq_check(inf->nl_sock);
+
     nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
     nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err);
     nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &err);
@@ -824,7 +829,7 @@ static int
 cons_action_frame (unsigned char field, unsigned char *mymac, unsigned char *peermac,
                    char *data, int len)
 {
-    char buf[2048];
+    char buf[WIRELESS_MTU];
     struct interface *inf = NULL;
     struct ieee80211_mgmt_frame *frame;
     size_t framesize;
@@ -1253,7 +1258,7 @@ callback_dump(struct nl_msg *msg, void *arg)
 }
 
 int
-trigger_scan(struct interface *inf, char *lookfor)
+trigger_scan (struct interface *inf, char *lookfor)
 {
     struct trigger_results results = { .done = 0, .aborted = 0 };
     struct nl_msg *msg;
@@ -1390,13 +1395,31 @@ find_dpp_access_point (struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
+static void
+scan_for_ssid (timerid id, void *data)
+{
+    struct interface *inf = (struct interface *)data;
+    struct nl_msg *msg;
+
+    if (inf == NULL) {
+        fprintf(stderr, "bad data on callback-- no interface! Can't scan\n");
+        return;
+    }
+    if (trigger_scan(inf, our_ssid) == 0) {
+        msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
+        if (send_nl_msg(msg, inf, find_dpp_access_point, inf)) {
+            fprintf(stderr, "unable to register for action frame!\n");
+        }
+    }
+    return;
+}    
+
 int
 provision_connector (char *role, unsigned char *ssid, int ssidlen,
                      unsigned char *connector, int connlen, dpp_handle handle)
 {
     struct interface *inf = NULL;
     struct dpp_instance *instance;
-    struct nl_msg *msg;
     
     if ((instance = find_instance_by_handle(handle)) == NULL) {
         fprintf(stderr, "no DPP instance to provision a connector for!\n");
@@ -1440,13 +1463,10 @@ provision_connector (char *role, unsigned char *ssid, int ssidlen,
             return -1;
         }
         if (!inf->is_loopback) {
-            if (trigger_scan(inf, our_ssid) == 0) {
-                msg = get_nl_msg(inf, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
-                if (send_nl_msg(msg, inf, find_dpp_access_point, inf)) {
-                    fprintf(stderr, "unable to register for action frame!\n");
-                    return -1;
-                }
-            }
+            /*
+             * let DPP finish before we go off and start scanning for SSIDs!
+             */
+            srv_add_timeout(srvctx, SRV_SEC(1), scan_for_ssid, inf);
         }
         discovered = 0;
     } else {
@@ -1851,19 +1871,20 @@ int
 main (int argc, char **argv)
 {
     int c, debug = 0, is_initiator = 0, config_or_enroll = 0, mutual = 1, do_pkex = 0, do_dpp = 1, keyidx = 0;
-    int chchandpp = 0, chirp = 0, ver = 2, newgroup = 0;
+    int chchandpp = 0, chirp = 0, ver, newgroup = 0;
     struct interface *inf;
     char interface[IFNAMSIZ], password[80], keyfile[80], signkeyfile[80], enrollee_role[10], mudurl[80];
     char *ptr, *endptr, identifier[80], pkexinfo[80], caip[40];
     unsigned char targetmac[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     struct nl_msg *msg;
-
+    
     if ((srvctx = srv_create_context()) == NULL) {
         fprintf(stderr, "%s: cannot create service context!\n", argv[0]);
         exit(1);
     }
     TAILQ_INIT(&interfaces);
     TAILQ_INIT(&dpp_instances);
+    ver = DPP_VERSION;
     
     memset(bootstrapfile, 0, 80);
     memset(signkeyfile, 0, 80);
@@ -1874,7 +1895,7 @@ main (int argc, char **argv)
     for (;;) {
         c = getopt(argc, argv, "hirm:k:I:B:x:b:yase:c:d:p:n:z:qf:g:u:tw:v:");
         /*
-         * left: j, l, o, v
+         * left: l, o
          */
         if (c < 0) {
             break;
@@ -1967,7 +1988,7 @@ main (int argc, char **argv)
                 break;
             case 'v':
                 ver = atoi(optarg);
-                if (ver < 1 || ver > 2) {
+                if (ver < 1 || ver > DPP_VERSION) {
                     fprintf(stderr, "%s: unknown version, %d\n", argv[0], ver);
                     exit(1);
                 }
@@ -2002,6 +2023,7 @@ main (int argc, char **argv)
                         "\t-t  send DPP chirps (responder only)\n"
                         "\t-q  terminate the process upon completion (enrollee only)\n"
                         "\t-w <ipaddr> IP address of CA (for enterprise-only Configurators)\n"
+                        "\t-j  enable mdns (client queries, configurator publishes)\n"
                         "\t-d <debug> set debugging mask\n",
                         argv[0], IFNAMSIZ);
                 exit(1);
@@ -2109,7 +2131,7 @@ main (int argc, char **argv)
                 bootstrap_peer(instance->handle, keyidx, is_initiator, mutual);
             } else {
                 /*
-                 * always update the macs in case there's no v2 answer we can
+                 * always update the macs in case there's no v2+ answer we can
                  * switch back to v1
                  */
                 instance = create_pkex_instance(inf->bssid, targetmac, ver);

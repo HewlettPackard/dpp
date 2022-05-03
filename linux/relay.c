@@ -54,6 +54,14 @@
 #include <openssl/pem.h>
 #include <openssl/ec.h>
 #include <openssl/hmac.h>
+#ifdef HASAVAHI
+#include <avahi-client/client.h>
+#include <avahi-client/lookup.h>
+#include <avahi-common/simple-watch.h>
+#include <avahi-common/malloc.h>
+#include <avahi-common/error.h>
+#include <avahi-common/timeval.h>
+#endif  /* HASAVAHI */
 #include "ieee802_11.h"
 #include "service.h"
 #include "radio.h"
@@ -61,6 +69,10 @@
 #include "tlv.h"
 #include "pkex.h"
 #include "dpp.h"
+
+#ifdef HASAVAHI
+static AvahiSimplePoll *simple_poll = NULL;
+#endif  /* HASAVAHI */
 
 struct interface {
     TAILQ_ENTRY(interface) entry;
@@ -91,8 +103,8 @@ struct cstate {
     TAILQ_ENTRY(cstate) entry;
     unsigned char peeraddr[ETH_ALEN];
     unsigned char myaddr[ETH_ALEN];
-    unsigned char bkhash[SHA256_DIGEST_LENGTH];
-    gas_action_comeback_resp_frame cbresp_hdr;
+    unsigned char bkhash[SHA256_DIGEST_LENGTH+1];
+    gas_action_resp_frame resp_hdr;
     char *buf;
     int left;
     int sofar;
@@ -104,7 +116,8 @@ service_context srvctx;
 static uint32_t port_bitmap[32] = { 0 };
 unsigned int opclass = 81, channel = 6;
 unsigned short portin, portout;
-char bootstrapfile[80], controller[30];
+char controller[80];
+unsigned char bkeyhash[SHA256_DIGEST_LENGTH+1];
 
 static void
 dump_buffer (unsigned char *buf, int len)
@@ -384,7 +397,7 @@ cons_action_frame (unsigned char field,
     frame->action.category = ACTION_PUBLIC;
     frame->action.field = field;
     memcpy(frame->action.variable, data, len);
-    printf("sending %d byte frame...\n", len);
+    printf("sending %ld byte frame (%d)...\n\n", framesize, len);
     if (inf->is_loopback) {
         if (write(inf->fd, buf, framesize) < 0) {
             fprintf(stderr, "unable to write management frame!\n");
@@ -411,9 +424,10 @@ cons_action_frame (unsigned char field,
 }
 
 static int
-cons_next_fragment (struct cstate *cs)
+cons_next_fragment (struct cstate *cs, int first)
 {
     char buffer[WIRELESS_MTU+sizeof(gas_action_comeback_resp_frame)];
+    gas_action_resp_frame *resp;
     gas_action_comeback_resp_frame *cb_resp;
     
     if (cs->buf == NULL) {
@@ -421,15 +435,27 @@ cons_next_fragment (struct cstate *cs)
         return 0;
     }
     /*
-     * technically it's MTU+sizeof(comeback response header)....
-     * just don't set WIRELESS_MTU to be *exactly* the MTU
-     *
-     * Copy over the comeback response header
+     * for first fragment, just send the header...
+     */
+    if (first) {
+        memcpy(buffer, (char *)&cs->resp_hdr, sizeof(gas_action_resp_frame));
+        resp = (gas_action_resp_frame *)&buffer[0];
+        resp->comeback_delay = 1;
+        resp->query_resplen = 0;
+        cons_action_frame(GAS_INITIAL_RESPONSE, cs->myaddr, cs->peeraddr,
+                          buffer, sizeof(gas_action_resp_frame));
+        return cs->left;
+    }
+    /*
+     * ...subsequent fragments get data (copy the header from the first message)
      */
     cb_resp = (gas_action_comeback_resp_frame *)&buffer[0];
-    memcpy(cb_resp, &cs->cbresp_hdr, sizeof(gas_action_comeback_resp_frame));
+    cb_resp->dialog_token = cs->resp_hdr.dialog_token;
+    cb_resp->status_code = cs->resp_hdr.status_code;
     cb_resp->comeback_delay = 0;
     cb_resp->fragment_id = cs->left/WIRELESS_MTU;
+    memcpy(cb_resp->ad_proto_elem, cs->resp_hdr.ad_proto_elem, 3);
+    memcpy(cb_resp->ad_proto_id, cs->resp_hdr.ad_proto_id, 7);
     if (cs->left > WIRELESS_MTU) {
         printf("sending next fragment of %d to " MACSTR ", %d so far and %d left\n",
                WIRELESS_MTU, MAC2STR(cs->peeraddr), cs->sofar, cs->left);
@@ -448,7 +474,7 @@ cons_next_fragment (struct cstate *cs)
         cons_action_frame(GAS_COMEBACK_RESPONSE, cs->myaddr, cs->peeraddr,
                           buffer, cs->left + sizeof(gas_action_comeback_resp_frame));
         cs->sofar = cs->left = 0;
-        memset(&cs->cbresp_hdr, 0, sizeof(gas_action_comeback_resp_frame));
+        memset((char *)&cs->resp_hdr, 0, sizeof(gas_action_comeback_resp_frame));
         free(cs->buf); cs->buf = NULL;
     }
     return cs->left;
@@ -458,8 +484,8 @@ void
 message_from_controller (int fd, void *data)
 {
     struct cstate *cs = (struct cstate *)data;
-    gas_action_comeback_resp_frame *cb_resp;
-    char buf[3000];
+    gas_action_resp_frame* resp;
+    char buf[8192];
     uint32_t netlen;
     int len, rlen;
 
@@ -500,18 +526,18 @@ message_from_controller (int fd, void *data)
         return;
     }
     if (len > WIRELESS_MTU) {
-        if (buf[0] != GAS_COMEBACK_RESPONSE) {
+        if (buf[0] != GAS_INITIAL_RESPONSE) {
             fprintf(stderr, "dropping message larger than %d that cannot be fragmented!\n",
                     WIRELESS_MTU);
             return;
         }
         len--;
         /*
-         * keep a copy of the comeback response header for each fragment
+         * keep a copy of the header for each fragment
          */
-        cb_resp = (gas_action_comeback_resp_frame *)&buf[1];
-        memcpy(&cs->cbresp_hdr, cb_resp, sizeof(gas_action_comeback_resp_frame));
-        len -= sizeof(gas_action_comeback_resp_frame);
+        resp = (gas_action_resp_frame *)&buf[1];
+        memcpy(&cs->resp_hdr, resp, sizeof(gas_action_resp_frame));
+        len -= sizeof(gas_action_resp_frame);
 
         if ((cs->buf = malloc(len)) == NULL) {
             fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
@@ -520,15 +546,14 @@ message_from_controller (int fd, void *data)
         /*
          * the actual response is copied into the buffer that gets fragmented
          */
-        printf("need to fragment message that is %d, buffer is %d\n",
-               cb_resp->query_resplen, len);
-        memcpy(cs->buf, cb_resp->query_resp, len);
+        printf("need to fragment message that is %d\n", len);
+        memcpy(cs->buf, resp->query_resp, len);
         print_buffer("First 32 octets that I'm gonna fragment", (unsigned char *)cs->buf, 32); 
         cs->sofar = 0;
         cs->left = len;
-        cons_next_fragment(cs);
+        cons_next_fragment(cs, 1);
     } else {
-        printf("sending message from " MACSTR " to " MACSTR "\n\n",
+        printf("sending message from " MACSTR " to " MACSTR "\n",
                MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
         if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
                               &buf[1], len - 1) < 1) {
@@ -573,7 +598,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
     type = IEEE802_11_FC_GET_TYPE(frame_control);
     stype = IEEE802_11_FC_GET_STYPE(frame_control);
 
-    printf("got an 802.11 frame from " MACSTR "\n", MAC2STR(frame->sa));
+    printf("got an 802.11 frame from " MACSTR " on " MACSTR "\n", MAC2STR(frame->sa), MAC2STR(frame->da));
     /*
      * if it's not a public action frame then we don't care about it!
      */
@@ -606,15 +631,32 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                      * DPP Auth
                      */
                     case DPP_SUB_AUTH_REQUEST:
+                        printf("a DPP Auth request...\n");
                         tlv = (TLV *)dpp->attributes;  // Br -- check whether for controller
                         if ((TLV_length(tlv) != SHA256_DIGEST_LENGTH) ||
                             (TLV_type(tlv) != RESPONDER_BOOT_HASH) ||
                             memcmp(inf->bkhash, TLV_value(tlv), SHA256_DIGEST_LENGTH)) {
                             break;
                         }
-                        /* fall through intentional */
+                        TAILQ_FOREACH(cs, &cstates, entry) {
+                            printf("checking whether " MACSTR " equals " MACSTR "\n",
+                                   MAC2STR(cs->peeraddr), MAC2STR(frame->sa));
+                            if (memcmp(cs->peeraddr, frame->sa, ETH_ALEN) == 0) {
+                                break;
+                            }
+                        }
+                        if (cs != NULL) {
+                            printf("sending %ld byte message from " MACSTR " back to controller...\n\n",
+                                   left+sizeof(uint32_t)+1, MAC2STR(cs->peeraddr));
+                            if (write(cs->fd, buf, left+sizeof(uint32_t)+1) < 1) {
+                                fprintf(stderr, "relay: unable to send message to controller!\n");
+                            }
+                            break;
+                        }
+                        /* fall through intentional, we didn't have a connection */
                     case DPP_CHIRP:
                     case PKEX_SUB_EXCH_REQ:
+                        printf("a chirp or a PKEX request\n");
                         /*
                          * a gratuitous request, create new client state...
                          */
@@ -632,16 +674,22 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                         clnt.sin_addr.s_addr = inet_addr(controller);
                         clnt.sin_port = htons(portout);
                         if ((cs->fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+                            fprintf(stderr, "unable to create socket to connect to ontroller!\n");
                             free(cs);
                             return;
                         }
                         if (connect(cs->fd, (struct sockaddr *)&clnt, sizeof(struct sockaddr_in)) < 0) {
+                            fprintf(stderr, "unable to connect to controller!\n");
                             close(cs->fd);
                             free(cs);
                             return;
                         }
                         memcpy(cs->peeraddr, frame->sa, ETH_ALEN);
-                        memcpy(cs->myaddr, frame->da, ETH_ALEN);
+                        if (memcmp(frame->da, broadcast, ETH_ALEN) == 0) {
+                            memcpy(cs->myaddr, inf->bssid, ETH_ALEN);
+                        } else {
+                            memcpy(cs->myaddr, frame->da, ETH_ALEN);
+                        }
                         if (dpp->frame_type == DPP_SUB_AUTH_REQUEST) {
                             tlv = (TLV *)dpp->attributes;
                             tlv = TLV_next(tlv);    // point to Br after Status
@@ -662,6 +710,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                         }
                         break;
                     case DPP_SUB_AUTH_RESPONSE:
+                        printf("a DPP auth response\n");
                         tlv = (TLV *)frame->action.variable;
                         tlv = TLV_next(tlv);    // point to Br after Status
                         /*
@@ -698,6 +747,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                     case PKEX_SUB_COM_REV_REQ:
                     case PKEX_SUB_COM_REV_RESP:
                     case DPP_CONFIG_RESULT:
+                        printf("one of the package of other frames...\n");
                         /*
                          * find the client state and send this off!
                          */
@@ -717,6 +767,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                         }
                         break;
                     case PKEX_SUB_EXCH_RESP:
+                        printf("a PKEX response\n");
                         tlv = (TLV *)frame->action.variable;
                         tlv = TLV_next(tlv);    // point to Identifier after group
                         /*
@@ -778,7 +829,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                         return;
                     }
                     printf("sending next fragment, %d left\n", cs->left);
-                    cons_next_fragment(cs);
+                    cons_next_fragment(cs, 0);
                 } else {
                     printf("sending %ld byte message from " MACSTR " back to controller...\n\n",
                            left+sizeof(uint32_t)+1, MAC2STR(cs->peeraddr));
@@ -1414,7 +1465,7 @@ new_controller (int fd, void *data)
 }
 
 static void
-compute_bk_hash (struct interface *inf, char *bkfile)
+compute_bk_hash (char *bkf)
 {
     FILE *fp;
     BIO *bio;
@@ -1424,23 +1475,22 @@ compute_bk_hash (struct interface *inf, char *bkfile)
     unsigned char *asn1;
     EC_KEY *bk;
                 
-    if ((fp = fopen(bkfile, "r")) == NULL) {
-        fprintf(stderr, "unable to open %s as bootstrap key file\n", bkfile);
+    if ((fp = fopen(bkf, "r")) == NULL) {
+        fprintf(stderr, "unable to open %s as bootstrap key file\n", bkf);
         return;
     }
     bio = BIO_new(BIO_s_file());
     BIO_set_fp(bio, fp, BIO_CLOSE);
     if ((bk = PEM_read_bio_ECPrivateKey(bio, NULL, NULL, NULL)) == NULL) {
-        fprintf(stderr, "unable to read bootstrap key from  %s\n", bkfile);
+        fprintf(stderr, "unable to read bootstrap key from  %s\n", bkf);
         return;
     }
     BIO_free(bio);
     EC_KEY_set_conv_form(bk, POINT_CONVERSION_COMPRESSED);
     EC_KEY_set_asn1_flag(bk, OPENSSL_EC_NAMED_CURVE);
 
-    memset(inf->bkhash, 0, SHA256_DIGEST_LENGTH);
     if ((bio = BIO_new(BIO_s_mem())) == NULL) {
-        fprintf(stderr, "unable to create bio for bootstrap key from %s\n", bkfile);
+        fprintf(stderr, "unable to create bio for bootstrap key from %s\n", bkf);
         EC_KEY_free(bk);
         return;
     }
@@ -1454,7 +1504,7 @@ compute_bk_hash (struct interface *inf, char *bkfile)
     asn1len = BIO_get_mem_data(bio, &asn1);
     EVP_DigestInit(mdctx, EVP_sha256());
     EVP_DigestUpdate(mdctx, asn1, asn1len);
-    EVP_DigestFinal(mdctx, inf->bkhash, &mdlen);
+    EVP_DigestFinal(mdctx, bkeyhash, &mdlen);
 
     BIO_free(bio);
     EVP_MD_CTX_free(mdctx);
@@ -1462,13 +1512,132 @@ compute_bk_hash (struct interface *inf, char *bkfile)
     return;
 }
 
+#ifdef HASAVAHI
+static void
+resolve_cb (AvahiServiceResolver *res, AvahiIfIndex ifidx, AvahiProtocol proto, AvahiResolverEvent event,
+            const char *name, const char *type, const char *domain, const char *hostname,
+            const AvahiAddress *addr, uint16_t port, AvahiStringList *txt, AvahiLookupResultFlags flags,
+            void *userdata)
+{
+    char *t, *s;
+
+    if (res == NULL) {
+        return;
+    }
+    switch (event) {
+        case AVAHI_RESOLVER_FAILURE:
+            fprintf(stderr, "failed to resolve service '%s' of type '%s' in domain '%s' (error %s)\n",
+                    name, type, domain, avahi_strerror(avahi_client_errno(avahi_service_resolver_get_client(res))));
+            strcpy(controller, "ERR");
+            portout = 0;
+            break;
+        case AVAHI_RESOLVER_FOUND:
+            /*
+             * record our resolved service...
+             */
+            t = avahi_string_list_to_string(txt);
+            printf("resolved service '%s' of type '%s' in domain '%s' to %s on port %u (%s)\nTXT record: %s\n",
+                   name, type, domain, hostname, port, controller, t);
+            if (portout == 0) {
+                char foo[AVAHI_ADDRESS_STR_MAX];
+                int i;
+                
+                portout = port;
+                avahi_address_snprint(foo, sizeof(foo), addr);
+                if ((s = strstr(t, "bskeyhash=")) != NULL) {
+                    /*
+                     * +10 to skip "bskeyhash=" and 44 = ceil(SHA256_DIGEST_LENGTH/3)*4
+                     */
+                    i = EVP_DecodeBlock(bkeyhash, (unsigned char *)s+10, 44);
+                    printf("decoded %d bytes\n", i);
+                }
+                printf("resolved address to %s\n", foo);
+                strcpy(controller, foo);
+                printf("recording controller %s at port %d and bskeyhash is %s\n", controller, portout, s+10);
+            }
+            avahi_free(t);
+            break;
+        default:
+            fprintf(stderr, "resolver error: service not resolved (%d)\n", event);
+            break;
+    }
+    avahi_service_resolver_free(res);
+}
+
+static void
+check_results (AvahiTimeout *to, void *unused)
+{
+    avahi_simple_poll_quit(simple_poll);
+    if (portout == 0) {
+        fprintf(stderr, "unable to find a controller in the DNS, re-run with -C\n");
+        exit(1);
+    }
+    printf("controller is at port %d on %s\n", portout, controller);
+    return;
+}
+
+static void
+browse_cb (AvahiServiceBrowser *browser, AvahiIfIndex ifidx, AvahiProtocol proto, AvahiBrowserEvent event,
+           const char *name, const char *type, const char *domain, AvahiLookupResultFlags flags, void *userdata)
+{
+    AvahiClient *client = (AvahiClient *)userdata;
+    struct timeval tv;
+
+    if (browser == NULL) {
+        fprintf(stderr, "null browser inside callback!\n");
+        return;
+    }
+    switch (event) {
+        case AVAHI_BROWSER_FAILURE:
+            fprintf(stderr, "avahi browse failure\n");
+            avahi_simple_poll_quit(simple_poll);
+            break;
+        case AVAHI_BROWSER_NEW:
+            printf("new DPP service '%s' of type '%s' in domain '%s' found\n", name, type, domain);
+            if (!avahi_service_resolver_new(client, ifidx, proto, name, type, domain,
+                                            AVAHI_PROTO_INET, 0, resolve_cb, NULL)) {
+                fprintf(stderr, "failed to resolve service '%s' (error %s)\n", name,
+                        avahi_strerror(avahi_client_errno(client)));
+            }
+            break;
+        case AVAHI_BROWSER_REMOVE:
+            break;
+        case AVAHI_BROWSER_CACHE_EXHAUSTED:
+            break;
+        case AVAHI_BROWSER_ALL_FOR_NOW:
+            avahi_simple_poll_get(simple_poll)->timeout_new(avahi_simple_poll_get(simple_poll),
+                                                            avahi_elapse_time(&tv, 1000, 0),
+                                                            check_results, NULL);
+            break;
+    }
+    return;
+}
+
+static void
+client_cb (AvahiClient *c, AvahiClientState state, void *unused)
+{
+    if (c == NULL) {
+        return;
+    }
+    if (state == AVAHI_CLIENT_FAILURE) {
+        avahi_simple_poll_quit(simple_poll);
+    }
+}
+#endif  /* HASAVAHI */
+
 int
 main (int argc, char **argv)
 {
-    int c, got_controller = 0, infd, opt;
+    int c, got_controller = 0, got_bsfile = 0, infd, opt;
     struct interface *inf;
-    char interface[IFNAMSIZ], bkfile[30];
-    struct sockaddr_in serv;
+    char iface[IFNAMSIZ], bootstrapfile[80]; 
+    struct sockaddr_in saddr;
+#ifdef HASAVAHI
+    AvahiClient *client = NULL;
+    AvahiServiceBrowser *sb = NULL;
+    char *serv = "_controller._sub._dpp._tcp";
+    int err;
+#endif  /* HASAVAHI */
 
     if ((srvctx = srv_create_context()) == NULL) {
         fprintf(stderr, "%s: cannot create service context!\n", argv[0]);
@@ -1476,8 +1645,14 @@ main (int argc, char **argv)
     }
     TAILQ_INIT(&interfaces);
     TAILQ_INIT(&cstates);
+    memset(controller, 0, sizeof(controller));
+    memset(bkeyhash, 0, SHA256_DIGEST_LENGTH);
     portin = 8741;
+#ifdef HASAVAHI
+    portout = 0;       // learn it!
+#else    
     portout = DPP_PORT;
+#endif  /* HASAVAHI */
     for (;;) {
         c = getopt(argc, argv, "hI:d:f:g:C:k:i:o:");
         if (c < 0) {
@@ -1489,9 +1664,9 @@ main (int argc, char **argv)
                     fprintf(stderr, "%s: interface name %s is 'too large'\n", argv[0], optarg);
                     exit(1);
                 }
-                strcpy(interface, optarg);
-                printf("adding interface %s...\n", interface);
-                add_interface(interface);
+                strcpy(iface, optarg);
+                printf("adding interface %s...\n", iface);
+                add_interface(iface);
                 break;
             case 'd':           /* debug */
 //                debug = atoi(optarg);
@@ -1507,7 +1682,8 @@ main (int argc, char **argv)
                 strcpy(controller, optarg);
                 break;
             case 'k':
-                strcpy(bkfile, optarg);
+                got_bsfile = 1;
+                strcpy(bootstrapfile, optarg);
                 break;
             case 'i':
                 portin = atoi(optarg);
@@ -1534,25 +1710,56 @@ main (int argc, char **argv)
         }
     }
     if (!got_controller) {
-        fprintf(stderr, "%s: need to specify a controller with -C\n", argv[0]);
+#ifdef HASAVAHI
+        if ((simple_poll = avahi_simple_poll_new()) == NULL) {
+            fprintf(stderr, "%s: unable to create avahi simple poll!\n", argv[0]);
+            exit(1);
+        }
+        if ((client = avahi_client_new(avahi_simple_poll_get(simple_poll), 0, client_cb, NULL, &err)) == NULL) {
+            fprintf(stderr, "%s: unable to create avahi client!\n", argv[0]);
+            exit(1);
+        }
+        if ((sb = avahi_service_browser_new(client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, serv, NULL, 0,
+                                            browse_cb, client)) == NULL) {
+            fprintf(stderr, "%s: unable to create avahi service browser!\n", argv[0]);
+            exit(1);
+        }
+        /*
+         * do a quick browse for a controller....
+         */
+        avahi_simple_poll_loop(simple_poll);
+#else    
+        fprintf(stderr, "%s: need to specify a controller with -C or recompile with avahi\n", argv[0]);
         exit(1);
+#endif  /* HASAVAHI */
     }
     if (TAILQ_EMPTY(&interfaces)) {
         fprintf(stderr, "%s: no interfaces defined!\n", argv[0]);
         add_interface("lo");
     }
+    if (got_bsfile) {
+        compute_bk_hash(bootstrapfile);
+#ifndef HASAVAHI
+    } else {
+        fprintf(stderr, "%s: don't know the bootstrapping key hash! Try specifying a key with -k\n", argv[0]);
+        exit(1);
+#endif  /* !HASAVAHI */
+    }
     printf("interfaces and MAC addresses:\n");
     TAILQ_FOREACH(inf, &interfaces, entry) {
         printf("\t%s: " MACSTR "\n", inf->ifname, MAC2STR(inf->bssid));
+        if (inf->is_loopback) {
+            srv_add_input(srvctx, inf->fd, inf, bpf_frame_in);
+        } else {
+            srv_add_input(srvctx, nl_socket_get_fd(inf->nl_sock), inf, nl_sock_in);
+        }
         /*
          * for now just make all interfaces have the same bootstrap key and are on the
          * same channel
          */
         change_channel(inf->bssid, opclass, channel);
-        compute_bk_hash(inf, bkfile);
+        memcpy(inf->bkhash, bkeyhash, SHA256_DIGEST_LENGTH);
     }
-    printf("controller is at %s\n", controller);
-
     /*
      * create and bind listening socket for new DPP conversations started
      * by the controller
@@ -1567,16 +1774,16 @@ main (int argc, char **argv)
         exit(1);
     }
     
-    memset((char *)&serv, 0, sizeof(struct sockaddr_in));
-    serv.sin_family = AF_INET;
-    serv.sin_addr.s_addr = INADDR_ANY;
-    serv.sin_port = htons(portin);
-    if ((bind(infd, (struct sockaddr *)&serv, sizeof(struct sockaddr_in)) < 0) ||
+    memset((char *)&saddr, 0, sizeof(struct sockaddr_in));
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    saddr.sin_port = htons(portin);
+    if ((bind(infd, (struct sockaddr *)&saddr, sizeof(struct sockaddr_in)) < 0) ||
         (listen(infd, 0) < 0)) {
         fprintf(stderr, "%s: unable to bind/listen TCP socket!\n", argv[0]);
         exit(1);
     }
-    srv_add_input(srvctx, infd, &serv, new_controller);
+    srv_add_input(srvctx, infd, &saddr, new_controller);
 
     srv_main_loop(srvctx);
 
