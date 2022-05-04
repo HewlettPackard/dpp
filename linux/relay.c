@@ -530,20 +530,12 @@ message_from_controller (int fd, void *data)
          */
         memcpy(&cs->resp_hdr, &buf[1], sizeof(gas_action_resp_frame));
     }
+    len--;      // minus 1 because the field is not part of the message to frag
     if (len > WIRELESS_MTU) {
         /*
          * fragmented initial response when the singular controller response is
          * too big, fragmented comeback response when the controller is
          * sending back certificates after first telling the enrollee to comeback
-         */
-        if ((buf[0] != GAS_INITIAL_RESPONSE) && (buf[0] != GAS_COMEBACK_RESPONSE)) {
-            fprintf(stderr, "dropping message larger than %d that cannot be fragmented!\n",
-                    WIRELESS_MTU);
-            return;
-        }
-        len--;
-        /*
-         * the actual response is copied into the buffer that gets fragmented
          */
         printf("need to fragment message that is %d\n", len);
         switch (buf[0]) {
@@ -580,7 +572,7 @@ message_from_controller (int fd, void *data)
         printf("sending message from " MACSTR " to " MACSTR "\n",
                MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
         if (cons_action_frame(buf[0], cs->myaddr, cs->peeraddr,
-                              &buf[1], len - 1) < 1) {
+                              &buf[1], len) < 1) {
             fprintf(stderr, "unable to send message from controller to peer!\n");
             srv_rem_input(srvctx, cs->fd);
             close(cs->fd);
