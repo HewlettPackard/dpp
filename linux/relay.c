@@ -484,7 +484,6 @@ void
 message_from_controller (int fd, void *data)
 {
     struct cstate *cs = (struct cstate *)data;
-    gas_action_resp_frame* resp;
     char buf[8192];
     uint32_t netlen;
     int len, rlen;
@@ -525,33 +524,58 @@ message_from_controller (int fd, void *data)
         fprintf(stderr, "we're still defraging the last message, chill!\n");
         return;
     }
+    if (buf[0] == GAS_INITIAL_RESPONSE) {
+        /*
+         * keep a copy of the header for each fragment
+         */
+        memcpy(&cs->resp_hdr, &buf[1], sizeof(gas_action_resp_frame));
+    }
     if (len > WIRELESS_MTU) {
-        if (buf[0] != GAS_INITIAL_RESPONSE) {
+        /*
+         * fragmented initial response when the singular controller response is
+         * too big, fragmented comeback response when the controller is
+         * sending back certificates after first telling the enrollee to comeback
+         */
+        if ((buf[0] != GAS_INITIAL_RESPONSE) && (buf[0] != GAS_COMEBACK_RESPONSE)) {
             fprintf(stderr, "dropping message larger than %d that cannot be fragmented!\n",
                     WIRELESS_MTU);
             return;
         }
         len--;
         /*
-         * keep a copy of the header for each fragment
-         */
-        resp = (gas_action_resp_frame *)&buf[1];
-        memcpy(&cs->resp_hdr, resp, sizeof(gas_action_resp_frame));
-        len -= sizeof(gas_action_resp_frame);
-
-        if ((cs->buf = malloc(len)) == NULL) {
-            fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
-            return;
-        }
-        /*
          * the actual response is copied into the buffer that gets fragmented
          */
         printf("need to fragment message that is %d\n", len);
-        memcpy(cs->buf, resp->query_resp, len);
-        print_buffer("First 32 octets that I'm gonna fragment", (unsigned char *)cs->buf, 32); 
-        cs->sofar = 0;
-        cs->left = len;
-        cons_next_fragment(cs, 1);
+        switch (buf[0]) {
+            case GAS_INITIAL_RESPONSE:
+                len -= sizeof(gas_action_resp_frame);
+                cs->sofar = 0;
+                cs->left = len;
+                if ((cs->buf = malloc(len)) == NULL) {
+                    fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
+                    return;
+                }
+                memcpy(cs->buf, (buf + sizeof(gas_action_resp_frame) + 1), len);
+                print_buffer("First 32 octets that I'm gonna fragment", (unsigned char *)cs->buf, 32); 
+                cons_next_fragment(cs, 1);
+                break;
+            case GAS_COMEBACK_RESPONSE:
+                len -= sizeof(gas_action_comeback_resp_frame);
+                cs->sofar = 0;
+                cs->left = len;
+                if ((cs->buf = malloc(len)) == NULL) {
+                    fprintf(stderr, "unable to allocate space to fragment %d byte message!\n", len);
+                    return;
+                }
+                memcpy(cs->buf, (buf + sizeof(gas_action_comeback_resp_frame) + 1), len);
+                print_buffer("First 32 octets that I'm gonna fragment", (unsigned char *)cs->buf, 32); 
+                cons_next_fragment(cs, 0);
+                break;
+            default:
+                fprintf(stderr, "bad frame from controller that needs fragmenting: %d\n",
+                        buf[0]);
+                return;
+        }
     } else {
         printf("sending message from " MACSTR " to " MACSTR "\n",
                MAC2STR(cs->myaddr), MAC2STR(cs->peeraddr));
