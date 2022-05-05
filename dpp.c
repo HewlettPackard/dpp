@@ -808,6 +808,12 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
               field == GAS_COMEBACK_RESPONSE ? "GAS_COMEBACK_RESPONSE" : "unknown");
     switch (field) {
         case GAS_INITIAL_REQUEST:
+            if (peer->bufferlen > peer->mtu) {
+                dpp_debug(DPP_DEBUG_ERR, "GAS_INITIAL_REQUESTs cannot be fragmented. "
+                          "Buffer is %d, MTU is only %d. Aborting exchange\n",
+                          peer->bufferlen, peer->mtu);
+                return 0;
+            }
             /*
              * fill in the generic header goo
              */
@@ -818,6 +824,7 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
             /*
              * fill in the response
              */
+            dpp_debug(DPP_DEBUG_TRACE, "initial request is %d bytes (mtu is %d)\n", peer->bufferlen, peer->mtu);
             gareq->query_reqlen = peer->bufferlen;
             memcpy(gareq->query_req, peer->buffer, peer->bufferlen);
             peer->field = field;
