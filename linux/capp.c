@@ -237,7 +237,7 @@ do_rest_api (char *hostname, uint16_t port)
     curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION, seek_cb);
     curl_easy_setopt(curl, CURLOPT_SEEKDATA, &send_buff);
 
-    slist = curl_slist_append(slist, "Content-Type: application/vnd.wfa.dpp");
+    slist = curl_slist_append(slist, "Content-Type: application/json");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
 
     send_buff.ptr = uridata;
@@ -522,9 +522,9 @@ main (int argc, char **argv)
         goto fin;
     }
     if (curlconfig & HASROLE) {
-        snprintf(uridata, sizeof(uridata), "dppuri=%s?netrole=%s", uri, role);
+        snprintf(uridata, sizeof(uridata), "{\"dppUri\":\"%s\",\"dppRole\":\"%s\"}", uri, role);
     } else {
-        snprintf(uridata, sizeof(uridata), "dppuri=%s", uri);
+        snprintf(uridata, sizeof(uridata), "{\"dppUri\":\"%s\"}", uri);
     }
     if ((simple_poll = avahi_simple_poll_new()) == NULL) {
         fprintf(stderr, "%s: unable to create avahi simple poll!\n", argv[0]);
@@ -641,9 +641,9 @@ main (int argc, char **argv)
         goto fin;
     }
     if (curlconfig & HASROLE) {
-        snprintf(uridata, sizeof(uridata), "dppuri=%s?netrole=%s", uri, role);
+        snprintf(uridata, sizeof(uridata), "{\"dppUri\":\"%s\",\"dppRole\":\"%s\"}", uri, role);
     } else {
-        snprintf(uridata, sizeof(uridata), "dppuri=%s", uri);
+        snprintf(uridata, sizeof(uridata), "{\"dppUri\":\"%s\"}", uri);
     }
 
     do_rest_api(server, port);

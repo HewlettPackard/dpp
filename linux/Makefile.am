@@ -7,7 +7,7 @@ controller_SOURCES = controller.c ../dpp.c ../pkex.c ../service.c ../hkdf.c ../t
 
 device_SOURCES = device.c ../dpp.c ../pkex.c ../service.c ../hkdf.c ../tlv.c ../aes_siv.c ../jsmn.c ../utils.c ../talk2ca.c
 
-cette_SOURCES = cette.c 
+cette_SOURCES = cette.c ../jsmn.c ../utils.c
 
 capp_SOURCES = capp.c
 
