@@ -68,7 +68,6 @@ TAILQ_HEAD(bar, conversation) conversations;
 
 service_context srvctx;
 char bootstrapfile[80];
-unsigned char fakemac[ETH_ALEN] = { 0xde, 0xad, 0xbe, 0xef, 0x0f, 0x00 };
 
 static void
 dump_buffer (unsigned char *buf, int len)
@@ -222,12 +221,9 @@ message_from_relay (int fd, void *data)
                 case PKEX_SUB_COM_REV_REQ:
                 case PKEX_SUB_COM_REV_RESP:
                     printf("PKEX message...\n");
-/* don't do PKEX in controller yet...
-                    if (process_pkex_frame(&buf[1], framesize - 1, fakemac, conv->fakepeer) < 0) {
-                        fprintf(stderr, "error processing PKEX frame from " MACSTR "\n",
-                                MAC2STR(conv->fakepeer));
+                    if (process_pkex_frame(&buf[1], framesize - 1, conv->handle) < 0) {
+                        fprintf(stderr, "error processing PKEX frame\n");
                     }
-*/
                     break;
                 case DPP_CONFIG_RESULT:
                     if (process_dpp_config_frame(BAD_DPP_SPEC_MESSAGE, &buf[1], framesize - 1,
@@ -382,6 +378,74 @@ save_bootstrap_key (unsigned char *b64key, unsigned char *peermac)
 }
 #endif
 
+int
+save_bootstrap_key (pkex_handle handle, void *param)
+{
+    FILE *fp = NULL;
+    BIO *bio = NULL;
+    char newone[1024], existing[1024], b64bskey[1024];
+    unsigned char *ptr, mac[2*ETH_ALEN];
+    int ret = -1, oc, ch, len, octets;
+    EC_KEY *peerbskey = (EC_KEY *)param;
+    struct conversation *conv;
+    
+    TAILQ_FOREACH(conv, &conversations, entry) {
+        if (handle == conv->handle) {
+            break;
+        }
+    }
+    if (conv == NULL) {
+        fprintf(stderr, "can't find dpp instance!\n");
+        return -1;
+    }
+
+    /*
+     * get the base64 encoded EC_KEY as onerow[1]
+     */
+    if ((bio = BIO_new(BIO_s_mem())) == NULL) {
+        fprintf(stderr, "unable to create bio!\n");
+        goto fin;
+    }
+    (void)i2d_EC_PUBKEY_bio(bio, peerbskey);
+    (void)BIO_flush(bio);
+    len = BIO_get_mem_data(bio, &ptr);
+    octets = EVP_EncodeBlock((unsigned char *)newone, ptr, len);
+    BIO_free(bio);
+
+    memset(b64bskey, 0, 1024);
+    strncpy(b64bskey, newone, octets);
+
+    if ((fp = fopen(bootstrapfile, "r+")) == NULL) {
+        fprintf(stderr, "SSS: unable to open %s as bootstrapping file\n", bootstrapfile);
+        goto fin;
+    }
+    ret = 0;
+    printf("peer's bootstrapping key (b64 encoded)\n%s\n", b64bskey);
+    while (!feof(fp)) {
+        memset(existing, 0, 1024);
+        if (fscanf(fp, "%d %d %d %s %s", &ret, &oc, &ch, mac, existing) < 1) {
+            break;
+        }
+        if (strcmp((char *)existing, (char *)b64bskey) == 0) {
+            fprintf(stderr, "SSS: bootstrapping key is trusted already\n");
+//            goto fin;
+        }
+    }
+    ret++;
+    /*
+     * bootstrapping file is index opclass channel macaddr key
+     * but the controller doesn't care about opclass and channel 
+     * and doesn't know anything about MAC addresses....
+     */
+    fprintf(fp, "%d 0 0 ffffffffffff %s\n", ret, b64bskey);
+
+  fin:
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    return ret;
+}
+
 void
 new_connection (int fd, void *data)
 {
@@ -445,12 +509,14 @@ new_connection (int fd, void *data)
     switch (dpp->frame_type) {
         case PKEX_SUB_EXCH_REQ:
             printf("PKEX request...\n");
-/* we don't do PKEX in the controller yet...
-            if (process_pkex_frame(&buf[1], framesize - 1, fakemac, conv->fakepeer) < 0) {
+            if ((conv->handle = pkex_create_peer(DPP_VERSION)) < 1) {
+                fprintf(stderr, "can't create pkex instance!\n");
+                goto fail;
+            }
+            if (process_pkex_frame(&buf[1], framesize - 1, conv->handle) < 0) {
                 fprintf(stderr, "error processing PKEX frame from relay!\n");
                 goto fail;
             }
-*/
             break;
         case DPP_SUB_AUTH_REQUEST:
             printf("DPP auth request...\n");
@@ -845,8 +911,7 @@ main (int argc, char **argv)
     if (do_pkex) {
         if (pkex_initialize(is_initiator, password, 
                             identifier[0] == 0 ? NULL : identifier,
-                            pkexinfo[0] == 0 ? NULL : pkexinfo, keyfile,
-                            bootstrapfile[0] == 0 ? NULL : bootstrapfile, 0, 0, debug) < 0) {
+                            pkexinfo[0] == 0 ? NULL : pkexinfo, keyfile, debug) < 0) {
             fprintf(stderr, "%s: cannot configure PKEX/DPP, check config file!\n", argv[0]);
             exit(1);
         }

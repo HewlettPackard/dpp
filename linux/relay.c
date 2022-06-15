@@ -695,7 +695,7 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
                             return;
                         }
                         if (connect(cs->fd, (struct sockaddr *)&clnt, sizeof(struct sockaddr_in)) < 0) {
-                            fprintf(stderr, "unable to connect to controller!\n");
+                            fprintf(stderr, "unable to connect to controller to %s:%d!\n", controller, portout);
                             close(cs->fd);
                             free(cs);
                             return;
@@ -1663,12 +1663,8 @@ main (int argc, char **argv)
     TAILQ_INIT(&cstates);
     memset(controller, 0, sizeof(controller));
     memset(bkeyhash, 0, SHA256_DIGEST_LENGTH);
-    portin = 8741;
-#ifdef HASAVAHI
-    portout = 0;       // learn it!
-#else    
-    portout = DPP_PORT;
-#endif  /* HASAVAHI */
+    portin = DPP_PORT;
+    portout = DPP_PORT;         /* may be overridden by mDNS */
     for (;;) {
         c = getopt(argc, argv, "hI:d:f:g:C:k:i:o:");
         if (c < 0) {
