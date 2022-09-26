@@ -44,6 +44,6 @@ int provision_connector(char *, char *, int, char *, int, dpp_handle);
 int change_dpp_channel(dpp_handle, unsigned char, unsigned char);
 int change_dpp_freq(dpp_handle, unsigned long freq);
 int bootstrap_peer(pkex_handle, int, int, int);
-void term(unsigned short reason);
+void term(unsigned short reason, dpp_handle);
 
 #endif  /* _OS_GLUE_H_ */

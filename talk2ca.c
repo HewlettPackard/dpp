@@ -147,12 +147,12 @@ get_cacerts (char **cap7, char *caip)
     len = (msgsinglet & 0xffff);
     printf("signlet is %d, len is %d\n", msgsinglet, len);
     if (len) {
-        if ((*cap7 = malloc(len)) == NULL) {
+        if ((*cap7 = malloc(len+1)) == NULL) {
             fprintf(stderr, "cannot allocate space for CA P7!\n");
             close(s);
             return -1;
         }
-        memset(*cap7, 0, len);
+        memset(*cap7, 0, len+1);
         if (reads(s, *cap7, len) < len) {
             fprintf(stderr, "cannot read %d byte CA P7!\n", len);
             free(*cap7);
@@ -240,17 +240,17 @@ get_pkcs7 (int s, char **p7)
     }
     msgsinglet = htonl(msgsinglet);
     len = (msgsinglet & 0xffff);
-    if ((*p7 = malloc(len)) == NULL) {
+    if ((*p7 = malloc(len+1)) == NULL) {
         fprintf(stderr, "cannot alloc space for p7!\n");
         close(s);
         return 0;
     }
+    memset(*p7, 0, len+1);
     if (reads(s, (char *)*p7, len) < len) {
         fprintf(stderr, "cannot read p7!\n");
         close(s);
         return 0;
     }
-
     srv_rem_input(srvctx, s);
     close(s);
     return len;

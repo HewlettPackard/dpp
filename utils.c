@@ -120,11 +120,11 @@ skip_array (jsmntok_t *t)
 static int
 find_token (jsmntok_t *toks, int *n, int ntoks, char *buffer, char *str)
 {
-    int i, num;
+    int num;
     jsmntok_t *tok;
     
     num = *n;
-    for (i = 0; i < ntoks; i++) {
+    while (num < ntoks) {
         tok = &toks[num];
         if (tok == NULL) {
             return -1;
@@ -494,7 +494,7 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
                     char *role, EC_KEY *signkey, BN_CTX *bnctx)
 {
     unsigned char kid[KID_LENGTH];
-    char buf[1024];
+    char buf[2048];
     unsigned char burlx[256], burly[256], *bn = NULL;
     unsigned char digest[SHA512_DIGEST_LENGTH], sig[BIGGEST_POSSIBLE_SIGNATURE];
     int nid, primelen, burllen, bnlen, offset, buflen, sofar = 0;

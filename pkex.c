@@ -1208,7 +1208,7 @@ pkex_exchange_to_peer (struct pkex_peer *peer, unsigned char status)
     unsigned short grp;
     BIGNUM *x = NULL, *y = NULL, *hmul = NULL, *order = NULL;
     TLV *tlv;
-    EC_POINT *Q;
+    EC_POINT *Q = NULL;
     const EC_POINT *Xpt;
     EVP_MD_CTX *mdctx = NULL;
     int offset, framelen, ret = -1;
@@ -1370,6 +1370,9 @@ fin:
     }
     if (hmul != NULL) {
         BN_free(hmul);
+    }
+    if (Q != NULL) {
+        EC_POINT_free(Q);
     }
     return ret;
 }
@@ -2021,6 +2024,7 @@ pkex_create_peer (int version)
     peer->state = PKEX_NOTHING;
     peer->initiator = 0;
     peer->retrans = 0;
+    peer->t0 = 0;
     TAILQ_INSERT_HEAD(&pkex_instance.peers, peer, entry);
     printf("creating PKEX peer with version %d\n", peer->version);
 

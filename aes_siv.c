@@ -338,6 +338,7 @@ siv_init (siv_ctx *ctx, const unsigned char *key, int keylen)
     times_two(ctx->K1, L);
     times_two(ctx->K2, ctx->K1);
 
+    memset(ctx->T, 0, AES_BLOCK_SIZE);
     memset(ctx->benchmark, 0, AES_BLOCK_SIZE);
     aes_cmac(ctx, zero, AES_BLOCK_SIZE, ctx->T);
     return 1;

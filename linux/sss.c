@@ -106,7 +106,7 @@ struct trigger_results {
     int aborted;
 };
 
-#define WIRELESS_MTU    1300
+#define WIRELESS_MTU    1400
 
 service_context srvctx;
 static int discovered = -1;
@@ -589,6 +589,132 @@ process_incoming_mgmt_frame (struct interface *inf, struct ieee80211_mgmt_frame 
     }
 }
 
+/*
+ * stolen from wpa_supplicant, thanks Jouni!
+ */
+static const char * nl80211_command_to_string(enum nl80211_commands cmd)
+{
+#define C2S(x) case x: return #x;
+	switch (cmd) {
+	C2S(NL80211_CMD_UNSPEC)
+	C2S(NL80211_CMD_GET_WIPHY)
+	C2S(NL80211_CMD_SET_WIPHY)
+	C2S(NL80211_CMD_NEW_WIPHY)
+	C2S(NL80211_CMD_DEL_WIPHY)
+	C2S(NL80211_CMD_GET_INTERFACE)
+	C2S(NL80211_CMD_SET_INTERFACE)
+	C2S(NL80211_CMD_NEW_INTERFACE)
+	C2S(NL80211_CMD_DEL_INTERFACE)
+	C2S(NL80211_CMD_GET_KEY)
+	C2S(NL80211_CMD_SET_KEY)
+	C2S(NL80211_CMD_NEW_KEY)
+	C2S(NL80211_CMD_DEL_KEY)
+	C2S(NL80211_CMD_GET_BEACON)
+	C2S(NL80211_CMD_SET_BEACON)
+	C2S(NL80211_CMD_START_AP)
+	C2S(NL80211_CMD_STOP_AP)
+	C2S(NL80211_CMD_GET_STATION)
+	C2S(NL80211_CMD_SET_STATION)
+	C2S(NL80211_CMD_NEW_STATION)
+	C2S(NL80211_CMD_DEL_STATION)
+	C2S(NL80211_CMD_GET_MPATH)
+	C2S(NL80211_CMD_SET_MPATH)
+	C2S(NL80211_CMD_NEW_MPATH)
+	C2S(NL80211_CMD_DEL_MPATH)
+	C2S(NL80211_CMD_SET_BSS)
+	C2S(NL80211_CMD_SET_REG)
+	C2S(NL80211_CMD_REQ_SET_REG)
+	C2S(NL80211_CMD_GET_MESH_CONFIG)
+	C2S(NL80211_CMD_SET_MESH_CONFIG)
+	C2S(NL80211_CMD_SET_MGMT_EXTRA_IE)
+	C2S(NL80211_CMD_GET_REG)
+	C2S(NL80211_CMD_GET_SCAN)
+	C2S(NL80211_CMD_TRIGGER_SCAN)
+	C2S(NL80211_CMD_NEW_SCAN_RESULTS)
+	C2S(NL80211_CMD_SCAN_ABORTED)
+	C2S(NL80211_CMD_REG_CHANGE)
+	C2S(NL80211_CMD_AUTHENTICATE)
+	C2S(NL80211_CMD_ASSOCIATE)
+	C2S(NL80211_CMD_DEAUTHENTICATE)
+	C2S(NL80211_CMD_DISASSOCIATE)
+	C2S(NL80211_CMD_MICHAEL_MIC_FAILURE)
+	C2S(NL80211_CMD_REG_BEACON_HINT)
+	C2S(NL80211_CMD_JOIN_IBSS)
+	C2S(NL80211_CMD_LEAVE_IBSS)
+	C2S(NL80211_CMD_TESTMODE)
+	C2S(NL80211_CMD_CONNECT)
+	C2S(NL80211_CMD_ROAM)
+	C2S(NL80211_CMD_DISCONNECT)
+	C2S(NL80211_CMD_SET_WIPHY_NETNS)
+	C2S(NL80211_CMD_GET_SURVEY)
+	C2S(NL80211_CMD_NEW_SURVEY_RESULTS)
+	C2S(NL80211_CMD_SET_PMKSA)
+	C2S(NL80211_CMD_DEL_PMKSA)
+	C2S(NL80211_CMD_FLUSH_PMKSA)
+	C2S(NL80211_CMD_REMAIN_ON_CHANNEL)
+	C2S(NL80211_CMD_CANCEL_REMAIN_ON_CHANNEL)
+	C2S(NL80211_CMD_SET_TX_BITRATE_MASK)
+	C2S(NL80211_CMD_REGISTER_FRAME)
+	C2S(NL80211_CMD_FRAME)
+	C2S(NL80211_CMD_FRAME_TX_STATUS)
+	C2S(NL80211_CMD_SET_POWER_SAVE)
+	C2S(NL80211_CMD_GET_POWER_SAVE)
+	C2S(NL80211_CMD_SET_CQM)
+	C2S(NL80211_CMD_NOTIFY_CQM)
+	C2S(NL80211_CMD_SET_CHANNEL)
+	C2S(NL80211_CMD_SET_WDS_PEER)
+	C2S(NL80211_CMD_FRAME_WAIT_CANCEL)
+	C2S(NL80211_CMD_JOIN_MESH)
+	C2S(NL80211_CMD_LEAVE_MESH)
+	C2S(NL80211_CMD_UNPROT_DEAUTHENTICATE)
+	C2S(NL80211_CMD_UNPROT_DISASSOCIATE)
+	C2S(NL80211_CMD_NEW_PEER_CANDIDATE)
+	C2S(NL80211_CMD_GET_WOWLAN)
+	C2S(NL80211_CMD_SET_WOWLAN)
+	C2S(NL80211_CMD_START_SCHED_SCAN)
+	C2S(NL80211_CMD_STOP_SCHED_SCAN)
+	C2S(NL80211_CMD_SCHED_SCAN_RESULTS)
+	C2S(NL80211_CMD_SCHED_SCAN_STOPPED)
+	C2S(NL80211_CMD_SET_REKEY_OFFLOAD)
+	C2S(NL80211_CMD_PMKSA_CANDIDATE)
+	C2S(NL80211_CMD_TDLS_OPER)
+	C2S(NL80211_CMD_TDLS_MGMT)
+	C2S(NL80211_CMD_UNEXPECTED_FRAME)
+	C2S(NL80211_CMD_PROBE_CLIENT)
+	C2S(NL80211_CMD_REGISTER_BEACONS)
+	C2S(NL80211_CMD_UNEXPECTED_4ADDR_FRAME)
+	C2S(NL80211_CMD_SET_NOACK_MAP)
+	C2S(NL80211_CMD_CH_SWITCH_NOTIFY)
+	C2S(NL80211_CMD_START_P2P_DEVICE)
+	C2S(NL80211_CMD_STOP_P2P_DEVICE)
+	C2S(NL80211_CMD_CONN_FAILED)
+	C2S(NL80211_CMD_SET_MCAST_RATE)
+	C2S(NL80211_CMD_SET_MAC_ACL)
+	C2S(NL80211_CMD_RADAR_DETECT)
+	C2S(NL80211_CMD_GET_PROTOCOL_FEATURES)
+	C2S(NL80211_CMD_UPDATE_FT_IES)
+	C2S(NL80211_CMD_FT_EVENT)
+	C2S(NL80211_CMD_CRIT_PROTOCOL_START)
+	C2S(NL80211_CMD_CRIT_PROTOCOL_STOP)
+	C2S(NL80211_CMD_GET_COALESCE)
+	C2S(NL80211_CMD_SET_COALESCE)
+	C2S(NL80211_CMD_CHANNEL_SWITCH)
+	C2S(NL80211_CMD_VENDOR)
+	C2S(NL80211_CMD_SET_QOS_MAP)
+	C2S(NL80211_CMD_ADD_TX_TS)
+	C2S(NL80211_CMD_DEL_TX_TS)
+	C2S(NL80211_CMD_WIPHY_REG_CHANGE)
+	C2S(NL80211_CMD_PORT_AUTHORIZED)
+	C2S(NL80211_CMD_EXTERNAL_AUTH)
+	C2S(NL80211_CMD_STA_OPMODE_CHANGED)
+	C2S(NL80211_CMD_CONTROL_PORT_FRAME)
+	C2S(NL80211_CMD_UPDATE_OWE_INFO)
+	default:
+		return "NL80211_CMD_UNKNOWN";
+	}
+#undef C2S
+}
+
 static int
 mgmt_frame_in (struct nl_msg *msg, void *data)
 {
@@ -600,14 +726,37 @@ mgmt_frame_in (struct nl_msg *msg, void *data)
     
     nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
               genlmsg_attrlen(gnlh, 0), NULL);
+#if 0
+    if ((gnlh->cmd != NL80211_CMD_FRAME) &&
+        (gnlh->cmd != NL80211_CMD_FRAME_TX_STATUS) &&
+        (gnlh->cmd != NL80211_CMD_FRAME_WAIT_CANCEL)) {
+        fprintf(stderr, "mgmt_frame_in: got %s (%d)\n",
+                nl80211_command_to_string(gnlh->cmd), gnlh->cmd);
+        return NL_SKIP;
+    }
     if (tb[NL80211_ATTR_FRAME]) {
         frame = (struct ieee80211_mgmt_frame *)nla_data(tb[NL80211_ATTR_FRAME]);
         framesize = nla_len(tb[NL80211_ATTR_FRAME]);
         process_incoming_mgmt_frame(inf, frame, framesize);
     } else {
-        fprintf(stderr, "got something that's not a frame in mgmt_frame_in\n");
+        fprintf(stderr, "mgmt_frame_in() got something that's not a frame with %s\n",
+                nl80211_command_to_string(gnlh->cmd));
     }
-    
+#endif
+    switch (gnlh->cmd) {
+        case NL80211_CMD_FRAME:
+        case NL80211_CMD_FRAME_TX_STATUS:
+            frame = (struct ieee80211_mgmt_frame *)nla_data(tb[NL80211_ATTR_FRAME]);
+            framesize = nla_len(tb[NL80211_ATTR_FRAME]);
+            process_incoming_mgmt_frame(inf, frame, framesize);
+            break;
+        case NL80211_CMD_FRAME_WAIT_CANCEL:
+//            fprintf(stderr, "mgmt_frame_in() got a wait cancel!\n");
+            break;
+        default:
+            fprintf(stderr, "mgmt_frame_in() got a %s\n",
+                    nl80211_command_to_string(gnlh->cmd));
+    }
     return NL_SKIP;
 }
 
@@ -872,7 +1021,11 @@ cons_action_frame (unsigned char field, unsigned char *mymac, unsigned char *pee
             return -1;
         }
         nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, inf->freq);
-        nla_put_u32(msg, NL80211_ATTR_DURATION, 500);
+        if (field == PUB_ACTION_VENDOR) {
+            nla_put_u32(msg, NL80211_ATTR_DURATION, 500);
+        } else {
+            nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+        }
         if (inf->offchan_tx_ok) {
             nla_put_flag(msg, NL80211_ATTR_OFFCHANNEL_TX_OK);
         }
@@ -923,13 +1076,13 @@ change_freq (unsigned char *mac, unsigned long freak)
         return 1;
     }
 
-    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_WIPHY)) == NULL) {
+    if ((msg = get_nl_msg(inf, 0, NL80211_CMD_SET_CHANNEL)) == NULL) {
         fprintf(stderr, "can't allocate an nl_msg!\n");
         return -1;
     }
     nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
     nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+//    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
     cookie = 0;
 
     if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {
@@ -1201,7 +1354,7 @@ find_dpp_conie (unsigned char *ie, int ielen) {
             memcpy(blah, data, len);
         }
         if (memcmp(ie, dpp_config_conn, sizeof(dpp_config_conn)) == 0) {
-            printf("FOUND THE DPP CONFIGURATOR CONNECTIVITY IE on %s!!!\n", blah);
+            printf("FOUND THE DPP CONFIGURATOR CONNECTIVITY IE on %s, ", blah);
             return 1;
         }
         ielen -= ie[1] + 2;
@@ -1209,6 +1362,21 @@ find_dpp_conie (unsigned char *ie, int ielen) {
     }
     printf("didn't find the DPP Configurator connectivity IE on %s\n", blah);
     return 0;
+}
+
+static unsigned char
+freq2chan (unsigned long freq)
+{
+    if (freq == 2484) {                 /* chan 14 */
+        return 14;
+    }
+    if (freq < 2473) {                  /* chan 0-13 */
+        return ((freq - 2407)/5);
+    }
+    if (freq < 2733) {                  /* chan 15-26 */
+        return (((freq - 2512)/20) + 15);
+    }
+    return ((freq - 5000)/5);
 }
 
 static int
@@ -1251,6 +1419,7 @@ callback_dump(struct nl_msg *msg, void *arg)
     if (find_dpp_conie(nla_data(bss[NL80211_BSS_INFORMATION_ELEMENTS]),
                        nla_len(bss[NL80211_BSS_INFORMATION_ELEMENTS])) > 0) {
         freq = nla_get_u32(bss[NL80211_BSS_FREQUENCY]);
+        printf("on frequency %d, channel %d\n", freq, freq2chan(freq));
         dpp_add_chirp_freq(inf->bssid, freq);
     }
     
@@ -1554,6 +1723,7 @@ capabilities_handler (struct nl_msg *msg, void *arg)
     } else {
         inf->max_roc = 5000;
     }
+    printf("max ROC is %ld\n", inf->max_roc);
     return NL_SKIP;
 }
 
@@ -1857,10 +2027,11 @@ fin:
  * called by enrollees when they finish DPP
  */
 void
-term (unsigned short reason)
+term (unsigned short reason, dpp_handle handle)
 {
     if (quit_at_fin) {
         printf("DPP is terminating...\n");
+        dpp_free_peer(handle);
         exit(reason);
     } else {
         printf("DPP has ended...\n");

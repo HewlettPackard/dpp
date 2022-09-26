@@ -177,7 +177,8 @@ struct candidate {
     EC_POINT *peernewproto;             /* if Configurator asks for a new protocol key */
     EC_KEY *mynewproto;
     int newprimelen;                    /* size of new group */
-    int nextfragment;
+    int nextfragment;                   /* where in the buffer we're doing frag/reass */
+    int nextid;                         /* next expected fragment id (used by enrollees) */
     char enrollee_name[80];
     char enrollee_role[10];
     char *p7;
@@ -203,8 +204,8 @@ struct candidate {
  * stuff that gets provisioned when we are an enrollee
  */
 static EC_KEY *netaccesskey;
-static char *connector;
-static int connector_len;
+static char *connector = NULL;
+static int connector_len = 0;
 static unsigned char discovery_transaction = 0;
 static EC_KEY *configurator_signkey;   /* we're an enrollee, this isn't ours */
 static unsigned char csign_kid[KID_LENGTH];
@@ -629,7 +630,7 @@ next_dpp_chirp (timerid id, void *data)
      * next!
      */
     peer->chirpto = TAILQ_NEXT(peer->chirpto, entry);
-    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), next_dpp_chirp, peer);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), next_dpp_chirp, peer);
     return;
 }
 
@@ -688,14 +689,16 @@ fin:
      * keep chirping, when we get a response we'll stop
      */
     peer->chirpto = TAILQ_NEXT(peer->chirpto, entry);
-    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), next_dpp_chirp, peer);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), next_dpp_chirp, peer);
     return;
 }
 
 static void
-send_term_notice (timerid id, void *unused)
+send_term_notice (timerid id, void *data)
 {
-    term(0);
+    struct candidate *peer = (struct candidate *)data;
+    
+    term(0, peer->handle);
 }
 
 static void
@@ -717,6 +720,9 @@ destroy_peer (timerid id, void *data)
     EC_KEY_free(peer->peer_bootstrap);
     BN_free(peer->m);
     free(peer->frame);
+    if (connector != NULL) {
+        free(connector);
+    }
     /*
      * zero out our secrets and other goo
      */
@@ -725,7 +731,7 @@ destroy_peer (timerid id, void *data)
     memset(peer->ke, 0, SHA512_DIGEST_LENGTH);
     memset(peer->peernonce, 0, SHA512_DIGEST_LENGTH/2);
     memset(peer->mynonce, 0, SHA512_DIGEST_LENGTH/2);
-    memset(peer->buffer, 0, 2048);
+    memset(peer->buffer, 0, 8192);
     TAILQ_REMOVE(&dpp_instance.peers, peer, entry);
     free(peer);
     return;
@@ -808,12 +814,6 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
               field == GAS_COMEBACK_RESPONSE ? "GAS_COMEBACK_RESPONSE" : "unknown");
     switch (field) {
         case GAS_INITIAL_REQUEST:
-            if (peer->bufferlen > peer->mtu) {
-                dpp_debug(DPP_DEBUG_ERR, "GAS_INITIAL_REQUESTs cannot be fragmented. "
-                          "Buffer is %d, MTU is only %d. Aborting exchange\n",
-                          peer->bufferlen, peer->mtu);
-                return 0;
-            }
             /*
              * fill in the generic header goo
              */
@@ -824,7 +824,6 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
             /*
              * fill in the response
              */
-            dpp_debug(DPP_DEBUG_TRACE, "initial request is %d bytes (mtu is %d)\n", peer->bufferlen, peer->mtu);
             gareq->query_reqlen = peer->bufferlen;
             memcpy(gareq->query_req, peer->buffer, peer->bufferlen);
             peer->field = field;
@@ -895,9 +894,9 @@ send_dpp_config_frame (struct candidate *peer, unsigned char field)
                  * record how big the next chunk will be
                  */
                 gacresp->comeback_delay = 0;
-                gacresp->fragment_id = peer->nextfragment/peer->mtu;
-                if ((peer->bufferlen - peer->nextfragment) > peer->mtu) {
-                    gacresp->query_resplen = peer->mtu;
+                gacresp->fragment_id = peer->nextfragment/(peer->mtu - sizeof(gas_action_comeback_resp_frame));
+                if ((peer->bufferlen - peer->nextfragment) > (peer->mtu - sizeof(gas_action_comeback_resp_frame))) {
+                    gacresp->query_resplen = peer->mtu - sizeof(gas_action_comeback_resp_frame);
                     gacresp->fragment_id |= 0x80;   // more fragments!
                     dpp_debug(DPP_DEBUG_TRACE, "\t(next fragment of %d (%d), there are more...\n",
                               gacresp->query_resplen, gacresp->fragment_id);
@@ -2507,7 +2506,7 @@ send_dpp_config_result (struct candidate *peer, unsigned char status)
     tlv = TLV_set_tlv(tlv, ENROLLEE_NONCE, dpp_instance.noncelen, peer->enonce);
     
     ieeeize_hton_attributes(wraptlv->value + AES_BLOCK_SIZE,
-                            (unsigned char *)tlv - (unsigned char *)(wraptlv->value + AES_BLOCK_SIZE));
+                            (int)((unsigned char *)tlv - (unsigned char *)(wraptlv->value + AES_BLOCK_SIZE)));
 
     setup_dpp_action_frame(peer, DPP_CONFIG_RESULT);
     switch(dpp_instance.digestlen) {
@@ -2928,7 +2927,7 @@ problemo:
     /*
      * ieee-ize the attributes that get encrypted
      */
-    ieeeize_hton_attributes(encrypt_ptr, ((unsigned char *)tlv - encrypt_ptr));
+    ieeeize_hton_attributes(encrypt_ptr, (int)(((unsigned char *)tlv - encrypt_ptr)));
 
     /*
      * in case something failed and the status got reset, set the status again
@@ -2938,7 +2937,7 @@ problemo:
     /*
      * ...and then ieee-ize the attributes that don't get encrypted
      */
-    ieeeize_hton_attributes(peer->buffer, ((unsigned char *)tlv - peer->buffer));
+    ieeeize_hton_attributes(peer->buffer, (int)(((unsigned char *)tlv - peer->buffer)));
 
     switch(dpp_instance.digestlen) {
         case SHA256_DIGEST_LENGTH:
@@ -3156,7 +3155,7 @@ send_dpp_config_req_frame (struct candidate *peer)
      * put the attributes into ieee-order
      */
     ieeeize_hton_attributes((((TLV *)peer->buffer)->value + AES_BLOCK_SIZE),
-                            (unsigned char *)tlv - (((TLV *)peer->buffer)->value + AES_BLOCK_SIZE));
+                            (int)((unsigned char *)tlv - (((TLV *)peer->buffer)->value + AES_BLOCK_SIZE)));
     
     switch(dpp_instance.digestlen) {
         case SHA256_DIGEST_LENGTH:
@@ -3175,6 +3174,7 @@ send_dpp_config_req_frame (struct candidate *peer)
      * fill in the lengths now that we have constructed the frame...
      */
     peer->bufferlen = (int)((unsigned char *)tlv - peer->buffer);
+
     tlv = (TLV *)peer->buffer;
     /*
      * only 1 attribute to put into ieee-order...
@@ -3187,7 +3187,7 @@ send_dpp_config_req_frame (struct candidate *peer)
 
     if (send_dpp_config_frame(peer, GAS_INITIAL_REQUEST)) {
         peer->retrans = 0;
-        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+        peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
     }
     ret = 1;
 
@@ -3203,7 +3203,7 @@ cameback_delayed (timerid id, void *data)
     struct candidate *peer = (struct candidate *)data;
 
     send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
-    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+    peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
 }
 
 static int
@@ -4109,6 +4109,12 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
     srv_rem_timeout(srvctx, peer->t0);
 
     if (peer->core == DPP_CONFIGURATOR) {
+        printf("processing config frame %s for peer in %s\n",
+               field == GAS_INITIAL_REQUEST ? "initial request" :
+               field == GAS_COMEBACK_REQUEST ? "comeback response" :
+               field == BAD_DPP_SPEC_MESSAGE ? "config result" : "unknown",
+               state_to_string(peer->state));
+
         switch (peer->state) {
             case DPP_AUTHENTICATED:
                 if (field != GAS_INITIAL_REQUEST) {
@@ -4168,7 +4174,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                              * with the CONFIG RESULT
                              */
                             if (peer->nextfragment < peer->bufferlen) {
-                                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
                             } else if (peer->version > 1) {
                                 peer->t0 = srv_add_timeout(srvctx, SRV_SEC(10), retransmit_config, peer);
                             }
@@ -4197,9 +4203,10 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                 dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_REQUEST (we're still pending)...\n");
                 send_dpp_config_frame(peer, GAS_COMEBACK_RESPONSE);
                 /*
-                 * set a timer here for the same reason we did it above, prevent zombies
+                 * set a timer here for the same reason we did it above, prevent zombies,
+                 * but set it big so we don't retransmit while waiting for the CA
                  */
-                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                peer->t0 = srv_add_timeout(srvctx, SRV_SEC(10), retransmit_config, peer);
                 break;
             case DPP_PROVISIONED:
                 dpp_debug(DPP_DEBUG_ERR, "already provisioned!\n");
@@ -4250,12 +4257,21 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                              * otherwise the response is going to be fragmented, ask for 1st fragment
                              */
                             send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
-                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
                         }
                         break;
                     case GAS_COMEBACK_RESPONSE:
-                        dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_RESPONSE...\n");
                         gacrp = (gas_action_comeback_resp_frame *)data;
+                        dpp_debug(DPP_DEBUG_TRACE, "got a GAS_COMEBACK_RESPONSE... frag #%d\n", gacrp->fragment_id&0x7f);
+                        if (peer->nextid &&
+                            (peer->nextid != (gacrp->fragment_id&0x7f))) {
+                            dpp_debug(DPP_DEBUG_ERR, "dropping fragment %d, already seen (%d)!\n", gacrp->fragment_id&0x7f,
+                                      peer->nextid);
+                            return -1;
+                        }
+                        peer->nextid = (int)(gacrp->fragment_id&0x7f) + 1;
+                        dpp_debug(DPP_DEBUG_TRACE, "fragment id is %d, and next is %d\n",
+                                  (int)(gacrp->fragment_id&0x7f), peer->nextid);
                         if (memcmp(gacrp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
                             memcmp(gacrp->ad_proto_id, dpp_proto_id, sizeof(dpp_proto_id))) {
                             dpp_debug(DPP_DEBUG_ERR, "got an gas action frame, not a dpp config frame\n");
@@ -4290,7 +4306,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                         if (gacrp->fragment_id & 0x80) {
                             dpp_debug(DPP_DEBUG_TRACE, "ask for next fragment\n");
                             send_dpp_config_frame(peer, GAS_COMEBACK_REQUEST);
-                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(2), retransmit_config, peer);
+                            peer->t0 = srv_add_timeout(srvctx, SRV_SEC(5), retransmit_config, peer);
                         } else {
                             dpp_debug(DPP_DEBUG_TRACE, "final fragment, %d total\n", peer->nextfragment);
                             if (process_dpp_config_response(peer, peer->buffer, peer->nextfragment) < 1) {
@@ -4336,6 +4352,8 @@ start_config_protocol (timerid id, void *data)
 {
     struct candidate *peer = (struct candidate *)data;
     dpp_debug(DPP_DEBUG_TRACE, "beginning DPP Config protocol\n");
+    peer->nextid = 0;
+    memset(peer->frame, 0, peer->mtu);
     send_dpp_config_req_frame(peer);
     peer->state = DPP_PROVISIONING;
 }
@@ -4958,7 +4976,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         /*
          * now ieee-ize the TLVs in the primary wrapping
          */
-        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, ptr - (primary + AES_BLOCK_SIZE));
+        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, (int)(ptr - (primary + AES_BLOCK_SIZE)));
         /*
          * and encrypt the whole thing with k2
          */
@@ -4991,7 +5009,7 @@ send_dpp_auth_response (struct candidate *peer, unsigned char status)
         /*
          * now ieee-ize the TLVs in the primary wrapping
          */
-        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, ptr - (primary + AES_BLOCK_SIZE));
+        ieeeize_hton_attributes(primary + AES_BLOCK_SIZE, (int)(ptr - (primary + AES_BLOCK_SIZE)));
         
         switch(dpp_instance.digestlen) {
             case SHA256_DIGEST_LENGTH:
@@ -5587,7 +5605,7 @@ process_dpp_auth_response (struct candidate *peer, dpp_action_frame *frame, int 
     /*
      * ...put the AAD back into ieee-order and unwrap it
      */
-    ieeeize_hton_attributes(attrs, ((unsigned char *)tlv - attrs));
+    ieeeize_hton_attributes(attrs, (int)(((unsigned char *)tlv - attrs)));
     if (siv_decrypt(&ctx, ptr, ptr, primarywraplen, TLV_value(tlv),
                     2, frame, sizeof(dpp_action_frame), attrs, ((unsigned char *)tlv - attrs)) < 1) {
         dpp_debug(DPP_DEBUG_ERR, "can't decrypt primary blob in DPP Auth Resp!\n");
@@ -6183,7 +6201,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
             free(peer);
             return -1;
         }
-        peer->mtu = mtu;
+        peer->mtu = mtu - sizeof(struct ieee80211_mgmt_frame);
     } else {
         peer->mtu = 8192;
     }
@@ -6195,10 +6213,10 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     peer->is_initiator = initiator;
     if (peer->is_initiator) {
         peer->version = 3;              /* we can do v3 now, so state it up front */
-        RAND_bytes(peer->enonce, dpp_instance.noncelen);
     } else {
         peer->version = 1;              /* leave it up to the initiator, assume the worst */
     }
+    RAND_bytes(peer->enonce, dpp_instance.noncelen);
     dpp_debug(DPP_DEBUG_TRACE, "we %s the initiator, version is %d\n",
               peer->is_initiator ? "are" : "are not", peer->version);
     
@@ -6270,7 +6288,10 @@ dpp_free_peer (dpp_handle handle)
         dpp_debug(DPP_DEBUG_ERR, "no peer found with handle %d\n", handle);
         return;
     }
-    (void)srv_add_timeout(srvctx, SRV_USEC(1), destroy_peer, peer);
+    /*
+     * no need to add a timeout, just destroy it
+     */
+    destroy_peer(0, peer);
     return;
 }
 

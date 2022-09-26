@@ -116,8 +116,6 @@ int port = 8443;
 typedef int SOCKET;
 #define WINCDECL
 
-#include <openssl/ec.h>
-#include "utils.h"
 #include "cette.h"
 
 #define MAX_OPTIONS 40
@@ -2288,9 +2286,9 @@ static void send_ssi_file(struct mg_connection *conn, const char *path,
 static void
 mg_bskey (struct mg_connection *conn)
 {
-    char *msg, *dppuri, mac[20], *str1, *str2, key[250], uri[250], *sstr, *estr;
+    char *msg, *dppuri, mac[20], *str1, *str2, key[250];
     struct vec mime_vec;
-    int len, next, class, channel, ntok;
+    int len, next, class, channel;
     FILE *fp;
 
     if (conn->content_len < 1) {
@@ -2303,14 +2301,9 @@ mg_bskey (struct mg_connection *conn)
         goto no_workypoo;
     }
     len = mg_read(conn, msg, conn->content_len);
+    printf("just read %d bytes from the connection\n", len);
 
-    if ((ntok = get_json_data((char *)msg, len, &sstr, &estr, 1, "dppUri")) != 1) {
-        fprintf(stderr, "failed to find dppUri in json!\n");
-        goto no_workypoo;
-    }
-    snprintf(uri, (int)(estr - sstr)+1, "%s", sstr);
-//    printf("dppUri is %s\n", uri);
-
+    printf("read:\n\t%s\nadding to the URI database\n", msg);
     if ((fp = mg_fopen(conn->ctx->config[BSKEYFILE], "a+")) == NULL) {
         fprintf(stderr, "can't open bootstrap key file %s\n",
                 conn->ctx->config[BSKEYFILE]);
@@ -2329,8 +2322,14 @@ mg_bskey (struct mg_connection *conn)
     /*
      * parse the DPP URI for the stuff we want to put into the file....
      */
+    if ((dppuri = strstr(msg, "dppuri=")) == NULL) {
+        fprintf(stderr, "can't find DPPURI in message\n");
+        goto no_workypoo;
+    }
+    dppuri += 7;        /* skip past the key to the value */
+
     next++;
-    if ((str1 = strstr(uri, "C:")) != NULL) {
+    if ((str1 = strstr(dppuri, "C:")) != NULL) {
         if ((str2 = strstr(str1+2, ";")) == NULL) {
             fprintf(stderr, "error parsing for class/channel in %s\n", dppuri);
             goto no_workypoo;
@@ -2339,7 +2338,7 @@ mg_bskey (struct mg_connection *conn)
     } else {
         class = channel = 0;
     }
-    if ((str1 = strstr(uri, "M:")) != NULL) {
+    if ((str1 = strstr(dppuri, "M:")) != NULL) {
         if ((str2 = strstr(str1+2, ";")) == NULL) {
             fprintf(stderr, "error parsing for MAC address in %s\n", dppuri);
             goto no_workypoo;
@@ -2349,7 +2348,7 @@ mg_bskey (struct mg_connection *conn)
     } else {
         strcpy(mac, "ffffffffffff");
     }
-    if ((str1 = strstr(uri, "K:")) != NULL) {
+    if ((str1 = strstr(dppuri, "K:")) != NULL) {
         if ((str2 = strstr(str1+2, ";")) == NULL) {
             fprintf(stderr, "error parsing for key in %s\n", dppuri);
             goto no_workypoo;
