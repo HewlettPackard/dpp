@@ -120,11 +120,11 @@ skip_array (jsmntok_t *t)
 static int
 find_token (jsmntok_t *toks, int *n, int ntoks, char *buffer, char *str)
 {
-    int num;
+    int i, num;
     jsmntok_t *tok;
     
     num = *n;
-    while (num < ntoks) {
+    for (i = 0; i < ntoks; i++) {
         tok = &toks[num];
         if (tok == NULL) {
             return -1;
