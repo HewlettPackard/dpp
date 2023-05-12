@@ -125,6 +125,9 @@ find_token (jsmntok_t *toks, int *n, int ntoks, char *buffer, char *str)
     
     num = *n;
     for (i = 0; i < ntoks; i++) {
+//        if (num > (*n + ntoks)) {
+//            return -1;
+//        }
         tok = &toks[num];
         if (tok == NULL) {
             return -1;
@@ -138,7 +141,8 @@ find_token (jsmntok_t *toks, int *n, int ntoks, char *buffer, char *str)
         /*
          * see if it's the one we want
          */
-        if (memcmp(str, buffer + TOKSTART(tok), strlen(str)) == 0) {
+        if ((strlen(str) == TOKLEN(tok)) &&
+            memcmp(str, buffer + TOKSTART(tok), strlen(str)) == 0) {
             *n = num;
             return num;
         }
@@ -184,9 +188,10 @@ get_json_data (char *buf, int buflen, char **start, char **end,
     if ((ntoks = jsmn_parse(&p, buf, buflen, NULL, 200)) == 0) {
         return 0;
     }
-    if ((toks = (jsmntok_t *)malloc(ntoks * sizeof(jsmntok_t))) == NULL) {
+    if ((toks = (jsmntok_t *)malloc((ntoks+1) * sizeof(jsmntok_t))) == NULL) {
         return -1;
     }
+    memset(toks, 0, (ntoks+1)*sizeof(jsmntok_t));
     jsmn_init(&p);
     if ((ntoks = jsmn_parse(&p, buf, buflen, toks, ntoks)) == 0) {
         goto fin;
@@ -596,6 +601,7 @@ generate_connector (unsigned char *connector, int len, EC_GROUP *group, EC_POINT
      * generate the connector body (the JWS Payload)
      */
     nid = EC_GROUP_get_curve_name(group);
+
     memset(buf, 0, sizeof(buf));
     buflen = snprintf(buf, sizeof(buf)-1,
                       "{\"groups\":[{\"groupId\":\"interop\",\"netRole\":\"%s\"}],"
@@ -875,11 +881,11 @@ EC_POINT *get_point_from_connector (unsigned char *connector, int len, const EC_
     BN_bin2bn((unsigned char *)unbpt, unbptlen, y);
 
     if (!EC_POINT_set_affine_coordinates_GFp(group, P, x, y, bnctx)) {
-        printf("can't set affine coordinates!\n");
+        fprintf(stderr, "can't set affine coordinates!\n");
         goto fail;
     }
     if (!EC_POINT_is_on_curve(group, P, bnctx)) {
-        printf("point is not on the curve!\n");
+        fprintf(stderr,"point is not on the curve!\n");
         goto fail;
     }
 

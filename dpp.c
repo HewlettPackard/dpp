@@ -1550,7 +1550,7 @@ gen_csrattrs (char *resp)
     num = BIO_get_mem_data(bio, &data);
     memcpy(resp, data, num);
     resp[num] = '\0';
-    dpp_debug(DPP_DEBUG_TRACE, "adding %d byte CSR %s\n", num, resp);
+    dpp_debug(DPP_DEBUG_TRACE, "adding %d byte CSRattr request %s\n", num, resp);
 fail:    
     if (buf != NULL) {
         free(buf);
@@ -1722,7 +1722,7 @@ get_set (const unsigned char **p, int len)
 static int
 generate_csr (struct candidate *peer, char **csr)
 {
-    int i, challp_len, pkey_id, tag, xclass, inf, asn1len, csrlen = -1;
+    int challp_len, pkey_id, tag, xclass, inf, asn1len, csrlen = -1;
     int nid, keylen = 2048, crypto_nid;
     const EVP_MD *md = EVP_sha256();
     const unsigned char *tot, *op;
@@ -1739,7 +1739,7 @@ generate_csr (struct candidate *peer, char **csr)
     X509_NAME *subj = NULL;
     X509_REQ *req = NULL;
     long len, length;
-    EVP_ENCODE_CTX *ctx;
+//    EVP_ENCODE_CTX *ctx;
     setval *values, *value;
     STACK_OF(X509_EXTENSION) *exts = NULL;
     STACK_OF(ASN1_OBJECT) *sk = NULL;
@@ -2268,6 +2268,7 @@ gen_csr:
         goto csr_fail;
     }
 
+#if 0
     if ((ctx = EVP_ENCODE_CTX_new()) == NULL) {
         goto csr_fail;
     }
@@ -2280,8 +2281,11 @@ gen_csr:
     EVP_EncodeFinal(ctx, (unsigned char *)&((*csr)[i]), &i);
     csrlen += i;
     EVP_ENCODE_CTX_free(ctx);
-        
-    (*csr)[csrlen] = '\0';
+#else
+    memset(*csr, 0, 2*asn1len);
+    csrlen = EVP_EncodeBlock((unsigned char *)*csr, p, asn1len);
+#endif
+//    (*csr)[csrlen] = '\0';
     dpp_debug(DPP_DEBUG_TRACE, "CSR is %d chars:\n%s\n", csrlen, *csr);
 csr_fail:
     X509_REQ_free(req);
@@ -3412,12 +3416,18 @@ check_connector (struct candidate *peer, unsigned char *blob, int len)
         dpp_debug(DPP_DEBUG_ERR, "signature on connector is bad!\n");
         goto fin;
     }
-    connector_len = (int)(estr - sstr);
-    if ((connector = malloc(connector_len)) == NULL) {
-        dpp_debug(DPP_DEBUG_ERR, "unable to allocate a connector!\n");
-        goto fin;
+    if (connector == NULL) {
+        /*
+         * if there are multiple AKMs we can go through this multiple times,
+         * don't allocate a connector a second time
+         */
+        connector_len = (int)(estr - sstr);
+        if ((connector = malloc(connector_len)) == NULL) {
+            dpp_debug(DPP_DEBUG_ERR, "unable to allocate a connector!\n");
+            goto fin;
+        }
+        memcpy(connector, sstr, connector_len);
     }
-    memcpy(connector, sstr, connector_len);
     ret = 1;
 fin:
     if (ret < 1) {
@@ -4269,7 +4279,6 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                                       peer->nextid);
                             return -1;
                         }
-                        peer->nextid = (int)(gacrp->fragment_id&0x7f) + 1;
                         dpp_debug(DPP_DEBUG_TRACE, "fragment id is %d, and next is %d\n",
                                   (int)(gacrp->fragment_id&0x7f), peer->nextid);
                         if (memcmp(gacrp->ad_proto_elem, dpp_proto_elem_resp, 2) ||
@@ -4290,6 +4299,7 @@ process_dpp_config_frame (unsigned char field, unsigned char *data, int len, dpp
                             srv_add_timeout(srvctx, SRV_MSEC(gacrp->comeback_delay), cameback_delayed, peer);
                             return 1;
                         }
+                        peer->nextid = (int)(gacrp->fragment_id&0x7f) + 1;
                         if ((peer->nextfragment + gacrp->query_resplen) > sizeof(peer->buffer)) {
                             dpp_debug(DPP_DEBUG_ERR, "a bit too many fragments\n");
                         }
@@ -6194,6 +6204,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     peer->mauth = initiator ? 1 : mutualauth;   /* initiator changes, responder set */
     peer->csrattrs = NULL;
     peer->csrattrs_len = 0;
+    memset(peer->enrollee_name, 0, sizeof(peer->enrollee_name));
 
     if (mtu) {
         if (mtu > 8192) {
@@ -6252,6 +6263,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     configurator_signkey = NULL;  // even if this is a configurator, used by discovery
     connector = NULL;
     connector_len = 0;
+    memset(peer->enrollee_role, 0, sizeof(peer->enrollee_role));
     peer->state = DPP_BOOTSTRAPPED;
     TAILQ_INSERT_HEAD(&dpp_instance.peers, peer, entry);
 
@@ -6434,7 +6446,7 @@ dpp_initialize (int core, char *keyfile, char *signkeyfile, int newgrp,
             dpp_instance.enterprise = 0;
         } else {
             strcpy(dpp_instance.caip, caip);
-            dpp_debug(DPP_DEBUG_TRACE, "got a %d byte cert from CA at %s\n",
+            dpp_debug(DPP_DEBUG_TRACE, "got a %d byte cert from CA (via %s)\n",
                       dpp_instance.cacert_len, caip);
         }
     }

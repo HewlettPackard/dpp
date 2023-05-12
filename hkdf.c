@@ -44,7 +44,8 @@ hkdf_extract (const EVP_MD *h,
               unsigned char *prk)               // prklen depnds on h
 {
     unsigned char *tweak;
-    int prklen, tweaklen;
+    unsigned int prklen;
+    int tweaklen;
     HMAC_CTX *ctx;
 
     prklen = EVP_MD_size(h);
@@ -81,7 +82,8 @@ hkdf_expand (const EVP_MD *h,
 {
     HMAC_CTX *ctx;
     unsigned char ctr, *digest;
-    int len, digestlen;
+    int len;
+    unsigned int digestlen;
 
     digestlen = EVP_MD_size(h);
     if ((digest = (unsigned char *)malloc(digestlen)) == NULL) {

@@ -1082,7 +1082,7 @@ change_freq (unsigned char *mac, unsigned long freak)
     }
     nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, freak);
     nla_put_u32(msg, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_NO_HT);
-//    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
+    nla_put_u32(msg, NL80211_ATTR_DURATION, inf->max_roc);
     cookie = 0;
 
     if (send_nl_msg(msg, inf, cookie_handler, &cookie)) {

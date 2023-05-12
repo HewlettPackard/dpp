@@ -168,7 +168,7 @@ get_cacerts (char **cap7, char *caip)
  * sends a PKCS10 to the CA
  *
  * gets passed p10, length of p10, IP address of CA, some data to pass
- * to a callback when the PKCS7 is ready, and the callback to call
+ * to a callback when the PKCS7 is ready, and the callback to call.
  *
  * returns the socket (which should be treated as an opaque indicator of
  * success or failure), we'll get it back when the callback is called.
