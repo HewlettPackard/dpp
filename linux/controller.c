@@ -332,7 +332,7 @@ save_bootstrap_key (pkex_handle handle, void *param)
     unsigned char *ptr, mac[2*ETH_ALEN];
     int ret = -1, oc, ch, len, octets;
     EC_KEY *peerbskey = (EC_KEY *)param;
-    struct conversation *conv;
+    struct conversation *conv = NULL;
     
     TAILQ_FOREACH(conv, &conversations, entry) {
         if (handle == conv->handle) {

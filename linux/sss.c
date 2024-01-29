@@ -154,7 +154,7 @@ dump_ssid (struct ieee80211_mgmt_frame *frame, int len)
 struct dpp_instance *
 find_instance_by_mac (unsigned char *me, unsigned char *peer)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
@@ -178,7 +178,7 @@ find_instance_by_mac (unsigned char *me, unsigned char *peer)
 struct dpp_instance *
 find_instance_by_handle (dpp_handle handle)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
         if (found->handle == handle) {
@@ -194,7 +194,7 @@ find_instance_by_handle (dpp_handle handle)
 struct dpp_instance *
 find_instance_by_tid (unsigned char tid)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
         if (found->tid == tid) {
@@ -252,7 +252,7 @@ create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
 struct pkex_instance *
 find_pkex_instance_by_mac (unsigned char *me)
 {
-    struct pkex_instance *found;
+    struct pkex_instance *found = NULL;
     
     TAILQ_FOREACH(found, &pkex_instances, entry) {
         if (memcmp(found->mymac, me, ETH_ALEN) == 0) {
@@ -269,7 +269,7 @@ find_pkex_instance_by_mac (unsigned char *me)
 struct pkex_instance *
 find_pkex_instance_by_handle (pkex_handle handle)
 {
-    struct pkex_instance *found;
+    struct pkex_instance *found = NULL;
     
     TAILQ_FOREACH(found, &pkex_instances, entry) {
         if (found->handle == handle) {
@@ -1060,7 +1060,7 @@ change_freq (unsigned char *mac, unsigned long freak)
 {
     struct nl_msg *msg;
     unsigned long long cookie;
-    struct interface *inf;
+    struct interface *inf = NULL;
     
     TAILQ_FOREACH(inf, &interfaces, entry) {
         if (memcmp(mac, inf->bssid, ETH_ALEN) == 0) {

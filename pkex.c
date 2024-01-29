@@ -1949,7 +1949,7 @@ pkex_update_macs (pkex_handle handle, unsigned char *mymac, unsigned char *peerm
 void
 pkex_initiate(pkex_handle handle) 
 {
-    struct pkex_peer *peer;
+    struct pkex_peer *peer = NULL;
 
     TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
         if (peer->handle == handle) {
@@ -1970,7 +1970,7 @@ pkex_initiate(pkex_handle handle)
 void
 pkex_destroy_peer (pkex_handle handle)
 {
-    struct pkex_peer *peer;
+    struct pkex_peer *peer = NULL;
 
     TAILQ_FOREACH(peer, &pkex_instance.peers, entry) {
         if (peer->handle == handle) {

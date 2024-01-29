@@ -1280,7 +1280,7 @@ change_freq (unsigned char *mac, unsigned long freak)
 {
     struct nl_msg *msg;
     unsigned long long cookie;
-    struct interface *inf;
+    struct interface *inf = NULL;
     
     TAILQ_FOREACH(inf, &interfaces, entry) {
         if (memcmp(mac, inf->bssid, ETH_ALEN) == 0) {

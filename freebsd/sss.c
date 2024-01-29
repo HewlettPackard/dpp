@@ -125,7 +125,7 @@ dump_ssid (struct ieee80211_mgmt_frame *frame, int len)
 struct dpp_instance *
 find_instance_by_mac (unsigned char *me, unsigned char *peer)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     unsigned char broadcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
@@ -149,7 +149,7 @@ find_instance_by_mac (unsigned char *me, unsigned char *peer)
 struct dpp_instance *
 find_instance_by_handle (dpp_handle handle)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
         if (found->handle == handle) {
@@ -165,7 +165,7 @@ find_instance_by_handle (dpp_handle handle)
 struct dpp_instance *
 find_instance_by_tid (unsigned char tid)
 {
-    struct dpp_instance *found;
+    struct dpp_instance *found = NULL;
     
     TAILQ_FOREACH(found, &dpp_instances, entry) {
         if (found->tid == tid) {
@@ -217,7 +217,7 @@ create_discovery_instance (unsigned char *mymac, unsigned char *peermac)
 struct pkex_instance *
 find_pkex_instance_by_mac (unsigned char *me)
 {
-    struct pkex_instance *found;
+    struct pkex_instance *found = NULL;
     
     TAILQ_FOREACH(found, &pkex_instances, entry) {
         if (memcmp(found->mymac, me, ETH_ALEN) == 0) {
@@ -234,7 +234,7 @@ find_pkex_instance_by_mac (unsigned char *me)
 struct pkex_instance *
 find_pkex_instance_by_handle (pkex_handle handle)
 {
-    struct pkex_instance *found;
+    struct pkex_instance *found = NULL;
     
     TAILQ_FOREACH(found, &pkex_instances, entry) {
         if (found->handle == handle) {
@@ -1183,7 +1183,7 @@ change_channel (unsigned char *mymac, unsigned char class, unsigned char channel
     struct ieee80211req ireq;
     struct ifmediareq ifmreq;
     struct ieee80211req_chaninfo chans;
-    struct interface *inf;
+    struct interface *inf = NULL;
 
     /*
      * find the interface whose radio we're gonna muck with
@@ -1325,6 +1325,7 @@ change_dpp_freq (dpp_handle handle, unsigned long freq)
         return -1;
     }
     channel = freq2chan(freq);
+    maxregs = (sizeof(regulatory)/sizeof(struct _regulatory));
     for (i = 0; i < maxregs; i++) {
         /*
          * go through all the classes for this channel and if one of
