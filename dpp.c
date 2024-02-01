@@ -2326,6 +2326,7 @@ dump_key_con (struct candidate *peer, char *ssid, int ssidlen)
     }
     if ((buf = malloc(connector_len + 1)) == NULL) {
         dpp_debug(DPP_DEBUG_ERR, "unable to copy the connector!\n");
+        fclose(fp);
         return;
     }
     memcpy(buf, connector, connector_len);
@@ -6273,7 +6274,7 @@ dpp_create_peer (char *keyb64, int initiator, int mutualauth, int mtu)
     if (peer->is_initiator) {
         peer->t0 = srv_add_timeout(srvctx, SRV_MSEC(200), init_dpp_auth, peer);
     } else if (do_chirp) {
-        struct chirpdest *chirpto;
+        struct chirpdest *chirpto = NULL;
 
         dpp_debug(DPP_DEBUG_TRACE, "chirp list:\n");
         TAILQ_FOREACH(chirpto, &chirpdests, entry) {
@@ -6310,7 +6311,7 @@ dpp_free_peer (dpp_handle handle)
 void
 dpp_add_chirp_freq (unsigned char *bssid, unsigned long freq)
 {
-    struct chirpdest *chirpto;
+    struct chirpdest *chirpto = NULL;
 
     /*
      * see if this frequency is already on the list

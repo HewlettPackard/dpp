@@ -92,6 +92,7 @@ hkdf_expand (const EVP_MD *h,
     }
     if ((ctx = HMAC_CTX_new()) == NULL) {
         perror("HMAC_CTX_new()");
+        free(digest);
         return -1;
     }
 

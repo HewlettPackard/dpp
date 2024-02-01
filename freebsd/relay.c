@@ -851,7 +851,7 @@ change_channel (unsigned char *mymac, unsigned char class, unsigned char channel
     struct ieee80211req ireq;
     struct ifmediareq ifmreq;
     struct ieee80211req_chaninfo chans;
-    struct interface *inf;
+    struct interface *inf = NULL;
 
     /*
      * find the interface whose radio we're gonna muck with
@@ -1137,6 +1137,7 @@ compute_bk_hash (struct interface *inf, char *bkfile)
     }
     if (fscanf(fp, "%s", keyb64) < 0) {
         fprintf(stderr, "unable to read bootstrap key file %s\n", bkfile);
+        fclose(fp);
         return;
     }
     fclose(fp);
